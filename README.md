@@ -2,8 +2,9 @@
 
 ## Quick start
 ```
-pip install cambc
-cambc starter
+pip install requirements.txt
+```
+```
 cambc run starter starter --watch
 ```
 
