@@ -6,6 +6,7 @@ from bot.constants import (
     PHASE_BOOTSTRAP,
     PHASE_EXPAND_AXIONITE,
     PHASE_EXPAND_TITANIUM,
+    PHASE_REFINE_AXIONITE,
     PHASE_STABILIZE,
     TITANIUM_LINE_READY_HARVESTERS,
     TITANIUM_LINE_READY_SCALE,
@@ -18,11 +19,13 @@ def is_titanium_line_ready(ct: Controller, titanium_harvesters: int) -> bool:
     )
 
 
-def choose_phase(ct: Controller, titanium_harvesters: int, axionite_harvesters: int) -> int:
+def choose_phase(ct: Controller, titanium_harvesters: int, axionite_harvesters: int, foundry_count: int) -> int:
     if titanium_harvesters == 0:
         return PHASE_BOOTSTRAP
     if not is_titanium_line_ready(ct, titanium_harvesters):
         return PHASE_EXPAND_TITANIUM
     if axionite_harvesters == 0:
         return PHASE_EXPAND_AXIONITE
+    if foundry_count == 0:
+        return PHASE_REFINE_AXIONITE
     return PHASE_STABILIZE
