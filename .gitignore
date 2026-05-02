@@ -8,3 +8,7 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+
+# Logging
+log.txt
+cb.txt
