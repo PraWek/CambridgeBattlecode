@@ -29,6 +29,7 @@ _logger = BotLogger()
 
 
 class Player:
+  
     def __init__(self) -> None:
         self.initialized = False
 
