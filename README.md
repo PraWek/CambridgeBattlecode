@@ -1,9 +1,14 @@
 # Cambridge Battlecode
 
 ## Quick start
+### Requirements  
+Python 3.12 or 3.13 (3.14 is not supported)  
+
+Install libraries
 ```
-pip install requirements.txt
+pip install -r requirements.txt
 ```
+Run
 ```
 cambc run starter starter --watch
 ```
