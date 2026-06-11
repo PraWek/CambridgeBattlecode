@@ -22,6 +22,7 @@ from bot.constants import (
 
 from bot.geometry import decode_marker, encode_marker, in_bounds
 from bot.navigation import a_star_to_any
+from bot.steiner import compute_steiner_tree
 from bot.strategy import choose_phase
 from bot.logger import BotLogger
 
@@ -29,7 +30,7 @@ _logger = BotLogger()
 
 
 class Player:
-  
+
     def __init__(self) -> None:
         self.initialized = False
 
@@ -54,6 +55,16 @@ class Player:
         self.path_index = 0
         self.harvester_built = False
         self.role = "bootstrap"
+
+        # Steiner tree state
+        # parent[pos] = parent_pos  →  conveyor at pos points toward parent_pos (= toward core)
+        self.steiner_parent: dict[Position, Position] = {}
+        # Key used when the tree was last computed – frozenset of ore positions
+        self.steiner_ores_key: frozenset = frozenset()
+
+        # Tiles where both conveyor and road build fail: treat as permanently
+        # impassable for future A* and Steiner planning.
+        self.permanently_blocked: set[Position] = set()
 
     def run(self, ct: Controller) -> None:
         entity_type = ct.get_entity_type()
@@ -94,7 +105,6 @@ class Player:
         self.place_core_markers(ct, phase)
         self.try_spawn_builder(ct, phase, titanium_harvesters, axionite_harvesters)
 
-        # Логирование статистики ресурсов Ядра раз в раунд
         current_round = ct.get_current_round()
         if current_round != self.last_round_logged_core_stats:
             _logger.log_core_stats(ct)
@@ -108,6 +118,9 @@ class Player:
         if self.core_pos is None:
             _logger.log_info(ct, "Could not find home core.")
             return
+
+        # Recompute Steiner tree whenever newly observed ores change the plan
+        self._ensure_steiner_tree(ct)
 
         self.update_role_from_phase_marker(ct)
 
@@ -161,6 +174,57 @@ class Player:
         if desired != Direction.CENTRE and desired != ct.get_direction() and ct.can_rotate(desired):
             ct.rotate(desired)
             _logger.log_info(ct, f"Rotated to {desired.name}.")
+
+    # ------------------------------------------------------------------
+    # Steiner tree
+    # ------------------------------------------------------------------
+
+    def _ensure_steiner_tree(self, ct: Controller) -> None:
+        """
+        Recompute the Steiner tree if the set of known titanium ores has
+        changed since the last computation.  Called once per builder turn.
+        """
+        if self.core_pos is None:
+            return
+        ti_ores = self.known_titanium_ores()
+        key = frozenset(ti_ores)
+        if key == self.steiner_ores_key:
+            return  # nothing new to compute
+
+        self.steiner_ores_key = key
+        self.steiner_parent = compute_steiner_tree(
+            self.core_pos,
+            ti_ores,
+            self.known_env,
+            self.map_width,
+            self.map_height,
+            blocked=self.permanently_blocked,
+        )
+        _logger.log_info(
+            ct,
+            f"Steiner tree recomputed: {len(self.steiner_parent)} conveyor tiles "
+            f"for {len(ti_ores)} ore deposits.",
+        )
+
+    def _get_conveyor_direction(self, ct: Controller, target: Position) -> Direction:
+        """
+        Return the direction a conveyor at *target* should point.
+
+        Prefers the Steiner tree parent direction (routes resources optimally
+        toward the core).  Falls back to the simple line-back direction when
+        *target* is not part of the computed tree (e.g. scouting paths or
+        ores outside the explore radius).
+        """
+        steiner_p = self.steiner_parent.get(target)
+        if steiner_p is not None:
+            d = target.direction_to(steiner_p)
+            if d != Direction.CENTRE:
+                return d
+        return self.get_line_direction(ct, target)
+
+    # ------------------------------------------------------------------
+    # Core helpers
+    # ------------------------------------------------------------------
 
     def find_marker_pads(self, ct: Controller, core_pos: Position) -> tuple[Position | None, Position | None]:
         pads = []
@@ -347,6 +411,9 @@ class Player:
         self.target_resource = RESOURCE_AXIONITE if self.role == "expand_axionite" else RESOURCE_TITANIUM
         candidates = self.known_axionite_ores() if self.target_resource == RESOURCE_AXIONITE else self.known_titanium_ores()
 
+        # Tiles already in the Steiner tree can be traversed at reduced A* cost
+        preferred = set(self.steiner_parent.keys()) if self.target_resource == RESOURCE_TITANIUM else set()
+
         current = ct.get_position()
         for ore in sorted(candidates, key=lambda pos: current.distance_squared(pos)):
             if self.is_harvester_on_tile(ore):
@@ -354,7 +421,7 @@ class Player:
             goals = set(self.buildable_approaches(ore))
             if not goals:
                 continue
-            path = a_star_to_any(ct, current, goals, self.traversable_for_planning)
+            path = a_star_to_any(ct, current, goals, self.traversable_for_planning, preferred)
             if current in goals or path:
                 self.target_ore = ore
                 self.path = path
@@ -414,14 +481,30 @@ class Player:
             self.select_new_target(ct)
 
     def try_prepare_tile(self, ct: Controller, target: Position) -> None:
-        conveyor_direction = self.get_line_direction(ct, target)
+        """
+        Make *target* passable so the builder bot can step onto it.
+
+        Uses the Steiner tree direction when available so conveyors are wired
+        to carry resources toward the core along the optimal shared network.
+        Falls back to the simple line-back direction otherwise.
+
+        If both conveyor and road builds fail AND the tile is still impassable,
+        the position is added to permanently_blocked so future A* and Steiner
+        tree computations will route around it (handles walls/obstacles that
+        were unknown when the path was planned).
+        """
+        conveyor_built = False
+        conveyor_direction = self._get_conveyor_direction(ct, target)
         if ct.can_build_conveyor(target, conveyor_direction):
             ct.build_conveyor(target, conveyor_direction)
             _logger.log_build(ct, EntityType.CONVEYOR, target, conveyor_direction)
-            return
+            conveyor_built = True
         else:
             _logger.log_info(ct,
                              f"Attempted to build CONVEYOR at ({target.x}, {target.y}) pointing {conveyor_direction.name}, but action blocked (cooldown, resources, or tile occupied).")
+
+        if conveyor_built:
+            return
 
         if ct.can_build_road(target):
             ct.build_road(target)
@@ -431,7 +514,19 @@ class Player:
             _logger.log_info(ct,
                              f"Attempted to build ROAD at ({target.x}, {target.y}), but action blocked (cooldown, resources, or tile occupied).")
 
+        # Both builds failed and tile is still impassable – mark as blocked so
+        # we never plan through it again (e.g. walls outside our vision range
+        # that were wrongly assumed passable by A*).
+        if not ct.is_tile_passable(target):
+            if target not in self.permanently_blocked:
+                self.permanently_blocked.add(target)
+                # Invalidate Steiner tree so it avoids this tile next recompute
+                self.steiner_ores_key = frozenset()
+                _logger.log_info(ct,
+                                 f"Marked ({target.x}, {target.y}) as permanently blocked.")
+
     def get_line_direction(self, ct: Controller, target: Position) -> Direction:
+        """Fallback: point the conveyor back toward where we came from."""
         if self.path_index == 0:
             previous = ct.get_position()
         else:
@@ -534,6 +629,8 @@ class Player:
 
     def traversable_for_planning(self, _ct: Controller | None, pos: Position) -> bool:
         if not (0 <= pos.x < self.map_width and 0 <= pos.y < self.map_height):
+            return False
+        if pos in self.permanently_blocked:
             return False
         env = self.known_env.get(pos)
         if env == Environment.WALL or env in ORE_TYPES:
