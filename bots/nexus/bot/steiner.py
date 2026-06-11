@@ -5,7 +5,7 @@ from cambc import Environment, Position
 
 from bot.constants import ORTHOGONAL_DIRECTIONS
 
-STEINER_EXPLORE_RADIUS_SQ = 100  # Chebyshev² ≤ 100  →  radius ≤ 10
+STEINER_EXPLORE_RADIUS_SQ = 100
 
 
 def _in_bounds(pos: Position, map_w: int, map_h: int) -> bool:
@@ -23,6 +23,7 @@ def _is_buildable_for_conveyor(
     map_h: int,
     blocked: set | None = None,
 ) -> bool:
+
     if not _in_bounds(pos, map_w, map_h):
         return False
     if blocked and pos in blocked:

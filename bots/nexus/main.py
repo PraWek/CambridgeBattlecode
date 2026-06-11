@@ -16,7 +16,7 @@ from bot.constants import (
     RESOURCE_AXIONITE,
     RESOURCE_TITANIUM,
     SECOND_BUILDER_RESERVE,
-    TITANIUM_LINE_READY_SCALE,
+    TITANIUM_LINE_READY_HARVESTERS,
     THIRD_BUILDER_RESERVE, GUNNER_RESERVE,
 )
 
@@ -30,7 +30,7 @@ _logger = BotLogger()
 
 
 class Player:
-
+  
     def __init__(self) -> None:
         self.initialized = False
 
@@ -55,6 +55,10 @@ class Player:
         self.path_index = 0
         self.harvester_built = False
         self.role = "bootstrap"
+        self.titanium_harvesters_built: int = 0
+        self.harvester_fail_count: int = 0
+        self.skipped_ores: set[Position] = set()
+        self.next_select_round: int = 0
 
         # parent[pos] = parent_pos
         self.steiner_parent: dict[Position, Position] = {}
@@ -119,19 +123,22 @@ class Player:
 
         self.update_role_from_phase_marker(ct)
 
+        current_round = ct.get_current_round()
         need_new_target = False
         if self.harvester_built:
             need_new_target = True
         elif self.target_ore is not None and self.is_harvester_on_tile(self.target_ore):
             need_new_target = True
-        elif self.target_ore is None and self.scout_target is None:
+        elif self.target_ore is None and self.scout_target is None and current_round >= self.next_select_round:
             need_new_target = True
-        elif self.target_ore is None and self.scout_target is not None and self.known_ores_for_role():
+        elif self.target_ore is None and self.scout_target is not None and self.mineable_ores_for_role():
             need_new_target = True
 
         if need_new_target:
             _logger.log_info(ct, f"Selecting new target. Current role: {self.role}.")
             self.select_new_target(ct)
+            if self.target_ore is None and self.scout_target is None:
+                self.next_select_round = current_round + 15
 
         if self.target_ore is None and self.scout_target is None:
             return
@@ -142,14 +149,29 @@ class Player:
                 ct.build_harvester(self.target_ore)
                 _logger.log_build(ct, EntityType.HARVESTER, self.target_ore)
                 self.harvester_built = True
+                self.harvester_fail_count = 0
+                self.skipped_ores.discard(self.target_ore)
+                if self.target_resource == RESOURCE_TITANIUM:
+                    self.titanium_harvesters_built += 1
                 self.target_ore = None
                 self.scout_target = None
                 self.path = []
                 self.path_index = 0
                 return
             else:
+                self.harvester_fail_count += 1
                 _logger.log_info(ct,
                                  f"Attempted to build HARVESTER at ({self.target_ore.x}, {self.target_ore.y}), but action blocked (cooldown, resources, or tile occupied).")
+                if self.harvester_fail_count >= 5:
+                    _logger.log_info(ct,
+                                     f"Giving up on HARVESTER at ({self.target_ore.x}, {self.target_ore.y}) after {self.harvester_fail_count} failed attempts.")
+                    self.skipped_ores.add(self.target_ore)
+                    self.harvester_fail_count = 0
+                    self.target_ore = None
+                    self.path = []
+                    self.path_index = 0
+                    self.select_new_target(ct)
+                    return
 
         self.follow_path_and_build(ct)
 
@@ -177,7 +199,7 @@ class Player:
         ti_ores = self.known_titanium_ores()
         key = frozenset(ti_ores)
         if key == self.steiner_ores_key:
-            return  # nothing new to compute
+            return
 
         self.steiner_ores_key = key
         self.steiner_parent = compute_steiner_tree(
@@ -373,26 +395,31 @@ class Player:
             return self.known_axionite_ores()
         return self.known_titanium_ores()
 
+    def mineable_ores_for_role(self) -> list[Position]:
+        return [ore for ore in self.known_ores_for_role() if not self.is_harvester_on_tile(ore)]
+
     def select_new_target(self, ct: Controller) -> None:
         self.harvester_built = False
+        self.harvester_fail_count = 0
         self.target_ore = None
         self.scout_target = None
         self.path = []
         self.path_index = 0
 
-        if self.role != "expand_axionite" and ct.get_scale_percent() >= TITANIUM_LINE_READY_SCALE:
-            _logger.log_info(ct, f"Scale percent {ct.get_scale_percent()} reached, switching to expand_axionite role.")
+        if self.role != "expand_axionite" and self.titanium_harvesters_built >= TITANIUM_LINE_READY_HARVESTERS:
+            _logger.log_info(ct, f"Built {self.titanium_harvesters_built} titanium harvesters, switching to expand_axionite role.")
             self.role = "expand_axionite"
 
         self.target_resource = RESOURCE_AXIONITE if self.role == "expand_axionite" else RESOURCE_TITANIUM
         candidates = self.known_axionite_ores() if self.target_resource == RESOURCE_AXIONITE else self.known_titanium_ores()
 
-        # Tiles already in the Steiner tree can be traversed at reduced A* cost
         preferred = set(self.steiner_parent.keys()) if self.target_resource == RESOURCE_TITANIUM else set()
 
         current = ct.get_position()
         for ore in sorted(candidates, key=lambda pos: current.distance_squared(pos)):
             if self.is_harvester_on_tile(ore):
+                continue
+            if ore in self.skipped_ores:
                 continue
             goals = set(self.buildable_approaches(ore))
             if not goals:
