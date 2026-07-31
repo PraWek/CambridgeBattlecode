@@ -17,20 +17,20 @@ def _is_ore(env) -> bool:
 
 
 def _is_buildable_for_conveyor(
-    pos: Position,
-    known_env: dict,
-    map_w: int,
-    map_h: int,
-    blocked: set | None = None,
+        pos: Position,
+        known_env: dict,
+        map_w: int,
+        map_h: int,
+        blocked: set | None = None,
 ) -> bool:
-
     if not _in_bounds(pos, map_w, map_h):
         return False
     if blocked and pos in blocked:
         return False
     env = known_env.get(pos)
+    # Если тайл неисследован — считаем проходимым для планирования
     if env is None:
-        return False  # unobserved – skip
+        return True
     if env == Environment.WALL:
         return False
     if _is_ore(env):
@@ -49,11 +49,11 @@ def _core_tiles(core_pos: Position, map_w: int, map_h: int) -> list[Position]:
 
 
 def _collection_points(
-    ore: Position,
-    known_env: dict,
-    map_w: int,
-    map_h: int,
-    blocked: set | None = None,
+        ore: Position,
+        known_env: dict,
+        map_w: int,
+        map_h: int,
+        blocked: set | None = None,
 ) -> list[Position]:
     pts = []
     for d in ORTHOGONAL_DIRECTIONS:
@@ -64,12 +64,12 @@ def _collection_points(
 
 
 def _bfs_connect(
-    tree_nodes: set[Position],
-    targets: set[Position],
-    known_env: dict,
-    map_w: int,
-    map_h: int,
-    blocked: set | None = None,
+        tree_nodes: set[Position],
+        targets: set[Position],
+        known_env: dict,
+        map_w: int,
+        map_h: int,
+        blocked: set | None = None,
 ) -> tuple[Position | None, dict[Position, Position]]:
     prev: dict[Position, Position] = {}
     visited: set[Position] = set()
@@ -99,14 +99,19 @@ def _bfs_connect(
 
 
 def compute_steiner_tree(
-    core_pos: Position,
-    ore_positions: list[Position],
-    known_env: dict,
-    map_w: int,
-    map_h: int,
-    radius_sq: int = STEINER_EXPLORE_RADIUS_SQ,
-    blocked: set | None = None,
+        core_pos: Position,
+        ore_positions: list[Position],
+        known_env: dict,
+        map_w: int,
+        map_h: int,
+        radius_sq: int = STEINER_EXPLORE_RADIUS_SQ,
+        blocked: set | None = None,
 ) -> dict[Position, Position]:
+    """
+    Жадный алгоритм Штейнера: последовательно подключает каждую руду
+    к растущему дереву с помощью BFS. Возвращает parent[pos] = parent_pos
+    - словарь, по которому строятся направления конвейеров
+    """
 
     core_tile_set: set[Position] = set(_core_tiles(core_pos, map_w, map_h))
     tree_nodes: set[Position] = set(core_tile_set)
@@ -115,9 +120,10 @@ def compute_steiner_tree(
     def cheb(p: Position) -> int:
         return max(abs(p.x - core_pos.x), abs(p.y - core_pos.y))
 
+    radius = int(radius_sq ** 0.5)
     candidate_ores = [
         ore for ore in ore_positions
-        if cheb(ore) ** 2 <= radius_sq
+        if cheb(ore) <= radius
     ]
     candidate_ores.sort(key=cheb)
 

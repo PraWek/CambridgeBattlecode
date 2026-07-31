@@ -1,3 +1,5 @@
+import random
+
 from cambc import Controller, Direction, EntityType, Environment, GameConstants, Position, Team
 
 from bot.constants import (
@@ -5,6 +7,8 @@ from bot.constants import (
     FOURTH_BUILDER_RESERVE,
     MARKER_KIND_ENEMY,
     MARKER_KIND_PHASE,
+    MARKER_KIND_ORE_TI,
+    MARKER_KIND_ORE_AX,
     MAX_BUILDERS_PHASE_ONE,
     ORE_TYPES,
     ORTHOGONAL_DIRECTIONS,
@@ -16,17 +20,18 @@ from bot.constants import (
     RESOURCE_AXIONITE,
     RESOURCE_TITANIUM,
     SECOND_BUILDER_RESERVE,
-    TITANIUM_LINE_READY_SCALE,
-    THIRD_BUILDER_RESERVE, GUNNER_RESERVE,
+    STUCK_KILL_ROUNDS,
+    MAX_IDLE_ROUNDS,
+    TITANIUM_LINE_READY_HARVESTERS,
+    THIRD_BUILDER_RESERVE,
+    GUNNER_RESERVE,
 )
 
 from bot.geometry import decode_marker, encode_marker, in_bounds
-from bot.navigation import a_star_to_any
+from bot.navigation import a_star_to_any, score_reachable_tiles, find_existing_conveyor_tiles
 from bot.steiner import compute_steiner_tree
 from bot.strategy import choose_phase
-from bot.logger import BotLogger
 
-_logger = BotLogger()
 
 
 class Player:
@@ -46,7 +51,6 @@ class Player:
         self.known_buildings = {}
 
         self.spawned_builders = 0
-        self.last_round_logged_core_stats = -1
 
         self.target_ore = None
         self.target_resource = RESOURCE_TITANIUM
@@ -55,12 +59,29 @@ class Player:
         self.path_index = 0
         self.harvester_built = False
         self.role = "bootstrap"
+        self.titanium_harvesters_built: int = 0
+        self.harvester_fail_count: int = 0
+        self.skipped_ores: set[Position] = set()
+        self.next_select_round: int = 0
 
-        # parent[pos] = parent_pos
+        # parent[pos] = parent_pos — дерево Штейнера
         self.steiner_parent: dict[Position, Position] = {}
         self.steiner_ores_key: frozenset = frozenset()
 
         self.permanently_blocked: set[Position] = set()
+
+        # Трансляция руды через маркеры
+        self._ore_broadcast_idx: int = 0
+
+        # Emergency kill: отслеживание прогресса
+        self._last_pos: Position | None = None
+        self._stuck_rounds: int = 0
+        self._rounds_alive: int = 0
+        self._last_progress_round: int = 0
+
+        # Кэш тайлов чужих конвейерных веток для nocross-пенальти в A*
+        self._nocross_tiles: set[Position] = set()
+        self._nocross_buildings_snapshot: int = 0
 
     def run(self, ct: Controller) -> None:
         entity_type = ct.get_entity_type()
@@ -80,7 +101,7 @@ class Player:
         self.map_height = ct.get_map_height()
         self.team = ct.get_team()
         self.observe_tiles(ct)
-        _logger.log_info(ct, f"Initialized: Map {self.map_width}x{self.map_height}, Team {self.team.name}")
+
 
     def run_core(self, ct: Controller) -> None:
         self.init_map_state(ct)
@@ -99,39 +120,60 @@ class Player:
         phase = choose_phase(ct, titanium_harvesters, axionite_harvesters)
 
         self.place_core_markers(ct, phase)
+        self.broadcast_ore(ct)
         self.try_spawn_builder(ct, phase, titanium_harvesters, axionite_harvesters)
 
-        current_round = ct.get_current_round()
-        if current_round != self.last_round_logged_core_stats:
-            _logger.log_core_stats(ct)
-            self.last_round_logged_core_stats = current_round
 
     def run_builder(self, ct: Controller) -> None:
         self.init_map_state(ct)
+        self._rounds_alive += 1
+
+        cur_pos = ct.get_position()
+
+        # --- Emergency kill: застрявший билдер ---
+        if self._last_pos is not None and cur_pos == self._last_pos:
+            self._stuck_rounds += 1
+        else:
+            self._stuck_rounds = 0
+            self._last_progress_round = self._rounds_alive
+        self._last_pos = cur_pos
+
+        if self._stuck_rounds >= STUCK_KILL_ROUNDS:
+            ct.self_destruct()
+            return
+
+        if self._rounds_alive - self._last_progress_round > MAX_IDLE_ROUNDS:
+            ct.self_destruct()
+            return
+
+        # --- Разведка ---
         self.observe_tiles(ct)
+        self.read_ore_markers(ct)
+
         if self.core_pos is None:
             self.core_pos = self.find_home_core(ct)
         if self.core_pos is None:
-            _logger.log_info(ct, "Could not find home core.")
             return
 
         self._ensure_steiner_tree(ct)
-
         self.update_role_from_phase_marker(ct)
 
+        current_round = ct.get_current_round()
         need_new_target = False
         if self.harvester_built:
+            self._last_progress_round = self._rounds_alive
             need_new_target = True
         elif self.target_ore is not None and self.is_harvester_on_tile(self.target_ore):
             need_new_target = True
-        elif self.target_ore is None and self.scout_target is None:
+        elif self.target_ore is None and self.scout_target is None and current_round >= self.next_select_round:
             need_new_target = True
-        elif self.target_ore is None and self.scout_target is not None and self.known_ores_for_role():
+        elif self.target_ore is None and self.scout_target is not None and self.mineable_ores_for_role():
             need_new_target = True
 
         if need_new_target:
-            _logger.log_info(ct, f"Selecting new target. Current role: {self.role}.")
             self.select_new_target(ct)
+            if self.target_ore is None and self.scout_target is None:
+                self.next_select_round = current_round + 15
 
         if self.target_ore is None and self.scout_target is None:
             return
@@ -140,25 +182,36 @@ class Player:
                 self.target_ore) <= GameConstants.ACTION_RADIUS_SQ:
             if ct.can_build_harvester(self.target_ore):
                 ct.build_harvester(self.target_ore)
-                _logger.log_build(ct, EntityType.HARVESTER, self.target_ore)
                 self.harvester_built = True
+                self._last_progress_round = self._rounds_alive
+                self.harvester_fail_count = 0
+                self.skipped_ores.discard(self.target_ore)
+                if self.target_resource == RESOURCE_TITANIUM:
+                    self.titanium_harvesters_built += 1
                 self.target_ore = None
                 self.scout_target = None
                 self.path = []
                 self.path_index = 0
                 return
             else:
-                _logger.log_info(ct,
-                                 f"Attempted to build HARVESTER at ({self.target_ore.x}, {self.target_ore.y}), but action blocked (cooldown, resources, or tile occupied).")
+                self.harvester_fail_count += 1
+                if self.harvester_fail_count >= 5:
+                    self.skipped_ores.add(self.target_ore)
+                    self.harvester_fail_count = 0
+                    self.target_ore = None
+                    self.path = []
+                    self.path_index = 0
+                    self.select_new_target(ct)
+                    return
 
         self.follow_path_and_build(ct)
+
 
     def run_gunner(self, ct: Controller) -> None:
         self.observe_tiles(ct)
         target = ct.get_gunner_target()
         if target is not None and ct.can_fire(target):
             ct.fire(target)
-            _logger.log_info(ct, f"Fired at {target}.")
             return
 
         marker_target = self.read_enemy_marker_target(ct)
@@ -168,16 +221,15 @@ class Player:
         desired = ct.get_position().direction_to(marker_target)
         if desired != Direction.CENTRE and desired != ct.get_direction() and ct.can_rotate(desired):
             ct.rotate(desired)
-            _logger.log_info(ct, f"Rotated to {desired.name}.")
 
-    # Steiner tree
+
     def _ensure_steiner_tree(self, ct: Controller) -> None:
         if self.core_pos is None:
             return
         ti_ores = self.known_titanium_ores()
         key = frozenset(ti_ores)
         if key == self.steiner_ores_key:
-            return  # nothing new to compute
+            return
 
         self.steiner_ores_key = key
         self.steiner_parent = compute_steiner_tree(
@@ -188,11 +240,8 @@ class Player:
             self.map_height,
             blocked=self.permanently_blocked,
         )
-        _logger.log_info(
-            ct,
-            f"Steiner tree recomputed: {len(self.steiner_parent)} conveyor tiles "
-            f"for {len(ti_ores)} ore deposits.",
-        )
+        # Сбрасываем кэш nocross при перестройке дерева
+        self._nocross_buildings_snapshot = 0
 
     def _get_conveyor_direction(self, ct: Controller, target: Position) -> Direction:
         steiner_p = self.steiner_parent.get(target)
@@ -201,6 +250,7 @@ class Player:
             if d != Direction.CENTRE:
                 return d
         return self.get_line_direction(ct, target)
+
 
     def find_marker_pads(self, ct: Controller, core_pos: Position) -> tuple[Position | None, Position | None]:
         pads = []
@@ -214,12 +264,9 @@ class Player:
                 if ct.can_place_marker(pos):
                     pads.append(pos)
         if not pads:
-            _logger.log_info(ct, "No marker pads found near core.")
             return None, None
         if len(pads) == 1:
-            _logger.log_info(ct, f"Found one marker pad at ({pads[0].x}, {pads[0].y}).")
             return pads[0], pads[0]
-        _logger.log_info(ct, f"Found two marker pads at ({pads[0].x}, {pads[0].y}) and ({pads[1].x}, {pads[1].y}).")
         return pads[0], pads[1]
 
     def place_core_markers(self, ct: Controller, phase: int) -> None:
@@ -227,12 +274,62 @@ class Player:
             return
         if self.enemy_marker_pad is not None and ct.can_place_marker(self.enemy_marker_pad):
             ct.place_marker(self.enemy_marker_pad, encode_marker(MARKER_KIND_ENEMY, self.enemy_estimate, phase))
-            _logger.log_info(ct,
-                             f"Placed enemy marker at ({self.enemy_marker_pad.x}, {self.enemy_marker_pad.y}) for enemy at ({self.enemy_estimate.x}, {self.enemy_estimate.y}).")
         if self.phase_marker_pad is not None and ct.can_place_marker(self.phase_marker_pad):
             ct.place_marker(self.phase_marker_pad, encode_marker(MARKER_KIND_PHASE, self.core_pos, phase))
-            _logger.log_info(ct,
-                             f"Placed phase marker at ({self.phase_marker_pad.x}, {self.phase_marker_pad.y}) with phase {phase}.")
+
+
+    def broadcast_ore(self, ct: Controller) -> None:
+        """Ядро циклически транслирует известные руды через свободные маркерные тайлы"""
+        ti_ores = self.known_titanium_ores()
+        ax_ores = self.known_axionite_ores()
+        all_ores = [(o, MARKER_KIND_ORE_TI) for o in ti_ores] + [(o, MARKER_KIND_ORE_AX) for o in ax_ores]
+        if not all_ores:
+            return
+
+        self._ore_broadcast_idx = self._ore_broadcast_idx % len(all_ores)
+        ore_pos, kind = all_ores[self._ore_broadcast_idx]
+        self._ore_broadcast_idx += 1
+
+        core_pos = ct.get_position()
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                pad = Position(core_pos.x + dx, core_pos.y + dy)
+                if pad == self.enemy_marker_pad or pad == self.phase_marker_pad:
+                    continue
+                if not in_bounds(ct, pad):
+                    continue
+                if pad.distance_squared(core_pos) > GameConstants.CORE_ACTION_RADIUS_SQ:
+                    continue
+                if ct.can_place_marker(pad):
+                    ct.place_marker(pad, encode_marker(kind, ore_pos, 0))
+                    return
+
+    def read_ore_markers(self, ct: Controller) -> None:
+        """Билдер читает маркеры руды, добавляет их в known_env и выводит зеркальные"""
+        for entity_id in ct.get_nearby_entities():
+            if ct.get_entity_type(entity_id) != EntityType.MARKER:
+                continue
+            try:
+                kind, pos, _ = decode_marker(ct.get_marker_value(entity_id))
+            except Exception:
+                continue
+            if kind == MARKER_KIND_ORE_TI:
+                if pos not in self.known_env:
+                    self.known_env[pos] = Environment.ORE_TITANIUM
+                    self._infer_symmetric(pos, Environment.ORE_TITANIUM)
+            elif kind == MARKER_KIND_ORE_AX:
+                if pos not in self.known_env:
+                    self.known_env[pos] = Environment.ORE_AXIONITE
+                    self._infer_symmetric(pos, Environment.ORE_AXIONITE)
+
+    def _infer_symmetric(self, pos: Position, env: Environment) -> None:
+        """Вывод симметричной позиции руды (карта гарантированно симметрична)"""
+        if self.map_width == 0 or self.map_height == 0:
+            return
+        mirror = Position(self.map_width - 1 - pos.x, self.map_height - 1 - pos.y)
+        if mirror not in self.known_env:
+            self.known_env[mirror] = env
+
 
     def try_spawn_builder(
             self,
@@ -248,6 +345,7 @@ class Player:
 
         titanium, _ = ct.get_global_resources()
         builder_cost, _ = ct.get_builder_bot_cost()
+        jitter = int(builder_cost * random.uniform(0.0, 0.1))
 
         if self.spawned_builders == 0:
             self.spawn_in_direction(ct, self.direction_towards_best_ore(ct, RESOURCE_TITANIUM))
@@ -256,9 +354,8 @@ class Player:
         if self.spawned_builders == 1:
             if titanium_harvesters == 0 and ct.get_current_round() < 60:
                 return
-            if titanium < builder_cost + SECOND_BUILDER_RESERVE:
-                _logger.log_info(ct,
-                                 f"Cannot spawn second builder: not enough titanium ({titanium} < {builder_cost + SECOND_BUILDER_RESERVE}).")
+            threshold = builder_cost + SECOND_BUILDER_RESERVE + jitter
+            if titanium < threshold:
                 return
             self.spawn_in_direction(ct, self.direction_towards_best_ore(ct, RESOURCE_TITANIUM).rotate_right())
             return
@@ -266,9 +363,8 @@ class Player:
         if self.spawned_builders == 2:
             if phase < PHASE_EXPAND_AXIONITE:
                 return
-            if titanium < builder_cost + THIRD_BUILDER_RESERVE:
-                _logger.log_info(ct,
-                                 f"Cannot spawn third builder: not enough titanium ({titanium} < {builder_cost + THIRD_BUILDER_RESERVE}).")
+            threshold = builder_cost + THIRD_BUILDER_RESERVE + jitter
+            if titanium < threshold:
                 return
             self.spawn_in_direction(ct, self.direction_towards_best_ore(ct, RESOURCE_AXIONITE))
             return
@@ -276,9 +372,8 @@ class Player:
         if self.spawned_builders == 3:
             if phase != PHASE_STABILIZE or axionite_harvesters == 0:
                 return
-            if titanium < builder_cost + FOURTH_BUILDER_RESERVE:
-                _logger.log_info(ct,
-                                 f"Cannot spawn fourth builder: not enough titanium ({titanium} < {builder_cost + FOURTH_BUILDER_RESERVE}).")
+            threshold = builder_cost + FOURTH_BUILDER_RESERVE + jitter
+            if titanium < threshold:
                 return
             self.spawn_in_direction(ct, self.direction_towards_best_ore(ct, RESOURCE_TITANIUM).rotate_left())
 
@@ -297,11 +392,8 @@ class Player:
             spawn_pos = core_pos.add(direction)
             if ct.can_spawn(spawn_pos):
                 new_builder_id = ct.spawn_builder(spawn_pos)
-                _logger.log_info(ct,
-                                 f"Spawned BUILDER_BOT #{new_builder_id} at ({spawn_pos.x}, {spawn_pos.y}) facing {direction.name}.")
                 self.spawned_builders += 1
                 return
-        _logger.log_info(ct, "Failed to spawn BUILDER_BOT: no available spawn tiles.")
 
     def direction_towards_best_ore(self, ct: Controller, resource_kind: str) -> Direction:
         origin = ct.get_position()
@@ -334,8 +426,8 @@ class Player:
                 building_id = ct.get_tile_building_id(probe)
                 if building_id is not None and ct.get_entity_type(building_id) == EntityType.CORE:
                     return ct.get_position(building_id)
-        _logger.log_info(ct, "Home CORE not found within vision or nearby scan.")
         return None
+
 
     def update_role_from_phase_marker(self, ct: Controller) -> None:
         old_role = self.role
@@ -353,8 +445,6 @@ class Player:
                 self.role = "stabilize"
             elif self.role != "stabilize":
                 self.role = "expand_titanium"
-        if self.role != old_role:
-            _logger.log_info(ct, f"Role changed from {old_role} to {self.role}.")
 
     def read_phase_marker(self, ct: Controller) -> int | None:
         for entity_id in ct.get_nearby_entities():
@@ -373,48 +463,68 @@ class Player:
             return self.known_axionite_ores()
         return self.known_titanium_ores()
 
+    def mineable_ores_for_role(self) -> list[Position]:
+        return [ore for ore in self.known_ores_for_role() if not self.is_harvester_on_tile(ore)]
+
+
     def select_new_target(self, ct: Controller) -> None:
         self.harvester_built = False
+        self.harvester_fail_count = 0
         self.target_ore = None
         self.scout_target = None
         self.path = []
         self.path_index = 0
 
-        if self.role != "expand_axionite" and ct.get_scale_percent() >= TITANIUM_LINE_READY_SCALE:
-            _logger.log_info(ct, f"Scale percent {ct.get_scale_percent()} reached, switching to expand_axionite role.")
+        if self.role != "expand_axionite" and self.titanium_harvesters_built >= TITANIUM_LINE_READY_HARVESTERS:
             self.role = "expand_axionite"
 
         self.target_resource = RESOURCE_AXIONITE if self.role == "expand_axionite" else RESOURCE_TITANIUM
         candidates = self.known_axionite_ores() if self.target_resource == RESOURCE_AXIONITE else self.known_titanium_ores()
 
-        # Tiles already in the Steiner tree can be traversed at reduced A* cost
         preferred = set(self.steiner_parent.keys()) if self.target_resource == RESOURCE_TITANIUM else set()
+        nocross = self._get_nocross_tiles()
 
         current = ct.get_position()
-        for ore in sorted(candidates, key=lambda pos: current.distance_squared(pos)):
+
+        def ore_score(ore: Position) -> float:
+            """
+            Оценивает привлекательность руды:
+            - Чем ближе — тем лучше (основной критерий)
+            - Штраф если уже не на ветке Штейнера (не помогает сети)
+            - Бонус если рядом другие не подключённые руды (кластер экономит конвейеры)
+            """
+            dist = float(current.distance_squared(ore))
+            cluster_bonus = 0.0
+            for d in ORTHOGONAL_DIRECTIONS:
+                nb = ore.add(d)
+                if nb in self.known_env and not self.is_harvester_on_tile(nb):
+                    from cambc import Environment
+                    if self.known_env.get(nb) in (Environment.ORE_TITANIUM, Environment.ORE_AXIONITE):
+                        cluster_bonus -= 10.0
+            return dist + cluster_bonus
+
+        for ore in sorted(candidates, key=ore_score):
             if self.is_harvester_on_tile(ore):
+                continue
+            if ore in self.skipped_ores:
                 continue
             goals = set(self.buildable_approaches(ore))
             if not goals:
                 continue
-            path = a_star_to_any(ct, current, goals, self.traversable_for_planning, preferred)
+            path = a_star_to_any(ct, current, goals, self.traversable_for_planning, preferred, nocross)
             if current in goals or path:
                 self.target_ore = ore
                 self.path = path
                 self.path_index = 0
-                _logger.log_info(ct,
-                                 f"New target ore ({self.target_resource.upper()}) selected at ({ore.x}, {ore.y}). Path length: {len(path)}.")
                 return
 
         self.scout_target = self.choose_scout_target(ct)
         if self.scout_target is not None:
-            path = a_star_to_any(ct, current, {self.scout_target}, self.traversable_for_planning)
+            path = a_star_to_any(ct, current, {self.scout_target}, self.traversable_for_planning,
+                                 conveyor_tiles=nocross)
             self.path = path
             self.path_index = 0
-            _logger.log_info(ct,
-                             f"New scout target selected at ({self.scout_target.x}, {self.scout_target.y}). Path length: {len(path)}.")
-        else:
-            _logger.log_info(ct, "No new ore or scout target found.")
+
 
     def follow_path_and_build(self, ct: Controller) -> None:
         current = ct.get_position()
@@ -423,7 +533,6 @@ class Player:
 
         if self.path_index >= len(self.path):
             if self.scout_target is not None and current == self.scout_target:
-                _logger.log_info(ct, f"Reached scout target at ({self.scout_target.x}, {self.scout_target.y}).")
                 self.scout_target = None
             return
 
@@ -434,26 +543,25 @@ class Player:
             return
 
         if current.distance_squared(next_pos) > 2:
-            _logger.log_info(ct,
-                             f"Path invalid: Current ({current.x}, {current.y}) too far from next ({next_pos.x}, {next_pos.y}). Re-selecting target.")
             self.select_new_target(ct)
             return
 
         if not ct.is_tile_passable(next_pos):
-            _logger.log_info(ct, f"Tile at ({next_pos.x}, {next_pos.y}) not passable. Attempting to prepare.")
             self.try_prepare_tile(ct, next_pos)
 
+        if ct.is_tile_passable(next_pos):
+            bridge_target = self.find_bridge_target(next_pos)
+            if bridge_target is not None and ct.can_build_bridge(next_pos, bridge_target):
+                ct.build_bridge(next_pos, bridge_target)
+                self._last_progress_round = self._rounds_alive
+
         if ct.can_move(move_dir):
-            _logger.log_move(ct, current, next_pos)
             ct.move(move_dir)
+            self._stuck_rounds = 0
+            self._last_progress_round = self._rounds_alive
             return
-        else:
-            _logger.log_info(ct,
-                             f"Cannot move to ({next_pos.x}, {next_pos.y}) in direction {move_dir.name}: movement blocked (cooldown, impassable, or occupied).")
 
         if not ct.is_tile_passable(next_pos):
-            _logger.log_info(ct,
-                             f"Tile at ({next_pos.x}, {next_pos.y}) still not passable after attempt to prepare. Re-selecting target.")
             self.select_new_target(ct)
 
     def try_prepare_tile(self, ct: Controller, target: Position) -> None:
@@ -461,29 +569,21 @@ class Player:
         conveyor_direction = self._get_conveyor_direction(ct, target)
         if ct.can_build_conveyor(target, conveyor_direction):
             ct.build_conveyor(target, conveyor_direction)
-            _logger.log_build(ct, EntityType.CONVEYOR, target, conveyor_direction)
             conveyor_built = True
-        else:
-            _logger.log_info(ct,
-                             f"Attempted to build CONVEYOR at ({target.x}, {target.y}) pointing {conveyor_direction.name}, but action blocked (cooldown, resources, or tile occupied).")
+            self._last_progress_round = self._rounds_alive
 
         if conveyor_built:
             return
 
         if ct.can_build_road(target):
             ct.build_road(target)
-            _logger.log_build(ct, EntityType.ROAD, target)
+            self._last_progress_round = self._rounds_alive
             return
-        else:
-            _logger.log_info(ct,
-                             f"Attempted to build ROAD at ({target.x}, {target.y}), but action blocked (cooldown, resources, or tile occupied).")
 
         if not ct.is_tile_passable(target):
             if target not in self.permanently_blocked:
                 self.permanently_blocked.add(target)
                 self.steiner_ores_key = frozenset()
-                _logger.log_info(ct,
-                                 f"Marked ({target.x}, {target.y}) as permanently blocked.")
 
     def get_line_direction(self, ct: Controller, target: Position) -> Direction:
         if self.path_index == 0:
@@ -545,9 +645,7 @@ class Player:
                 continue
             if ct.can_build_gunner(build_pos, facing):
                 ct.build_gunner(build_pos, facing)
-                _logger.log_build(ct, EntityType.GUNNER, build_pos, facing)
                 return True
-        _logger.log_info(ct, "Failed to build GUNNER: no suitable build position found.")
         return False
 
     def read_enemy_marker_target(self, ct: Controller) -> Position | None:
@@ -562,9 +660,22 @@ class Player:
                 return pos
         return None
 
+
     def observe_tiles(self, ct: Controller) -> None:
         for pos in ct.get_nearby_tiles():
-            self.known_env[pos] = ct.get_tile_env(pos)
+            env = ct.get_tile_env(pos)
+            old_env = self.known_env.get(pos)
+            self.known_env[pos] = env
+
+            # При обнаружении новой руды вычисляем зеркальную позицию
+            if old_env != env and env in ORE_TYPES:
+                self._infer_symmetric(pos, env)
+
+            # Если была стена там, где Штейнер планировал путь - перестроить
+            if old_env is None and env == Environment.WALL and pos in self.steiner_parent:
+                self.permanently_blocked.add(pos)
+                self.steiner_ores_key = frozenset()
+
             building_info = None
             building_id = ct.get_tile_building_id(pos)
             if building_id is not None:
@@ -608,7 +719,32 @@ class Player:
                 candidates.append(pos)
         return candidates
 
+
+    def _get_nocross_tiles(self) -> set[Position]:
+        """
+        Возвращает тайлы союзных конвейеров, которые НЕ принадлежат текущему дереву Штейнера.
+        Кэшируется по размеру known_buildings, чтобы не пересчитывать каждый ход
+        """
+        snapshot = len(self.known_buildings)
+        if snapshot != self._nocross_buildings_snapshot:
+            self._nocross_buildings_snapshot = snapshot
+            self._nocross_tiles = find_existing_conveyor_tiles(
+                self.known_buildings,
+                self.steiner_parent,
+                self.team,
+            )
+        return self._nocross_tiles
+
+
     def choose_scout_target(self, ct: Controller) -> Position | None:
+        """
+        Выбирает цель для разведки.
+
+        Улучшение по сравнению с исходным алгоритмом:
+        вместо выбора ближайшей фронтирной клетки используем score_reachable_tiles —
+        оцениваем, сколько новой территории открывается из каждой фронтирной точки.
+        Это даёт более широкое и равномерное покрытие карты
+        """
         current = ct.get_position()
         preferred = self.enemy_estimate if self.enemy_estimate is not None else current
         forward = current.direction_to(preferred)
@@ -618,6 +754,7 @@ class Player:
             else:
                 forward = Direction.SOUTH if preferred.y >= current.y else Direction.NORTH
 
+        # Быстрый путь: первый неизвестный тайл в направлении врага
         probe = current
         for _ in range(4):
             probe = probe.add(forward)
@@ -626,19 +763,41 @@ class Player:
             if probe not in self.known_env:
                 return probe
 
-        best = None
-        best_score = 10 ** 9
+        # Собираем все фронтирные клетки (граничат с известной территорией и неизвестны)
+        frontier: list[Position] = []
         for known_pos in self.known_env:
             for direction in ORTHOGONAL_DIRECTIONS:
                 probe = known_pos.add(direction)
                 if not in_bounds(ct, probe) or probe in self.known_env:
                     continue
-                score = current.distance_squared(probe)
-                if self.target_resource == RESOURCE_AXIONITE:
-                    score = score * 2
-                if self.enemy_estimate is not None:
-                    score += probe.distance_squared(self.enemy_estimate)
-                if score < best_score:
-                    best = probe
-                    best_score = score
+                frontier.append(probe)
+
+        if not frontier:
+            return None
+
+        # Оцениваем каждую фронтирную клетку по score_reachable_tiles
+        best: Position | None = None
+        best_val = -1e18
+        for probe in frontier:
+            dist_to_current = current.distance_squared(probe)
+            if dist_to_current > 200:
+                continue
+            territory_score = score_reachable_tiles(
+                probe,
+                self.known_env,
+                self.known_buildings,
+                self.map_width,
+                self.map_height,
+                self.team,
+            )
+            # Штраф за расстояние; двойной штраф при поиске аксионита (держимся ближе)
+            dist_penalty = dist_to_current * (2.0 if self.target_resource == RESOURCE_AXIONITE else 1.0)
+            # Бонус за близость к предполагаемой позиции врага (разведка в сторону врага ценнее)
+            enemy_bonus = 0.0
+            if self.enemy_estimate is not None:
+                enemy_bonus = -0.3 * probe.distance_squared(self.enemy_estimate)
+            val = territory_score - dist_penalty * 0.05 + enemy_bonus * 0.02
+            if val > best_val:
+                best_val = val
+                best = probe
         return best
