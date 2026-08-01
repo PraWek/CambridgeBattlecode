@@ -18,7 +18,7 @@ def is_titanium_line_ready(ct: Controller, titanium_harvesters: int) -> bool:
     )
 
 
-def choose_phase(ct: Controller, titanium_harvesters: int, axionite_harvesters: int, _extra: int = 0) -> int:
+def choose_phase(ct: Controller, titanium_harvesters: int, axionite_harvesters: int) -> int:
     if titanium_harvesters == 0:
         return PHASE_BOOTSTRAP
     if not is_titanium_line_ready(ct, titanium_harvesters):

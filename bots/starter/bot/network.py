@@ -6,11 +6,7 @@ def compute_steiner_network(core_pos: Position, known_env: dict, radius: int = 1
     dict[Position, Direction], set[Position]]:
     """
     Приближенно вычисляет направленное дерево Штейнера, соединяющее
-    известные залежи титана в радиусе `radius` с Ядром.
-
-    Возвращает:
-        conveyors: dict[Position, Direction] - карта конвейеров и их направлений (к ядру).
-        network_ores: set[Position] - список подключенных к сети руд.
+    известные залежи титана в радиусе `radius` с Ядром
     """
     ores = []
     for pos, env in known_env.items():
