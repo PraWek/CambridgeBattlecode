@@ -1,48 +1,24 @@
-from cambc import Direction
+from cambc import Position
 
-from constants import ASSIGNMENT_DIRECTIONS, MARKER_KIND_MASK
-
-
-def encode_marker(kind: int, payload: int) -> int:
-    return kind * MARKER_KIND_MASK + payload
+from constants import MARKER_KIND_BASE, MARKER_X_BASE, MARKER_Y_BASE
 
 
-def decode_marker(value: int) -> tuple[int, int]:
-    return value // MARKER_KIND_MASK, value % MARKER_KIND_MASK
+def chebyshev(first: Position, second: Position) -> int:
+    """Return the Chebyshev distance between two map positions."""
+    return max(abs(first.x - second.x), abs(first.y - second.y))
 
 
-def direction_index(direction: Direction) -> int:
-    return ASSIGNMENT_DIRECTIONS.index(direction)
+def encode_marker(kind: int, pos: Position, payload: int = 0) -> int:
+    """Pack a marker kind, position, and small payload into one integer."""
+    return kind * MARKER_KIND_BASE + pos.x * MARKER_X_BASE + pos.y * MARKER_Y_BASE + payload
 
 
-def direction_to_vector(direction: Direction) -> tuple[int, int]:
-    mapping = {
-        Direction.NORTH: (0, -1),
-        Direction.NORTHEAST: (1, -1),
-        Direction.EAST: (1, 0),
-        Direction.SOUTHEAST: (1, 1),
-        Direction.SOUTH: (0, 1),
-        Direction.SOUTHWEST: (-1, 1),
-        Direction.WEST: (-1, 0),
-        Direction.NORTHWEST: (-1, -1),
-    }
-    return mapping[direction]
-
-
-def rotate_left(direction: Direction) -> Direction:
-    dx, dy = direction_to_vector(direction)
-    return vector_to_direction(-dy, dx)
-
-
-def vector_to_direction(dx: int, dy: int) -> Direction:
-    mapping = {
-        (0, -1): Direction.NORTH,
-        (1, -1): Direction.NORTHEAST,
-        (1, 0): Direction.EAST,
-        (1, 1): Direction.SOUTHEAST,
-        (0, 1): Direction.SOUTH,
-        (-1, 1): Direction.SOUTHWEST,
-        (-1, 0): Direction.WEST,
-        (-1, -1): Direction.NORTHWEST,
-    }
-    return mapping[(dx, dy)]
+def decode_marker(value: int) -> tuple[int, Position, int]:
+    """Unpack a marker integer into its kind, position, and payload fields."""
+    kind = value // MARKER_KIND_BASE
+    value %= MARKER_KIND_BASE
+    x = value // MARKER_X_BASE
+    value %= MARKER_X_BASE
+    y = value // MARKER_Y_BASE
+    payload = value % MARKER_Y_BASE
+    return kind, Position(x, y), payload

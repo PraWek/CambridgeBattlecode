@@ -1,953 +1,1482 @@
-from __future__ import annotations
-
 from collections import deque
 
 from cambc import Controller, Direction, EntityType, Environment, GameConstants, Position
 
 from base import BaseBot
-from constants import ASSIGNMENT_DIRECTIONS, CARDINALS, DIRECTIONS, PASSABLE_BUILDINGS
-from geometry import direction_index, direction_to_vector, rotate_left
+from constants import (
+    AXIONITE_TITANIUM_THRESHOLD,
+    BUILDER_CODE_DIRECTIONS,
+    DIRECTIONS,
+    MARKER_KIND_ORE_AX,
+    MARKER_KIND_ORE_TI,
+    MARKER_KIND_SECTOR_ORE_AX,
+    MARKER_KIND_SECTOR_ORE_TI,
+    MARKER_KIND_SPAWN_DIRECTION,
+    MARKER_KIND_SPAWN_ORE_AX,
+    MARKER_KIND_SPAWN_ORE_TI,
+    MAX_IDLE_ROUNDS,
+    ORE_TYPES,
+    ORTHOGONAL_DIRECTIONS,
+    PASSABLE_BUILDINGS,
+    RESOURCE_AXIONITE,
+    RESOURCE_TITANIUM,
+    SCOUT_DISTANCE_WEIGHT,
+    SCOUT_FORWARD_PROGRESS_WEIGHT,
+    SCOUT_FRONTIER_CANDIDATE_LIMIT,
+    SCOUT_INWARD_STEP_PENALTY,
+    SCOUT_LATERAL_DEVIATION_WEIGHT,
+    SCOUT_NEW_VISION_WEIGHT,
+    SCOUT_ORE_HINT_PROGRESS_WEIGHT,
+    SCOUT_RETURN_TO_BASE_WEIGHT,
+    SCOUT_REVISIT_STEP_PENALTY,
+    SCOUT_ROUTE_MEMORY_TILES,
+    STUCK_KILL_ROUNDS,
+    YIELD_ROUTE_AVOID_ROUNDS,
+)
+from geometry import decode_marker
+from navigation import a_star_to_any
 
 
-PHASE_EXPLORE_TITANIUM = 1
-PHASE_BUILD_TITANIUM = 2
-PHASE_EXPLORE_EXPANDED = 3
-PHASE_BUILD_AXIONITE = 4
-
-ROADLIKE_BUILDINGS = PASSABLE_BUILDINGS | {EntityType.HARVESTER}
-
-
-class FoundryPlan:
-    def __init__(
-        self,
-        foundry_pos: Position,
-        titanium_input: Position,
-        axionite_input: Position,
-        output_pos: Position | None,
-        output_target: Position | None,
-    ) -> None:
-        self.foundry_pos = foundry_pos
-        self.titanium_input = titanium_input
-        self.axionite_input = axionite_input
-        self.output_pos = output_pos
-        self.output_target = output_target
+_VISION_RADIUS = int(GameConstants.BUILDER_BOT_VISION_RADIUS_SQ ** 0.5)
+SCOUT_VISION_OFFSETS = tuple(
+    (dx, dy)
+    for dx in range(-_VISION_RADIUS, _VISION_RADIUS + 1)
+    for dy in range(-_VISION_RADIUS, _VISION_RADIUS + 1)
+    if dx * dx + dy * dy <= GameConstants.BUILDER_BOT_VISION_RADIUS_SQ
+)
 
 
 class BuilderBot(BaseBot):
     def __init__(self, map_width: int, map_height: int) -> None:
+        """Initialize exploration memory, mining state, and conveyor planning state."""
         super().__init__(map_width, map_height)
         self.core_pos: Position | None = None
-        self.assigned_direction: Direction | None = None
-        self.assigned_index: int | None = None
+        self.enemy_estimate: Position | None = None
+        self.work_direction: Direction | None = None
+        self.spawn_direction: Direction | None = None
         self.team = None
-        self.phase = PHASE_EXPLORE_TITANIUM
 
-        self.known_tiles: set[Position] = set()
-        self.known_walls: set[Position] = set()
-        self.known_titanium: set[Position] = set()
-        self.known_axionite: set[Position] = set()
-        self.known_buildings: dict[Position, tuple[EntityType, Direction | None] | None] = {}
-        self.known_building_teams: dict[Position, object | None] = {}
-
-        self.scan_depth = 1
-        self.max_distance_reached = 0
-
-        self.titanium_plan: dict[Position, tuple[str, Direction | None]] = {}
-        self.axionite_plan: dict[Position, tuple[str, Direction | None]] = {}
-        self.foundry_plan: FoundryPlan | None = None
-        self.target_tile: Position | None = None
-
-    def run(self, c: Controller) -> None:
-        super().run(c)
-        self.observe(c)
-        if self.team is None:
-            self.team = c.get_team()
-
-        if self.core_pos is None:
-            self.core_pos = self.find_home_core(c)
-        if self.core_pos is None:
-            return
-
-        if self.assigned_direction is None:
-            self.read_assignment(c)
-        if self.assigned_direction is None:
-            return
-
-        self.max_distance_reached = max(self.max_distance_reached, self.core_distance(c.get_position()))
-        self.update_phase(c)
-
-        if self.phase in {PHASE_EXPLORE_TITANIUM, PHASE_EXPLORE_EXPANDED}:
-            self.run_exploration_phase(c)
-            return
-
-        if self.phase == PHASE_BUILD_TITANIUM:
-            self.run_titanium_network_phase(c)
-            return
-
-        self.run_axionite_network_phase(c)
-
-    def update_phase(self, c: Controller) -> None:
-        if self.phase == PHASE_EXPLORE_TITANIUM:
-            if self.is_titanium_exploration_complete():
-                self.phase = PHASE_BUILD_TITANIUM
-                self.titanium_plan = {}
-                self.target_tile = None
-            return
-
-        if self.phase == PHASE_BUILD_TITANIUM:
-            if self.foundry_is_affordable(c):
-                self.phase = PHASE_BUILD_AXIONITE
-                self.axionite_plan = {}
-                self.foundry_plan = None
-                self.target_tile = None
-                return
-            if not self.has_pending_titanium_network():
-                self.phase = PHASE_EXPLORE_EXPANDED
-                self.target_tile = None
-            return
-
-        if self.phase == PHASE_EXPLORE_EXPANDED:
-            if self.foundry_is_affordable(c):
-                self.phase = PHASE_BUILD_AXIONITE
-                self.axionite_plan = {}
-                self.foundry_plan = None
-                self.target_tile = None
-                return
-            if self.has_pending_titanium_network():
-                self.phase = PHASE_BUILD_TITANIUM
-                self.titanium_plan = {}
-                self.target_tile = None
-            return
-
-        if self.phase == PHASE_BUILD_AXIONITE and not self.known_axionite_ores():
-            self.target_tile = None
-
-    def is_titanium_exploration_complete(self) -> bool:
-        ore_count = len(self.sector_titanium_ores())
-        return ore_count >= 1 and self.max_distance_reached > 5
-
-    def foundry_is_affordable(self, c: Controller) -> bool:
-        titanium, axionite = c.get_global_resources()
-        foundry_titanium, foundry_axionite = c.get_foundry_cost()
-        return titanium >= foundry_titanium and axionite >= foundry_axionite
-
-    def run_exploration_phase(self, c: Controller) -> None:
-        if self.try_build_nearby_titanium_harvester(c):
-            return
-        if self.try_build_road_underfoot(c):
-            return
-        target = self.choose_scan_target()
-        if target is None:
-            return
-        self.target_tile = target
-        self.move_towards_any(c, {target}, allow_ore=False, pave_roads=True)
-
-    def try_build_nearby_titanium_harvester(self, c: Controller) -> bool:
-        for ore in sorted(self.sector_titanium_ores(), key=lambda pos: c.get_position().distance_squared(pos)):
-            if self.is_harvester_built(ore):
-                continue
-            if c.get_position().distance_squared(ore) <= GameConstants.ACTION_RADIUS_SQ and c.can_build_harvester(ore):
-                c.build_harvester(ore)
-                self.known_buildings[ore] = (EntityType.HARVESTER, None)
-                self.known_building_teams[ore] = self.team
-                return True
-        return False
-
-    def try_build_road_underfoot(self, c: Controller) -> bool:
-        pos = c.get_position()
-        if not self.should_build_road(pos):
-            return False
-        if c.can_build_road(pos):
-            c.build_road(pos)
-            self.known_buildings[pos] = (EntityType.ROAD, None)
-            self.known_building_teams[pos] = self.team
-            return True
-        return False
-
-    def run_titanium_network_phase(self, c: Controller) -> None:
-        if not self.has_pending_titanium_network():
-            self.phase = PHASE_EXPLORE_EXPANDED
-            self.target_tile = None
-            return
-
-        if not self.titanium_plan:
-            self.titanium_plan = self.plan_conveyor_network(self.sector_titanium_ores())
-            if not self.titanium_plan:
-                self.phase = PHASE_EXPLORE_EXPANDED
-                return
-
-        build_target = self.choose_next_build_target(c, self.titanium_plan)
-        if build_target is None:
-            self.titanium_plan = {}
-            if not self.has_pending_titanium_network():
-                self.phase = PHASE_EXPLORE_EXPANDED
-            return
-
-        task_type, direction = self.titanium_plan[build_target]
-        if c.get_position().distance_squared(build_target) <= GameConstants.ACTION_RADIUS_SQ:
-            if self.try_execute_titanium_task(c, build_target, task_type, direction):
-                return
-
-        if task_type == "harvester":
-            goals = self.harvester_stand_positions(build_target)
-            if goals:
-                self.move_towards_any(c, goals, allow_ore=False, pave_roads=True)
-                return
-
-        self.move_towards_any(c, {build_target}, allow_ore=False, pave_roads=True)
-
-    def run_axionite_network_phase(self, c: Controller) -> None:
-        if self.foundry_plan is None:
-            self.foundry_plan = self.find_foundry_plan()
-
-        if self.foundry_plan is not None:
-            if not self.is_allied_foundry_at(self.foundry_plan.foundry_pos):
-                if self.try_build_foundry(c, self.foundry_plan.foundry_pos):
-                    return
-            elif self.ensure_foundry_links(c, self.foundry_plan):
-                return
-
-        if not self.known_axionite_ores():
-            self.run_exploration_phase(c)
-            return
-
-        if not self.axionite_plan:
-            self.axionite_plan = self.plan_road_network(self.known_axionite_ores())
-            if not self.axionite_plan:
-                return
-
-        build_target = self.choose_next_build_target(c, self.axionite_plan)
-        if build_target is None:
-            self.axionite_plan = self.plan_road_network(self.known_axionite_ores())
-            return
-
-        task_type, _ = self.axionite_plan[build_target]
-        if c.get_position().distance_squared(build_target) <= GameConstants.ACTION_RADIUS_SQ:
-            if self.try_execute_axionite_task(c, build_target, task_type):
-                return
-
-        if task_type == "harvester":
-            goals = self.harvester_stand_positions(build_target)
-            if goals:
-                self.move_towards_any(c, goals, allow_ore=False, pave_roads=True)
-                return
-
-        self.move_towards_any(c, {build_target}, allow_ore=False, pave_roads=True)
-
-    def read_assignment(self, c: Controller) -> None:
-        if self.core_pos is None:
-            return
-
-        spawn_lane = self.core_pos.direction_to(c.get_position())
-        if spawn_lane == Direction.CENTRE or spawn_lane not in ASSIGNMENT_DIRECTIONS:
-            return
-
-        self.assigned_index = direction_index(spawn_lane)
-        self.assigned_direction = ASSIGNMENT_DIRECTIONS[self.assigned_index]
-
-    def choose_scan_target(self) -> Position | None:
-        if self.core_pos is None or self.assigned_direction is None:
-            return None
-
-        forward_x, forward_y = direction_to_vector(self.assigned_direction)
-        side_x, side_y = direction_to_vector(rotate_left(self.assigned_direction))
-
-        max_depth = max(self.map_width, self.map_height)
-        while self.scan_depth <= max_depth:
-            depth = self.scan_depth
-            width = depth * 2 + 1
-            offsets = self.row_offsets(width)
-
-            for lateral in offsets:
-                target = Position(
-                    self.core_pos.x + forward_x * depth + side_x * lateral,
-                    self.core_pos.y + forward_y * depth + side_y * lateral,
-                )
-                if not self.in_bounds(target) or not self.is_in_sector(target):
-                    continue
-                if self.is_row_tile_complete(target):
-                    continue
-                return target
-
-            self.scan_depth += 1
-
-        return self.edge_target()
-
-    def row_offsets(self, width: int) -> list[int]:
-        offsets = [0]
-        half = width // 2
-        for delta in range(1, half + 1):
-            offsets.append(delta)
-            offsets.append(-delta)
-        return offsets
-
-    def is_row_tile_complete(self, pos: Position) -> bool:
-        if pos in self.known_walls or pos in self.known_titanium or pos in self.known_axionite:
-            return True
-
-        building = self.known_buildings.get(pos)
-        if building is None:
-            return False
-        return building[0] in ROADLIKE_BUILDINGS
-
-    def edge_target(self) -> Position | None:
-        if self.core_pos is None or self.assigned_direction is None:
-            return None
-        dx, dy = direction_to_vector(self.assigned_direction)
-        pos = self.core_pos
-        while True:
-            nxt = Position(pos.x + dx, pos.y + dy)
-            if not self.in_bounds(nxt):
-                return pos
-            pos = nxt
-
-    def move_towards_any(self, c: Controller, goals: set[Position], allow_ore: bool, pave_roads: bool) -> None:
-        current = c.get_position()
-        path = self.find_path(current, goals, allow_ore=allow_ore)
-        if path:
-            next_pos = path[0]
-            if self.try_prepare_or_move(c, next_pos, pave_roads):
-                return
-
-        detour = self.choose_right_hand_step(c, goals, allow_ore)
-        if detour is not None:
-            self.try_prepare_or_move(c, detour, pave_roads)
-
-    def choose_right_hand_step(self, c: Controller, goals: set[Position], allow_ore: bool) -> Position | None:
-        current = c.get_position()
-        primary = self.assigned_direction or Direction.NORTH
-        if self.target_tile is not None:
-            primary = current.direction_to(self.target_tile)
-            if primary == Direction.CENTRE:
-                primary = self.assigned_direction or Direction.NORTH
-
-        ordered = []
-        direction = primary
-        for _ in range(8):
-            ordered.append(direction)
-            direction = direction.rotate_right()
-
-        for direction in ordered:
-            if direction == Direction.CENTRE:
-                continue
-            nxt = current.add(direction)
-            if not self.in_bounds(nxt):
-                continue
-            if not self.can_travel_through(nxt, allow_ore, goals):
-                continue
-            return nxt
-        return None
-
-    def try_prepare_or_move(self, c: Controller, next_pos: Position, pave_roads: bool) -> bool:
-        current = c.get_position()
-        if current == next_pos:
-            return False
-
-        step = current.direction_to(next_pos)
-        if step == Direction.CENTRE:
-            return False
-
-        if pave_roads and self.should_build_road(next_pos):
-            if c.can_build_road(next_pos):
-                c.build_road(next_pos)
-                self.known_buildings[next_pos] = (EntityType.ROAD, None)
-                return True
-
-        if c.can_move(step):
-            c.move(step)
-            return True
-
-        return False
-
-    def should_build_road(self, pos: Position) -> bool:
-        if pos in self.known_titanium or pos in self.known_axionite or pos in self.known_walls:
-            return False
-        building = self.known_buildings.get(pos)
-        if building is None:
-            return True
-        return building[0] not in ROADLIKE_BUILDINGS
-
-    def choose_next_build_target(
-        self,
-        c: Controller,
-        plan: dict[Position, tuple[str, Direction | None]],
-    ) -> Position | None:
-        current = c.get_position()
-        best = None
-        best_score = 10**9
-        for pos, task in plan.items():
-            if self.is_task_done(pos, task[0], task[1]):
-                continue
-            goals = self.harvester_stand_positions(pos) if task[0] == "harvester" else {pos}
-            path = self.find_path(current, goals, allow_ore=False)
-            score = len(path) if path else current.distance_squared(pos)
-            if score < best_score:
-                best_score = score
-                best = pos
-        return best
-
-    def is_task_done(self, pos: Position, task_type: str, direction: Direction | None) -> bool:
-        building_info = self.known_buildings.get(pos)
-        if task_type == "harvester":
-            return building_info is not None and building_info[0] == EntityType.HARVESTER
-        if task_type == "conveyor":
-            return building_info is not None and building_info[0] == EntityType.CONVEYOR and building_info[1] == direction
-        if task_type == "road":
-            return building_info is not None and building_info[0] in ROADLIKE_BUILDINGS
-        return False
-
-    def try_execute_titanium_task(
-        self,
-        c: Controller,
-        pos: Position,
-        task_type: str,
-        direction: Direction | None,
-    ) -> bool:
-        building_id = c.get_tile_building_id(pos)
-
-        if task_type == "harvester":
-            if c.can_build_harvester(pos):
-                c.build_harvester(pos)
-                self.known_buildings[pos] = (EntityType.HARVESTER, None)
-                return True
-            return False
-
-        if building_id is not None:
-            entity_type = c.get_entity_type(building_id)
-            if entity_type == EntityType.CONVEYOR and c.get_direction(building_id) == direction:
-                self.known_buildings[pos] = (EntityType.CONVEYOR, direction)
-                return False
-            if entity_type in (EntityType.ROAD, EntityType.CONVEYOR):
-                if c.can_destroy(pos):
-                    c.destroy(pos)
-                    self.known_buildings[pos] = None
-                    return True
-                return False
-            return False
-
-        if direction is not None and c.can_build_conveyor(pos, direction):
-            c.build_conveyor(pos, direction)
-            self.known_buildings[pos] = (EntityType.CONVEYOR, direction)
-            return True
-
-        if c.can_build_road(pos):
-            c.build_road(pos)
-            self.known_buildings[pos] = (EntityType.ROAD, None)
-            return True
-
-        return False
-
-    def try_execute_axionite_task(self, c: Controller, pos: Position, task_type: str) -> bool:
-        if task_type == "harvester":
-            if c.can_build_harvester(pos):
-                c.build_harvester(pos)
-                self.known_buildings[pos] = (EntityType.HARVESTER, None)
-                return True
-            return False
-
-        if c.can_build_road(pos):
-            c.build_road(pos)
-            self.known_buildings[pos] = (EntityType.ROAD, None)
-            return True
-        return False
-
-    def try_build_foundry(self, c: Controller, pos: Position) -> bool:
-        if c.get_position().distance_squared(pos) > GameConstants.ACTION_RADIUS_SQ:
-            return self.move_towards_build_tile(c, pos)
-        building_id = c.get_tile_building_id(pos)
-        if building_id is not None:
-            if c.get_entity_type(building_id) == EntityType.FOUNDRY and c.get_team(building_id) == self.team:
-                self.known_buildings[pos] = (EntityType.FOUNDRY, None)
-                self.known_building_teams[pos] = self.team
-                return False
-            if c.can_destroy(pos):
-                c.destroy(pos)
-                self.known_buildings[pos] = None
-                self.known_building_teams[pos] = None
-                return True
-            return False
-        if c.can_build_foundry(pos):
-            c.build_foundry(pos)
-            self.known_buildings[pos] = (EntityType.FOUNDRY, None)
-            self.known_building_teams[pos] = self.team
-            return True
-        return False
-
-    def harvester_stand_positions(self, ore: Position) -> set[Position]:
-        goals = set()
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                if dx == 0 and dy == 0:
-                    continue
-                pos = Position(ore.x + dx, ore.y + dy)
-                if not self.in_bounds(pos):
-                    continue
-                if pos in self.known_walls or pos in self.known_titanium or pos in self.known_axionite:
-                    continue
-                building = self.known_buildings.get(pos)
-                if building is not None and building[0] not in PASSABLE_BUILDINGS:
-                    continue
-                goals.add(pos)
-        return goals
-
-    def plan_conveyor_network(self, ores: list[Position]) -> dict[Position, tuple[str, Direction | None]]:
-        if self.core_pos is None:
-            return {}
-
-        targets = sorted(
-            [ore for ore in ores if not self.is_harvester_built(ore)],
-            key=lambda pos: (self.core_distance(pos), pos.x, pos.y),
-        )
-        if not targets:
-            return {}
-
-        network_anchors = set(self.core_tiles())
-        plan: dict[Position, tuple[str, Direction | None]] = {}
-        remaining = list(targets)
-
-        while remaining:
-            best_ore = None
-            best_path = None
-            best_anchor = None
-            best_approach = None
-            best_score = 10**9
-
-            for ore in remaining:
-                for approach in self.ore_approaches(ore):
-                    path = self.find_cardinal_path(approach, network_anchors, ore)
-                    if path is None:
-                        continue
-                    anchor = path[1] if len(path) > 1 else self.closest_anchor(approach, network_anchors)
-                    if anchor is None:
-                        continue
-                    if approach.direction_to(anchor) == approach.direction_to(ore):
-                        continue
-                    if len(path) < best_score:
-                        best_score = len(path)
-                        best_ore = ore
-                        best_path = path
-                        best_anchor = anchor
-                        best_approach = approach
-
-            if best_ore is None or best_path is None or best_approach is None or best_anchor is None:
-                break
-
-            plan[best_ore] = ("harvester", None)
-            parent = best_anchor
-            for tile in reversed(best_path[:-1]):
-                plan[tile] = ("conveyor", tile.direction_to(parent))
-                network_anchors.add(tile)
-                parent = tile
-            network_anchors.add(best_approach)
-            remaining.remove(best_ore)
-
-        return plan
-
-    def plan_road_network(self, ores: list[Position]) -> dict[Position, tuple[str, Direction | None]]:
-        if self.core_pos is None:
-            return {}
-
-        targets = sorted(
-            [ore for ore in ores if not self.is_harvester_built(ore)],
-            key=lambda pos: (self.core_distance(pos), pos.x, pos.y),
-        )
-        if not targets:
-            return {}
-
-        anchors = set(self.core_tiles())
-        plan: dict[Position, tuple[str, Direction | None]] = {}
-        remaining = list(targets)
-
-        while remaining:
-            best_ore = None
-            best_path = None
-            best_score = 10**9
-
-            for ore in remaining:
-                for approach in self.ore_approaches(ore):
-                    path = self.find_cardinal_path(approach, anchors, ore)
-                    if path is None:
-                        continue
-                    if len(path) < best_score:
-                        best_score = len(path)
-                        best_ore = ore
-                        best_path = path
-
-            if best_ore is None or best_path is None:
-                break
-
-            plan[best_ore] = ("harvester", None)
-            for tile in best_path[:-1]:
-                plan[tile] = ("road", None)
-                anchors.add(tile)
-            remaining.remove(best_ore)
-
-        return plan
-
-    def find_foundry_plan(self) -> FoundryPlan | None:
-        if self.core_pos is None:
-            return None
-
-        titanium_tiles = self.find_resource_input_tiles(self.sector_titanium_ores())
-        axionite_tiles = self.find_resource_input_tiles(self.known_axionite_ores())
-        if not titanium_tiles or not axionite_tiles:
-            return None
-
-        best_plan = None
-        best_score = 10**9
-        for titanium_pos in titanium_tiles[:6]:
-            for axionite_pos in axionite_tiles[:6]:
-                if titanium_pos == axionite_pos:
-                    continue
-                common_neighbors = set(self.cardinal_adjacent_tiles(titanium_pos)) & set(self.cardinal_adjacent_tiles(axionite_pos))
-                for foundry_pos in common_neighbors:
-                    if not self.can_place_foundry_on(foundry_pos):
-                        continue
-                    output_pos, output_target = self.find_foundry_output(foundry_pos, titanium_pos, axionite_pos)
-                    if output_pos is None or output_target is None:
-                        continue
-                    score = self.core_distance(foundry_pos)
-                    score += self.core_distance(titanium_pos)
-                    score += self.core_distance(axionite_pos)
-                    if score < best_score:
-                        best_score = score
-                        best_plan = FoundryPlan(
-                            foundry_pos=foundry_pos,
-                            titanium_input=titanium_pos,
-                            axionite_input=axionite_pos,
-                            output_pos=output_pos,
-                            output_target=output_target,
-                        )
-        return best_plan
-
-    def find_resource_input_tiles(self, ores: list[Position]) -> list[Position]:
-        candidates = []
-        core_tiles = self.core_adjacent_tiles()
-        for pos in core_tiles:
-            if pos in self.known_walls or pos in self.known_titanium or pos in self.known_axionite:
-                continue
-            building = self.known_buildings.get(pos)
-            team = self.known_building_teams.get(pos)
-            if building is not None and team is not None and team != self.team:
-                continue
-            score = min((pos.distance_squared(ore) for ore in ores), default=10**6)
-            if building is not None and building[0] in {EntityType.CONVEYOR, EntityType.SPLITTER, EntityType.ROAD}:
-                score -= 20
-            candidates.append((score, pos))
-        candidates.sort(key=lambda item: item[0])
-        return [pos for _, pos in candidates]
-
-    def can_place_foundry_on(self, pos: Position) -> bool:
-        if not self.in_bounds(pos):
-            return False
-        if pos in self.known_walls or pos in self.known_titanium or pos in self.known_axionite:
-            return False
-        building = self.known_buildings.get(pos)
-        team = self.known_building_teams.get(pos)
-        return building is None or team == self.team and building[0] in PASSABLE_BUILDINGS
-
-    def find_foundry_output(
-        self,
-        foundry_pos: Position,
-        titanium_pos: Position,
-        axionite_pos: Position,
-    ) -> tuple[Position | None, Position | None]:
-        for output_pos in self.core_adjacent_tiles():
-            if output_pos in {titanium_pos, axionite_pos}:
-                continue
-            if output_pos.distance_squared(foundry_pos) != 1:
-                continue
-            return output_pos, self.core_pos
-        return None, None
-
-    def ensure_foundry_links(self, c: Controller, plan: FoundryPlan) -> bool:
-        splitter_direction = plan.titanium_input.direction_to(self.core_pos)
-        left_target = plan.titanium_input.add(splitter_direction.rotate_left())
-        right_target = plan.titanium_input.add(splitter_direction.rotate_right())
-        if plan.foundry_pos in {left_target, right_target}:
-            if self.ensure_transport_building(c, plan.titanium_input, splitter_direction, use_splitter=True):
-                return True
+        self.known_env: dict[Position, Environment] = {}
+        self.known_buildings: dict[Position, tuple[EntityType, object] | None] = {}
+        self.known_conveyor_directions: dict[Position, Direction] = {}
+        self.connected_network_cache: set[Position] | None = None
+        self.observed_tiles: set[Position] = set()
+        self.inferred_ores: dict[Position, Environment] = {}
+        self.reported_ores: dict[Position, Environment] = {}
+        self.assigned_ores: dict[Position, Environment] = {}
+        self.scout_frontier: set[Position] = set()
+        self.scout_frontier_initialized = False
+        self.unreachable_scout_targets: set[Position] = set()
+        self.scout_retry_pending = False
+        self.permanently_blocked: set[Position] = set()
+        self.yield_blocked_until: dict[Position, int] = {}
+        self.current_round = 0
+
+        self.target_ore: Position | None = None
+        self.target_resource = RESOURCE_TITANIUM
+        self.target_is_connection = False
+        self.scout_target: Position | None = None
+        self.scout_target_direct = False
+        self.path: list[Position] = []
+        self.path_index = 0
+        self.conveyor_path_tiles: set[Position] = set()
+        self.conveyor_directions: dict[Position, Direction] = {}
+        self.connection_anchor: Position | None = None
+        # Tiles laid by this builder for its current, not-yet-connected mine.
+        # They may be safely reused after a newly discovered obstacle forces a
+        # replan; conveyors made by any other builder remain immutable.
+        self.unfinished_branch_tiles: set[Position] = set()
+        self.pending_network_ores: set[Position] = set()
+        self.harvester_built = False
+        self.harvester_fail_count = 0
+        self.skipped_ores: set[Position] = set()
+        self.deferred_ores_until: dict[Position, int] = {}
+        self.next_select_round = 0
+        self.replan_after_yield = False
+        self.mode = "scout"
+        self.titanium_unlocked = False
+        self.scout_heading: Direction | None = None
+        self.scout_sweep_direction: Direction | None = None
+        self.connection_survey_heading: Direction | None = None
+        self.connection_survey_last_pos: Position | None = None
+
+        self.last_pos: Position | None = None
+        self.stuck_rounds = 0
+        self.rounds_alive = 0
+        self.last_progress_round = 0
+        self.recent_route: deque[Position] = deque()
+        self.recent_route_visits: dict[Position, int] = {}
+
+    def run(self, controller: Controller) -> None:
+        """Execute one turn of scouting, mining, or conveyor construction."""
+        self.rounds_alive += 1
+        self.current_round = controller.get_current_round()
+        current = controller.get_position()
+        if self.last_pos is not None and current == self.last_pos:
+            self.stuck_rounds += 1
         else:
-            if self.ensure_transport_building(
-                c,
-                plan.titanium_input,
-                plan.titanium_input.direction_to(plan.foundry_pos),
-                use_splitter=False,
-            ):
-                return True
+            self.stuck_rounds = 0
+            self.last_progress_round = self.rounds_alive
+            self.remember_route_position(current)
+        self.last_pos = current
 
-        if self.ensure_transport_building(
-            c,
-            plan.axionite_input,
-            plan.axionite_input.direction_to(plan.foundry_pos),
-            use_splitter=False,
+        # A mine already fitted with a harvester is a committed job.  Do not
+        # self-destruct its only worker merely because a competing builder or
+        # a temporary lack of titanium delayed one conveyor tile; replan the
+        # branch instead and keep the four-builder fleet intact.
+        if (
+            self.has_active_goal()
+            and not self.target_is_connection
+            and self.stuck_rounds >= STUCK_KILL_ROUNDS
         ):
-            return True
+            controller.self_destruct()
+            return
+        if (
+            self.has_active_goal()
+            and not self.target_is_connection
+            and self.rounds_alive - self.last_progress_round > MAX_IDLE_ROUNDS
+        ):
+            controller.self_destruct()
+            return
 
-        if plan.output_pos is not None and plan.output_target is not None:
-            if self.ensure_transport_building(
-                c,
-                plan.output_pos,
-                plan.output_pos.direction_to(plan.output_target),
-                use_splitter=False,
-            ):
-                return True
+        self.observe_tiles(controller)
+        if self.team is None:
+            self.team = controller.get_team()
+        if self.core_pos is None:
+            self.core_pos = self.find_home_core(controller)
+        if self.core_pos is None:
+            return
+        if self.enemy_estimate is None:
+            self.enemy_estimate = Position(
+                self.map_width - 1 - self.core_pos.x,
+                self.map_height - 1 - self.core_pos.y,
+            )
+        if self.work_direction is None:
+            self.spawn_direction = self.core_pos.direction_to(current)
+        self.read_ore_markers(controller)
+        if self.work_direction is None:
+            self.work_direction = self.spawn_direction
+            if self.work_direction not in ORTHOGONAL_DIRECTIONS:
+                self.work_direction = Direction.NORTH
+        if self.scout_heading is None:
+            self.scout_heading = self.work_direction
+            self.scout_sweep_direction = self.work_direction.rotate_right().rotate_right()
 
-        return False
+        self.titanium_unlocked = controller.get_global_resources()[0] > AXIONITE_TITANIUM_THRESHOLD
+        if not self.target_is_connection and self.try_build_nearby_harvester(controller, current):
+            return
+        if self.replan_after_yield:
+            self.replan_after_yield = False
+            if not self.replan_active_ore_target(controller):
+                if self.target_is_connection:
+                    self.survey_for_connection(controller)
+                    self.replan_after_yield = True
+                    return
+                self.select_new_target(controller)
+        else:
+            self.maybe_select_new_target(controller)
+        if self.target_ore is None and self.scout_target is None:
+            return
 
-    def ensure_transport_building(
-        self,
-        c: Controller,
-        pos: Position,
-        direction: Direction,
-        use_splitter: bool,
-    ) -> bool:
-        if c.get_position().distance_squared(pos) > GameConstants.ACTION_RADIUS_SQ:
-            return self.move_towards_build_tile(c, pos)
+        if (
+            self.target_ore is not None
+            and not self.target_is_connection
+            and current.distance_squared(self.target_ore) <= GameConstants.ACTION_RADIUS_SQ
+        ):
+            if self.is_harvester_on_tile(self.target_ore):
+                if self.ore_network_needs_work(self.target_ore):
+                    self.start_ore_connection(controller, current, self.target_ore)
+                else:
+                    self.clear_ore_target()
+                    self.select_new_target(controller)
+                return
+            if controller.can_build_harvester(self.target_ore):
+                # Do not leave an isolated harvester behind.  Reserve a valid
+                # branch to the core-connected conveyor tree *before* placing
+                # the harvester, while the ore approach is still known to be
+                # reachable.  The next turns build this exact branch.
+                if not self.assign_connection_target(controller, current, self.target_ore):
+                    self.defer_ore_for_survey(self.target_ore)
+                    self.clear_ore_target()
+                    self.select_new_target(controller)
+                    return
+                controller.build_harvester(self.target_ore)
+                self.record_harvester_built(self.target_ore)
+                return
 
-        building_id = c.get_tile_building_id(pos)
-        if building_id is not None:
-            entity_type = c.get_entity_type(building_id)
-            team = c.get_team(building_id)
-            existing_direction = None
-            if entity_type in {EntityType.CONVEYOR, EntityType.SPLITTER, EntityType.ARMOURED_CONVEYOR}:
-                existing_direction = c.get_direction(building_id)
-            if team == self.team:
-                if use_splitter and entity_type == EntityType.SPLITTER and existing_direction == direction:
-                    return False
-                if not use_splitter and entity_type == EntityType.CONVEYOR and existing_direction == direction:
-                    return False
-            if entity_type == EntityType.FOUNDRY:
-                return False
-            if c.can_destroy(pos):
-                c.destroy(pos)
+            self.harvester_fail_count += 1
+            if self.harvester_fail_count >= 5:
+                self.skipped_ores.add(self.target_ore)
+                self.clear_ore_target()
+                self.harvester_fail_count = 0
+                self.select_new_target(controller)
+                return
+
+        self.follow_path_and_build(controller)
+
+    def maybe_select_new_target(self, controller: Controller) -> None:
+        """Choose a fresh job when the current non-connection job is complete or absent."""
+        if self.target_is_connection:
+            return
+        current_round = controller.get_current_round()
+        need_target = (
+            self.harvester_built
+            or self.target_ore is not None and self.is_harvester_on_tile(self.target_ore)
+            or self.target_ore is None and self.scout_target is None and current_round >= self.next_select_round
+            or self.target_ore is None and self.scout_target is not None and self.mineable_ores()
+        )
+        if not need_target:
+            return
+        self.select_new_target(controller)
+        if self.target_ore is None and self.scout_target is None:
+            self.next_select_round = current_round + (1 if self.scout_retry_pending else 15)
+
+    def has_active_goal(self) -> bool:
+        """Return whether the builder currently has an ore or scouting destination."""
+        return self.target_ore is not None or self.scout_target is not None
+
+    def observe_tiles(self, controller: Controller) -> None:
+        """Refresh known terrain, buildings, conveyor directions, and scout frontier."""
+        # Buildings can change on every turn, so any previous transport graph
+        # snapshot is no longer authoritative.
+        self.connected_network_cache = None
+        for pos in controller.get_nearby_tiles():
+            env = controller.get_tile_env(pos)
+            old_env = self.known_env.get(pos)
+            first_observation = pos not in self.observed_tiles
+            self.observed_tiles.add(pos)
+            self.known_env[pos] = env
+            self.inferred_ores.pop(pos, None)
+            self.reported_ores.pop(pos, None)
+            if first_observation:
+                self.update_scout_frontier(pos)
+            if old_env != env and env in ORE_TYPES:
+                self.infer_symmetric(pos, env)
+            building_id = controller.get_tile_building_id(pos)
+            if building_id is None:
                 self.known_buildings[pos] = None
-                self.known_building_teams[pos] = None
-                return True
-            return False
+                self.known_conveyor_directions.pop(pos, None)
+            else:
+                building_type = controller.get_entity_type(building_id)
+                self.known_buildings[pos] = (building_type, controller.get_team(building_id))
+                if building_type in {EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR}:
+                    self.known_conveyor_directions[pos] = controller.get_direction(building_id)
+                else:
+                    self.known_conveyor_directions.pop(pos, None)
 
-        if use_splitter:
-            if c.can_build_splitter(pos, direction):
-                c.build_splitter(pos, direction)
-                self.known_buildings[pos] = (EntityType.SPLITTER, direction)
-                self.known_building_teams[pos] = self.team
-                return True
-            return False
+    def read_ore_markers(self, controller: Controller) -> None:
+        """Read core orders and shared ore hints from nearby marker buildings."""
+        records: list[tuple[int, Position, int]] = []
+        for entity_id in controller.get_nearby_entities():
+            if controller.get_entity_type(entity_id) != EntityType.MARKER:
+                continue
+            try:
+                kind, pos, payload = decode_marker(controller.get_marker_value(entity_id))
+            except Exception:
+                continue
+            records.append((kind, pos, payload))
 
-        if c.can_build_conveyor(pos, direction):
-            c.build_conveyor(pos, direction)
-            self.known_buildings[pos] = (EntityType.CONVEYOR, direction)
-            self.known_building_teams[pos] = self.team
-            return True
-        return False
+        # A newly created builder has no durable memory yet.  The core writes
+        # one handoff marker in the same round as spawn, which is necessary
+        # when a map edge forces it to use a non-cardinal core tile.
+        if self.work_direction is None:
+            for kind, pos, payload in records:
+                if kind not in {
+                    MARKER_KIND_SPAWN_DIRECTION,
+                    MARKER_KIND_SPAWN_ORE_TI,
+                    MARKER_KIND_SPAWN_ORE_AX,
+                }:
+                    continue
+                direction = BUILDER_CODE_DIRECTIONS.get(payload)
+                if direction is None:
+                    continue
+                self.work_direction = direction
+                if kind == MARKER_KIND_SPAWN_ORE_TI:
+                    self.assigned_ores[pos] = Environment.ORE_TITANIUM
+                elif kind == MARKER_KIND_SPAWN_ORE_AX:
+                    self.assigned_ores[pos] = Environment.ORE_AXIONITE
+                break
 
-    def core_tiles(self) -> list[Position]:
-        if self.core_pos is None:
-            return []
-        tiles = []
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                pos = Position(self.core_pos.x + dx, self.core_pos.y + dy)
-                if self.in_bounds(pos):
-                    tiles.append(pos)
-        return tiles
+        if self.work_direction is None and self.spawn_direction in ORTHOGONAL_DIRECTIONS:
+            self.work_direction = self.spawn_direction
 
-    def core_adjacent_tiles(self) -> list[Position]:
-        if self.core_pos is None:
-            return []
-        tiles = []
+        for kind, pos, payload in records:
+            if kind == MARKER_KIND_ORE_TI and pos not in self.observed_tiles:
+                self.reported_ores[pos] = Environment.ORE_TITANIUM
+            elif kind == MARKER_KIND_ORE_AX and pos not in self.observed_tiles:
+                self.reported_ores[pos] = Environment.ORE_AXIONITE
+            elif (
+                kind in {MARKER_KIND_SECTOR_ORE_TI, MARKER_KIND_SECTOR_ORE_AX}
+                and self.work_direction is not None
+                and BUILDER_CODE_DIRECTIONS.get(payload) == self.work_direction
+            ):
+                # Unlike a symmetry hint, a sector order comes from a core
+                # that has directly observed the ore.  It is therefore a real
+                # mining target even before this builder sees the tile itself.
+                self.assigned_ores[pos] = (
+                    Environment.ORE_TITANIUM
+                    if kind == MARKER_KIND_SECTOR_ORE_TI
+                    else Environment.ORE_AXIONITE
+                )
+
+    def infer_symmetric(self, pos: Position, env: Environment) -> None:
+        """Record the mirrored position as an exploration hint for observed ore."""
+        mirror = Position(self.map_width - 1 - pos.x, self.map_height - 1 - pos.y)
+        if mirror not in self.observed_tiles:
+            # Symmetry gives a useful exploration hint, but it is not enough
+            # evidence to construct a harvester or a conveyor branch there.
+            self.inferred_ores[mirror] = env
+
+    def update_scout_frontier(self, known_pos: Position) -> None:
+        """Update unknown boundary cells adjacent to a newly known tile."""
+        self.scout_frontier_initialized = True
+        self.scout_frontier.discard(known_pos)
         for direction in DIRECTIONS:
-            pos = self.core_pos.add(direction)
-            if self.in_bounds(pos):
-                tiles.append(pos)
-        return tiles
-
-    def cardinal_adjacent_tiles(self, pos: Position) -> list[Position]:
-        return [pos.add(direction) for direction in CARDINALS if self.in_bounds(pos.add(direction))]
-
-    def closest_anchor(self, origin: Position, anchors: set[Position]) -> Position | None:
-        best = None
-        best_score = 10**9
-        for anchor in anchors:
-            score = origin.distance_squared(anchor)
-            if score < best_score:
-                best_score = score
-                best = anchor
-        return best
-
-    def ore_approaches(self, ore: Position) -> list[Position]:
-        result = []
-        for direction in CARDINALS:
-            pos = ore.add(direction)
-            if not self.in_bounds(pos):
+            probe = known_pos.add(direction)
+            if not self.in_bounds(probe):
                 continue
-            if pos in self.known_walls or pos in self.known_titanium or pos in self.known_axionite:
-                continue
-            building = self.known_buildings.get(pos)
-            if building is not None and building[0] not in PASSABLE_BUILDINGS:
-                continue
-            result.append(pos)
-        result.sort(key=lambda pos: (self.core_distance(pos), pos.x, pos.y))
-        return result
+            if probe in self.known_env:
+                self.scout_frontier.discard(probe)
+            else:
+                self.scout_frontier.add(probe)
 
-    def find_cardinal_path(self, start: Position, goals: set[Position], blocked_ore: Position) -> list[Position] | None:
-        if start in goals:
-            return [start]
+    def rebuild_scout_frontier(self) -> None:
+        """Reconstruct the exploration frontier from all observed tiles."""
+        for known_pos in self.observed_tiles:
+            self.update_scout_frontier(known_pos)
 
-        queue = deque([start])
-        came_from = {start: start}
-
-        while queue:
-            current = queue.popleft()
-            for direction in CARDINALS:
-                nxt = current.add(direction)
-                if not self.in_bounds(nxt) or nxt in came_from:
+    def find_home_core(self, controller: Controller) -> Position | None:
+        """Locate the friendly core while it is within local vision."""
+        for entity_id in controller.get_nearby_entities():
+            if controller.get_entity_type(entity_id) == EntityType.CORE:
+                return controller.get_position(entity_id)
+        current = controller.get_position()
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                probe = Position(current.x + dx, current.y + dy)
+                if not self.in_bounds(probe):
                     continue
-                if nxt != blocked_ore and (nxt in self.known_titanium or nxt in self.known_axionite):
-                    continue
-                if nxt in self.known_walls:
-                    continue
-                building = self.known_buildings.get(nxt)
-                if building is not None and building[0] not in PASSABLE_BUILDINGS and nxt not in goals:
-                    continue
-                came_from[nxt] = current
-                if nxt in goals:
-                    path = [nxt]
-                    while path[-1] != start:
-                        path.append(came_from[path[-1]])
-                    path.reverse()
-                    return path
-                queue.append(nxt)
+                building_id = controller.get_tile_building_id(probe)
+                if building_id is not None and controller.get_entity_type(building_id) == EntityType.CORE:
+                    return controller.get_position(building_id)
         return None
 
-    def find_path(self, start: Position, goals: set[Position], allow_ore: bool) -> list[Position]:
-        queue = deque([start])
-        came_from = {start: start}
-
-        while queue:
-            current = queue.popleft()
-            if current in goals:
-                path = []
-                while current != start:
-                    path.append(current)
-                    current = came_from[current]
-                path.reverse()
-                return path
-
-            for direction in DIRECTIONS:
-                nxt = current.add(direction)
-                if not self.in_bounds(nxt) or nxt in came_from:
-                    continue
-                if not self.can_travel_through(nxt, allow_ore, goals):
-                    continue
-                came_from[nxt] = current
-                queue.append(nxt)
-        return []
-
-    def move_towards_build_tile(self, c: Controller, target: Position) -> bool:
-        goals = set()
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                pos = Position(target.x + dx, target.y + dy)
-                if pos == target or not self.in_bounds(pos):
-                    continue
-                if self.can_travel_through(pos, allow_ore=False, goals={pos}):
-                    goals.add(pos)
-        if not goals:
-            return False
-        self.move_towards_any(c, goals, allow_ore=False, pave_roads=True)
-        return True
-
-    def can_travel_through(self, pos: Position, allow_ore: bool, goals: set[Position]) -> bool:
-        if pos in self.known_walls:
-            return False
-        if pos in goals:
-            return True
-        if pos in self.known_titanium or pos in self.known_axionite:
-            return allow_ore
-        building = self.known_buildings.get(pos)
-        if building is None:
-            return True
-        return building[0] in PASSABLE_BUILDINGS
-
-    def sector_titanium_ores(self) -> list[Position]:
-        return [pos for pos in self.known_titanium if self.is_in_sector(pos)]
+    def known_titanium_ores(self) -> list[Position]:
+        """Return all directly observed titanium deposits."""
+        return [pos for pos, env in self.known_env.items() if env == Environment.ORE_TITANIUM]
 
     def known_axionite_ores(self) -> list[Position]:
-        return [pos for pos in self.known_axionite if self.is_in_sector(pos)]
+        """Return all directly observed axionite deposits."""
+        return [pos for pos, env in self.known_env.items() if env == Environment.ORE_AXIONITE]
 
-    def has_unconnected_titanium_ores(self) -> bool:
-        for ore in self.sector_titanium_ores():
-            if not self.is_harvester_built(ore):
-                return True
-        return False
+    def resource_at(self, pos: Position) -> Environment | None:
+        """Return the observed or core-assigned ore type at ``pos``."""
+        return self.known_env.get(pos) or self.assigned_ores.get(pos)
 
-    def has_pending_titanium_network(self) -> bool:
-        if self.titanium_plan:
-            for pos, task in self.titanium_plan.items():
-                if not self.is_task_done(pos, task[0], task[1]):
-                    return True
-        return bool(self.plan_conveyor_network(self.sector_titanium_ores()))
+    def is_ore_eligible(self, ore: Position) -> bool:
+        """Return whether this ore type is currently allowed to be mined."""
+        resource = self.resource_at(ore)
+        return resource == Environment.ORE_TITANIUM or (
+            resource == Environment.ORE_AXIONITE and self.titanium_unlocked
+        )
 
-    def is_harvester_built(self, pos: Position) -> bool:
+    def mineable_ores(self) -> list[Position]:
+        """Return eligible, unharvested, non-deferred local and assigned ores."""
+        known = self.known_titanium_ores()
+        if self.titanium_unlocked:
+            known += self.known_axionite_ores()
+        known += [ore for ore in self.assigned_ores if ore not in self.known_env]
+        return [
+            ore
+            for ore in known
+            if (
+                self.is_ore_eligible(ore)
+                and not self.is_harvester_on_tile(ore)
+                and not self.ore_is_deferred(ore)
+            )
+        ]
+
+    def observed_ores(self) -> list[Position]:
+        """Return eligible ore deposits that this builder has directly seen."""
+        return [
+            pos
+            for pos, env in self.known_env.items()
+            if pos in self.observed_tiles and env in ORE_TYPES and self.is_ore_eligible(pos)
+        ]
+
+    def is_harvester_on_tile(self, pos: Position) -> bool:
+        """Report whether the last observation shows a harvester at ``pos``."""
         building = self.known_buildings.get(pos)
         return building is not None and building[0] == EntityType.HARVESTER
 
-    def is_in_sector(self, pos: Position) -> bool:
-        if self.core_pos is None or self.assigned_direction is None:
+    def try_build_nearby_harvester(self, controller: Controller, current: Position) -> bool:
+        """Preflight and build a harvester on the best reachable adjacent ore."""
+        candidates = [
+            ore
+            for ore in self.observed_ores()
+            if (
+                not self.is_harvester_on_tile(ore)
+                and current.distance_squared(ore) <= GameConstants.ACTION_RADIUS_SQ
+            )
+        ]
+        candidates.sort(
+            key=lambda ore: (
+                0 if ore == self.target_ore and not self.target_is_connection else 1,
+                self.work_direction_priority(ore),
+                current.distance_squared(ore),
+            )
+        )
+        for ore in candidates:
+            if self.ore_is_deferred(ore):
+                continue
+            if not controller.can_build_harvester(ore):
+                continue
+            # A harvester is useful only with an already planned connection to
+            # the core-connected tree.  Planning first also prevents a bot
+            # from switching back to exploration immediately after the build.
+            if not self.assign_connection_target(controller, current, ore):
+                self.defer_ore_for_survey(ore)
+                if ore == self.target_ore:
+                    self.clear_ore_target()
+                continue
+            controller.build_harvester(ore)
+            self.record_harvester_built(ore)
+            return True
+        return False
+
+    def record_harvester_built(self, ore: Position) -> None:
+        """Update local state after successfully placing a harvester on ``ore``."""
+        self.known_buildings[ore] = (EntityType.HARVESTER, self.team)
+        self.harvester_built = True
+        self.last_progress_round = self.rounds_alive
+        self.harvester_fail_count = 0
+        self.skipped_ores.discard(ore)
+        self.assigned_ores.pop(ore, None)
+        self.reported_ores.pop(ore, None)
+        self.deferred_ores_until.pop(ore, None)
+        self.pending_network_ores.add(ore)
+
+    def defer_ore_for_survey(self, ore: Position) -> None:
+        """Temporarily resume exploration until a fully known branch exists."""
+        self.deferred_ores_until[ore] = self.current_round + 12
+
+    def ore_is_deferred(self, ore: Position) -> bool:
+        """Return whether ore processing is temporarily postponed for scouting."""
+        return self.deferred_ores_until.get(ore, -1) >= self.current_round
+
+    def clear_ore_target(self) -> None:
+        """Reset the current ore job and its associated path and branch state."""
+        self.target_ore = None
+        self.target_is_connection = False
+        self.path = []
+        self.path_index = 0
+        self.conveyor_path_tiles = set()
+        self.conveyor_directions = {}
+        self.connection_anchor = None
+        self.connection_survey_heading = None
+        self.connection_survey_last_pos = None
+        self.mode = "scout"
+
+    def assign_ore_target(
+            self,
+            controller: Controller,
+            current: Position,
+            ore: Position,
+            connecting: bool,
+    ) -> bool:
+        """Plan movement to an ore deposit or its preflighted conveyor branch."""
+        if connecting:
+            return self.assign_connection_target(controller, current, ore)
+
+        approaches = self.ore_action_approaches(ore)
+        if not approaches:
             return False
-        fx, fy = direction_to_vector(self.assigned_direction)
-        sx, sy = direction_to_vector(rotate_left(self.assigned_direction))
-        rel_x = pos.x - self.core_pos.x
-        rel_y = pos.y - self.core_pos.y
-        forward = rel_x * fx + rel_y * fy
-        side = rel_x * sx + rel_y * sy
-        return forward > 0 and abs(side) <= forward + 1
+        path = a_star_to_any(
+            controller,
+            current,
+            set(approaches),
+            self.traversable_for_planning,
+            movement_directions=DIRECTIONS,
+        )
+        if not path and current not in approaches:
+            return False
+        self.target_ore = ore
+        self.target_resource = (
+            RESOURCE_TITANIUM
+            if self.resource_at(ore) == Environment.ORE_TITANIUM
+            else RESOURCE_AXIONITE
+        )
+        self.target_is_connection = False
+        self.scout_target = None
+        self.path = path
+        self.path_index = 0
+        self.conveyor_path_tiles = set()
+        self.conveyor_directions = {}
+        self.connection_anchor = None
+        self.mode = "ore"
+        return True
+
+    def start_ore_connection(self, controller: Controller, current: Position, ore: Position) -> None:
+        """Start or retain responsibility for connecting a harvested ore to the tree."""
+        self.pending_network_ores.add(ore)
+        if not self.assign_connection_target(controller, current, ore):
+            # The harvester already exists, so retain ownership of this job
+            # and retry after new terrain/network information arrives.
+            self.target_ore = ore
+            self.target_is_connection = True
+            self.scout_target = None
+            self.path = []
+            self.path_index = 0
+            self.conveyor_path_tiles = set()
+            self.conveyor_directions = {}
+            self.connection_anchor = None
+            self.mode = "connect"
+            self.replan_after_yield = True
+
+    def replan_active_ore_target(self, controller: Controller) -> bool:
+        """Recompute the path for the active ore job after a route becomes invalid."""
+        if self.target_ore is None:
+            return False
+        ore = self.target_ore
+        connecting = self.target_is_connection
+        if self.assign_ore_target(controller, controller.get_position(), ore, connecting):
+            return True
+        if connecting:
+            self.pending_network_ores.add(ore)
+            # Do not abandon an already harvested ore if a just-observed
+            # obstacle invalidates its old route.  Keeping the target lets a
+            # later replan use a newly completed allied branch.
+            self.target_ore = ore
+            self.target_is_connection = True
+            self.scout_target = None
+            self.path = []
+            self.path_index = 0
+            self.conveyor_path_tiles = set()
+            self.conveyor_directions = {}
+            self.connection_anchor = None
+            self.mode = "connect"
+            return False
+        self.clear_ore_target()
+        return False
+
+    def ore_network_needs_work(self, ore: Position) -> bool:
+        """Return whether the harvester on ``ore`` lacks a path to the core."""
+        return not self.harvester_is_connected(ore)
+
+    def connection_candidates(self) -> set[Position]:
+        """Return harvested ores that still need to join the conveyor tree."""
+        candidates = set(self.pending_network_ores)
+        for ore in self.observed_ores():
+            if self.is_harvester_on_tile(ore) and self.ore_network_needs_work(ore):
+                candidates.add(ore)
+        return {
+            ore
+            for ore in candidates
+            if self.is_harvester_on_tile(ore) and self.ore_network_needs_work(ore)
+        }
+
+    def ore_action_approaches(self, ore: Position) -> list[Position]:
+        """Return movement tiles from which a builder can act on an ore deposit."""
+        return [
+            ore.add(direction)
+            for direction in DIRECTIONS
+            if self.traversable_for_planning(None, ore.add(direction))
+        ]
+
+    def core_receiver_tiles(self) -> set[Position]:
+        """Return in-bounds tiles that deliver resources directly into the core."""
+        if self.core_pos is None:
+            return set()
+        return {
+            Position(self.core_pos.x + dx, self.core_pos.y + dy)
+            for dx in range(-1, 2)
+            for dy in range(-1, 2)
+            if self.in_bounds(Position(self.core_pos.x + dx, self.core_pos.y + dy))
+        }
+
+    def is_core_receiver_tile(self, pos: Position) -> bool:
+        """Return whether a conveyor at ``pos`` can send resources into the core."""
+        return pos in self.core_receiver_tiles()
+
+    def known_connected_network(self) -> set[Position]:
+        """Return the part of the observed conveyor graph that truly reaches core."""
+        if self.connected_network_cache is not None:
+            return self.connected_network_cache
+
+        connected = self.core_receiver_tiles()
+        # Reverse edges let us traverse the directed conveyor graph from the
+        # core in linear time.  The earlier fixed-point scan became quadratic
+        # on a long line and could consume the per-turn time budget.
+        incoming: dict[Position, list[Position]] = {}
+        for pos, building in self.known_buildings.items():
+            if (
+                building is None
+                or building[1] != self.team
+                or building[0] not in {EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR}
+            ):
+                continue
+            direction = self.known_conveyor_directions.get(pos)
+            if direction is None:
+                continue
+            incoming.setdefault(pos.add(direction), []).append(pos)
+
+        queue = deque(connected)
+        while queue:
+            receiver = queue.popleft()
+            for source in incoming.get(receiver, []):
+                if source in connected:
+                    continue
+                connected.add(source)
+                queue.append(source)
+        self.connected_network_cache = connected
+        return connected
+
+    def network_receiver_accepts(self, receiver: Position, source: Position) -> bool:
+        """Return whether a connected receiver can accept flow from ``source``."""
+        if self.is_core_receiver_tile(receiver):
+            return True
+        building = self.known_buildings.get(receiver)
+        if building is None or building[1] != self.team:
+            return False
+        direction = self.known_conveyor_directions.get(receiver)
+        return direction is not None and direction != receiver.direction_to(source)
+
+    def harvester_is_connected(self, ore: Position) -> bool:
+        """Return whether a harvester has a directed allied conveyor path to core."""
+        network = self.known_connected_network()
+        for direction in ORTHOGONAL_DIRECTIONS:
+            receiver = ore.add(direction)
+            if receiver in network and self.network_receiver_accepts(receiver, ore):
+                return True
+        return False
+
+    def connection_plan(
+            self,
+            controller: Controller,
+            ore: Position,
+    ) -> tuple[Position, list[Position], dict[Position, Direction], Position] | None:
+        """Build the shortest new branch from an ore to the connected network.
+
+        Each successfully completed branch becomes part of the connected tree,
+        so choosing the closest valid receiver is an incremental Steiner-tree
+        expansion without ever joining an unconnected stray conveyor.
+        """
+        network = self.known_connected_network()
+        if not network:
+            return None
+        # A large known network is common later in a game.  Nearby receivers
+        # are enough to find the shortest useful merge and keep A* below the
+        # per-turn CPU budget.
+        nearby = sorted(
+            network,
+            key=lambda pos: max(abs(pos.x - ore.x), abs(pos.y - ore.y)),
+        )[:12]
+        anchors = set(nearby)
+        best = None
+        for approach in self.buildable_approaches(ore):
+            available_anchors = set(anchors)
+            route_blocked_tiles: set[Position] = set()
+            for _ in range(12):
+                if not available_anchors:
+                    break
+                # Existing connected tiles are allowed only as the final
+                # receiver.  Routing through one would overwrite a live
+                # conveyor and could disconnect an older mine.
+                def branch_tile_is_buildable(_controller: Controller | None, pos: Position) -> bool:
+                    """Allow only a free known branch tile or the chosen final anchor."""
+                    return pos in available_anchors or (
+                        pos not in network
+                        and pos not in route_blocked_tiles
+                        and self.traversable_for_connection(pos)
+                    )
+
+                route = a_star_to_any(
+                    controller,
+                    approach,
+                    available_anchors,
+                    branch_tile_is_buildable,
+                    movement_directions=ORTHOGONAL_DIRECTIONS,
+                )
+                if not route and approach not in available_anchors:
+                    break
+                anchor = approach if not route else route[-1]
+                build_tiles = [] if approach == anchor else [approach] + route[:-1]
+                source = ore if not build_tiles else build_tiles[-1]
+                if not self.network_receiver_accepts(anchor, source):
+                    available_anchors.discard(anchor)
+                    continue
+                full_path = build_tiles + [anchor]
+                directions = {
+                    tile: tile.direction_to(full_path[index + 1])
+                    for index, tile in enumerate(build_tiles)
+                }
+                if any(direction not in ORTHOGONAL_DIRECTIONS for direction in directions.values()):
+                    available_anchors.discard(anchor)
+                    continue
+                # We may reuse a pre-existing allied conveyor only when it
+                # already points along this exact branch.  A mismatching tile
+                # is excluded and A* tries a detour; it is never rewritten.
+                incompatible = next(
+                    (
+                        tile
+                        for tile, direction in directions.items()
+                        if self.is_incompatible_existing_conveyor(tile, direction)
+                    ),
+                    None,
+                )
+                if incompatible is not None:
+                    route_blocked_tiles.add(incompatible)
+                    continue
+                candidate = (approach, build_tiles, directions, anchor)
+                score = (len(build_tiles), max(abs(approach.x - ore.x), abs(approach.y - ore.y)))
+                if best is None or score < best[0]:
+                    best = (score, candidate)
+                break
+        return None if best is None else best[1]
+
+    def assign_connection_target(self, controller: Controller, current: Position, ore: Position) -> bool:
+        """Commit the shortest safe branch plan and path toward its first tile."""
+        plan = self.connection_plan(controller, ore)
+        if plan is None:
+            return False
+        approach, build_tiles, directions, anchor = plan
+        path_to_approach: list[Position] = []
+        if build_tiles:
+            path_to_approach = a_star_to_any(
+                controller,
+                current,
+                {approach},
+                self.traversable_for_planning,
+                movement_directions=DIRECTIONS,
+            )
+            if not path_to_approach and current != approach:
+                return False
+        path = list(path_to_approach)
+        for tile in build_tiles:
+            if not path or path[-1] != tile:
+                path.append(tile)
+        self.target_ore = ore
+        self.target_resource = (
+            RESOURCE_TITANIUM
+            if self.resource_at(ore) == Environment.ORE_TITANIUM
+            else RESOURCE_AXIONITE
+        )
+        self.target_is_connection = True
+        self.scout_target = None
+        self.path = path
+        self.path_index = 0
+        self.conveyor_path_tiles = set(build_tiles)
+        self.conveyor_directions = directions
+        self.connection_anchor = anchor
+        self.connection_survey_heading = None
+        self.connection_survey_last_pos = None
+        self.mode = "connect"
+        return True
+
+    def traversable_for_planning(self, _controller: Controller | None, pos: Position) -> bool:
+        """Return whether a builder may move through ``pos`` while planning a path."""
+        if (
+            not self.in_bounds(pos)
+            or pos in self.permanently_blocked
+            or self.is_yield_blocked(pos)
+        ):
+            return False
+        env = self.known_env.get(pos)
+        if env == Environment.WALL or env in ORE_TYPES:
+            return False
+        building = self.known_buildings.get(pos)
+        return building is None or building[0] in PASSABLE_BUILDINGS
+
+    def traversable_for_connection(self, pos: Position) -> bool:
+        """Whether a branch conveyor can be safely installed on ``pos``.
+
+        Movement may cross an opponent's road or conveyor, but a transport
+        branch cannot use it: it would either have no ownership or require an
+        impossible overwrite.  Keep the two predicates separate so A* still
+        has normal movement freedom while branch planning is ownership-safe.
+        """
+        if (
+            not self.in_bounds(pos)
+            or pos in self.permanently_blocked
+            or self.is_yield_blocked(pos)
+            # A conveyor branch is a committed construction job.  Unlike
+            # scouting, it must not invent a shortcut through unseen terrain:
+            # an unknown wall would otherwise leave a half-built branch with
+            # its last conveyor pointing into the obstacle.
+            or pos not in self.known_env
+        ):
+            return False
+        env = self.known_env.get(pos)
+        if env == Environment.WALL or env in ORE_TYPES:
+            return False
+        building = self.known_buildings.get(pos)
+        if building is None:
+            return True
+        building_type, building_team = building
+        # An already laid conveyor may belong to another builder's live route
+        # that is outside this bot's vision.  It is not rewriteable.  The
+        # connection planner validates its existing direction before using it
+        # as part of a branch; roads carry no resource flow and may safely be
+        # converted on the next action.
+        if building_team != self.team:
+            return False
+        if building_type == EntityType.ROAD:
+            return True
+        return building_type in {EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR}
+
+    def is_incompatible_existing_conveyor(self, pos: Position, direction: Direction) -> bool:
+        """Return whether an allied conveyor at ``pos`` points the wrong way."""
+        building = self.known_buildings.get(pos)
+        if (
+            building is None
+            or building[1] != self.team
+            or building[0] not in {EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR}
+        ):
+            return False
+        return self.known_conveyor_directions.get(pos) != direction
+
+    def buildable_approaches(self, ore_pos: Position) -> list[Position]:
+        """Return cardinal ore-adjacent tiles suitable for the first branch conveyor."""
+        return [
+            ore_pos.add(direction)
+            for direction in ORTHOGONAL_DIRECTIONS
+            if (
+                self.is_core_receiver_tile(ore_pos.add(direction))
+                or self.traversable_for_connection(ore_pos.add(direction))
+            )
+        ]
+
+    def work_direction_progress(self, pos: Position) -> int:
+        """Measure signed progress from the core along this builder's sector direction."""
+        if self.core_pos is None or self.work_direction is None:
+            return 0
+        forward = self.core_pos.add(self.work_direction)
+        return (
+            (pos.x - self.core_pos.x) * (forward.x - self.core_pos.x)
+            + (pos.y - self.core_pos.y) * (forward.y - self.core_pos.y)
+        )
+
+    def work_direction_priority(self, pos: Position) -> int:
+        """Prefer positions ahead of the core over positions outside the sector."""
+        if self.core_pos is None or self.work_direction is None:
+            return 0
+        return 0 if self.work_direction_progress(pos) > 0 else 1
 
     def core_distance(self, pos: Position) -> int:
+        """Return the Chebyshev distance from the core to ``pos``."""
         if self.core_pos is None:
-            return 10**9
-        return abs(pos.x - self.core_pos.x) + abs(pos.y - self.core_pos.y)
+            return 0
+        return max(abs(pos.x - self.core_pos.x), abs(pos.y - self.core_pos.y))
 
-    def observe(self, c: Controller) -> None:
-        for pos in c.get_nearby_tiles():
-            self.known_tiles.add(pos)
-            env = c.get_tile_env(pos)
-            if env == Environment.WALL:
-                self.known_walls.add(pos)
-            elif env == Environment.ORE_TITANIUM:
-                self.known_titanium.add(pos)
-            elif env == Environment.ORE_AXIONITE:
-                self.known_axionite.add(pos)
+    def work_direction_lateral_offset(self, pos: Position) -> int:
+        """Return the perpendicular distance from this builder's sector axis."""
+        if self.core_pos is None or self.work_direction is None:
+            return 0
+        forward = self.core_pos.add(self.work_direction)
+        return abs(
+            (pos.x - self.core_pos.x) * (forward.y - self.core_pos.y)
+            - (pos.y - self.core_pos.y) * (forward.x - self.core_pos.x)
+        )
 
-            building_id = c.get_tile_building_id(pos)
-            if building_id is None:
-                self.known_buildings[pos] = None
-                self.known_building_teams[pos] = None
+    def remember_route_position(self, pos: Position) -> None:
+        """Maintain a bounded recent-route history used to penalize revisits."""
+        if self.recent_route and self.recent_route[-1] == pos:
+            return
+        self.recent_route.append(pos)
+        self.recent_route_visits[pos] = self.recent_route_visits.get(pos, 0) + 1
+        if len(self.recent_route) <= SCOUT_ROUTE_MEMORY_TILES:
+            return
+        old_pos = self.recent_route.popleft()
+        old_count = self.recent_route_visits[old_pos] - 1
+        if old_count == 0:
+            del self.recent_route_visits[old_pos]
+        else:
+            self.recent_route_visits[old_pos] = old_count
+
+    def scout_path_step_cost(self, origin: Position, pos: Position) -> int:
+        """Return the additional A* cost for revisiting or moving back toward core."""
+        revisit_cost = self.recent_route_visits.get(pos, 0) * SCOUT_REVISIT_STEP_PENALTY
+        inward_steps = max(0, self.core_distance(origin) - self.core_distance(pos))
+        return revisit_cost + inward_steps * SCOUT_INWARD_STEP_PENALTY
+
+    def newly_visible_tiles(self, centre: Position) -> int:
+        """Count unknown tiles that would enter vision from ``centre``."""
+        visible = 0
+        for dx, dy in SCOUT_VISION_OFFSETS:
+            pos = Position(centre.x + dx, centre.y + dy)
+            if self.in_bounds(pos) and pos not in self.known_env:
+                visible += 1
+        return visible
+
+    def ore_hint_progress(self, current: Position, candidate: Position) -> int:
+        """Measure how much a candidate step approaches an inferred or reported ore hint."""
+        hints = set(self.inferred_ores) | set(self.reported_ores)
+        if not hints:
+            return 0
+        current_distance = min(
+            max(abs(current.x - hint.x), abs(current.y - hint.y))
+            for hint in hints
+        )
+        candidate_distance = min(
+            max(abs(candidate.x - hint.x), abs(candidate.y - hint.y))
+            for hint in hints
+        )
+        return max(0, current_distance - candidate_distance)
+
+    def scout_frontier_pre_score(self, current: Position, candidate: Position) -> tuple[int, int]:
+        """Score a frontier cheaply before calculating expensive visibility details."""
+        forward_progress = self.work_direction_progress(candidate)
+        in_sector = int(self.work_direction is None or forward_progress > 0)
+        returning = max(0, self.core_distance(current) - self.core_distance(candidate))
+        distance = max(abs(candidate.x - current.x), abs(candidate.y - current.y))
+        return in_sector, (
+            forward_progress * SCOUT_FORWARD_PROGRESS_WEIGHT
+            - returning * SCOUT_RETURN_TO_BASE_WEIGHT
+            - distance * SCOUT_DISTANCE_WEIGHT
+            + self.ore_hint_progress(current, candidate) * SCOUT_ORE_HINT_PROGRESS_WEIGHT
+        )
+
+    def scout_frontier_score(self, current: Position, candidate: Position) -> tuple[int, int]:
+        """Score a frontier by sector progress, new vision, routing, and ore hints."""
+        forward_progress = self.work_direction_progress(candidate)
+        in_sector = int(self.work_direction is None or forward_progress > 0)
+        returning = max(0, self.core_distance(current) - self.core_distance(candidate))
+        distance = max(abs(candidate.x - current.x), abs(candidate.y - current.y))
+        score = (
+            forward_progress * SCOUT_FORWARD_PROGRESS_WEIGHT
+            + self.newly_visible_tiles(candidate) * SCOUT_NEW_VISION_WEIGHT
+            - returning * SCOUT_RETURN_TO_BASE_WEIGHT
+            - distance * SCOUT_DISTANCE_WEIGHT
+            - self.work_direction_lateral_offset(candidate) * SCOUT_LATERAL_DEVIATION_WEIGHT
+            + self.ore_hint_progress(current, candidate) * SCOUT_ORE_HINT_PROGRESS_WEIGHT
+            + self.snake_sweep_bias(current, candidate)
+        )
+        return in_sector, score
+
+    def select_new_target(self, controller: Controller) -> None:
+        """Choose work in priority order: connections, mineable ore, then scouting."""
+        was_idle = not self.has_active_goal()
+        self.harvester_built = False
+        self.harvester_fail_count = 0
+        self.clear_ore_target()
+        self.scout_target = None
+        self.scout_target_direct = False
+        self.scout_retry_pending = False
+        current = controller.get_position()
+        ore_sort_key = lambda pos: (
+            0 if pos in self.assigned_ores else 1,
+            self.work_direction_priority(pos),
+            current.distance_squared(pos),
+        )
+
+        for ore in sorted(self.connection_candidates(), key=ore_sort_key):
+            if not self.assign_ore_target(controller, current, ore, connecting=True):
                 continue
+            if was_idle:
+                self.stuck_rounds = 0
+                self.last_progress_round = self.rounds_alive
+            return
 
-            entity_type = c.get_entity_type(building_id)
-            team = c.get_team(building_id)
-            direction = None
-            if entity_type in {
-                EntityType.CONVEYOR,
-                EntityType.ARMOURED_CONVEYOR,
-                EntityType.SPLITTER,
-                EntityType.GUNNER,
-                EntityType.SENTINEL,
-                EntityType.BREACH,
-            }:
-                direction = c.get_direction(building_id)
-            self.known_buildings[pos] = (entity_type, direction)
-            self.known_building_teams[pos] = team
+        for ore in sorted(set(self.mineable_ores()), key=ore_sort_key):
+            if self.is_harvester_on_tile(ore) or ore in self.skipped_ores:
+                continue
+            if not self.assign_ore_target(controller, current, ore, connecting=False):
+                continue
+            if was_idle:
+                self.stuck_rounds = 0
+                self.last_progress_round = self.rounds_alive
+            return
 
-    def find_home_core(self, c: Controller) -> Position | None:
-        for entity_id in c.get_nearby_entities():
-            if c.get_entity_type(entity_id) == EntityType.CORE:
-                return c.get_position(entity_id)
+        scout_target = self.choose_scout_target(controller)
+        if scout_target is not None:
+            # A selected frontier is intentionally reached greedily instead of
+            # by an A* search.  On a new builder that search dominated the
+            # 2 ms turn budget even for a five-cell route.  The following
+            # turns still validate/build every next tile, and fall back to the
+            # right-hand rule if the direct line meets an obstacle.
+            self.scout_target = scout_target
+            self.scout_target_direct = True
+            self.path = []
+            self.path_index = 0
+            self.mode = "scout"
+            if was_idle:
+                self.stuck_rounds = 0
+                self.last_progress_round = self.rounds_alive
+            return
+
+        # No usable frontier was found, so take one local right-hand step and
+        # let the next turn select a fresh frontier from the newly seen tiles.
+        step = self.choose_right_hand_scout_step(current)
+        if step is not None:
+            self.scout_target = step
+            self.scout_target_direct = False
+            self.path = [step]
+            self.path_index = 0
+            self.mode = "scout"
+            if was_idle:
+                self.stuck_rounds = 0
+                self.last_progress_round = self.rounds_alive
+            return
+        self.scout_retry_pending = True
+
+    def snake_sweep_bias(self, current: Position, candidate: Position) -> int:
+        """Bias exploration toward the current lateral leg of the snake sweep."""
+        if self.scout_sweep_direction is None:
+            return 0
+        dx, dy = self.scout_sweep_direction.delta()
+        lateral_step = (candidate.x - current.x) * dx + (candidate.y - current.y) * dy
+        if lateral_step > 0:
+            return 3
+        if lateral_step < 0:
+            return -3
+        return 0
+
+    def scout_a_star_traversable(self, pos: Position, target: Position) -> bool:
+        """Restrict scout A* to known terrain plus its single frontier endpoint."""
+        if not self.traversable_for_planning(None, pos):
+            return False
+        # A* may use the known map and enter its one frontier endpoint, but it
+        # must not invent an entire route through terrain it has never seen.
+        return pos == target or pos in self.known_env or self.is_core_receiver_tile(pos)
+
+    def scout_step_is_viable(self, pos: Position) -> bool:
+        """Return whether a one-step right-hand scouting move may use ``pos``."""
+        return self.traversable_for_planning(None, pos)
+
+    def choose_right_hand_scout_step(self, current: Position) -> Position | None:
+        """Choose a forward move or a clockwise wall-following scouting detour."""
+        if self.work_direction is None:
+            return None
+        forward = self.work_direction
+        forward_pos = current.add(forward)
+        if self.scout_step_is_viable(forward_pos):
+            self.scout_heading = forward
+            return forward_pos
+
+        heading = self.scout_heading or forward
+        direction = heading
+        # Rotate clockwise around the obstacle: this is the right-hand rule.
+        # The first open option becomes our wall-following heading; as soon as
+        # the assigned forward direction opens again, the branch above wins.
+        for _ in range(7):
+            direction = direction.rotate_right()
+            candidate = current.add(direction)
+            if not self.scout_step_is_viable(candidate):
+                continue
+            self.scout_heading = direction
+            if self.scout_sweep_direction is not None and direction == self.scout_sweep_direction.opposite():
+                self.scout_sweep_direction = self.scout_sweep_direction.opposite()
+            return candidate
         return None
 
-    def is_allied_foundry_at(self, pos: Position) -> bool:
-        building = self.known_buildings.get(pos)
-        team = self.known_building_teams.get(pos)
-        return building is not None and building[0] == EntityType.FOUNDRY and team == self.team
+    def survey_for_connection(self, controller: Controller) -> bool:
+        """Reveal a detour when a live branch reaches newly seen terrain.
+
+        A preflighted branch normally uses only the internal known map.  A
+        rival can nevertheless occupy one of its future cells while the
+        builder is walking there.  In that case keep the harvester job and
+        take one safe scouting step around the obstruction, then try A* again
+        with the newly visible cells instead of idling beside the break.
+        """
+        if self.core_pos is None:
+            return False
+        current = controller.get_position()
+        forward = current.direction_to(self.core_pos)
+        if forward == Direction.CENTRE:
+            return False
+
+        def can_survey_step(direction: Direction, allow_backtrack: bool = False) -> bool:
+            """Check whether one detour step can safely reveal new branch terrain."""
+            candidate = current.add(direction)
+            if (
+                not self.in_bounds(candidate)
+                or candidate in self.permanently_blocked
+                or candidate in self.unfinished_branch_tiles
+                or (not allow_backtrack and candidate == self.connection_survey_last_pos)
+                or not controller.can_move(direction)
+            ):
+                return False
+            env = self.known_env.get(candidate)
+            return env != Environment.WALL and env not in ORE_TYPES
+
+        # First resume the direct line toward the core.  If it is closed,
+        # retain a clockwise wall-following heading, so the survey actually
+        # walks around an obstruction instead of oscillating between two
+        # equally fresh cells.
+        if can_survey_step(forward):
+            direction = forward
+        else:
+            direction = self.connection_survey_heading or forward
+            for _ in range(7):
+                direction = direction.rotate_right()
+                if can_survey_step(direction):
+                    break
+            else:
+                # A genuine dead end may require one reverse step, but only
+                # after every non-backtracking wall-following option failed.
+                direction = self.connection_survey_heading or forward
+                for _ in range(7):
+                    direction = direction.rotate_right()
+                    if can_survey_step(direction, allow_backtrack=True):
+                        break
+                else:
+                    return False
+        controller.move(direction)
+        self.connection_survey_heading = direction
+        self.connection_survey_last_pos = current
+        self.stuck_rounds = 0
+        self.last_progress_round = self.rounds_alive
+        return True
+
+    def choose_scout_target(self, controller: Controller) -> Position | None:
+        """Select the highest-scoring reachable frontier tile for exploration."""
+        if not self.scout_frontier and self.known_env and not self.scout_frontier_initialized:
+            self.rebuild_scout_frontier()
+        current = controller.get_position()
+        candidates = [
+            pos for pos in self.scout_frontier
+            if (
+                pos not in self.known_env
+                and pos not in self.permanently_blocked
+                and pos not in self.unreachable_scout_targets
+            )
+        ]
+        candidates.sort(key=lambda pos: self.scout_frontier_pre_score(current, pos), reverse=True)
+        best = None
+        best_score = None
+        for pos in candidates[:SCOUT_FRONTIER_CANDIDATE_LIMIT]:
+            score = self.scout_frontier_score(current, pos)
+            if best_score is None or score > best_score:
+                best = pos
+                best_score = score
+        return best
+
+    def reject_scout_target(self, target: Position | None) -> None:
+        """Forget an unreachable frontier target and clear its obsolete path."""
+        if target is not None:
+            self.unreachable_scout_targets.add(target)
+            self.scout_frontier.discard(target)
+        self.scout_target = None
+        self.scout_target_direct = False
+        self.path = []
+        self.path_index = 0
+        self.conveyor_path_tiles = set()
+
+    def follow_path_and_build(self, controller: Controller) -> None:
+        """Advance along the active path, constructing branch conveyors when required."""
+        current = controller.get_position()
+        if self.scout_target is not None and self.scout_target_direct:
+            self.follow_direct_scout_target(controller, current)
+            return
+        # The path can begin on the ore-adjacent tile the builder already
+        # occupies when it erects the harvester.  Build that first conveyor
+        # before consuming the path node; otherwise the builder would walk
+        # away and leave the new harvester disconnected.
+        if self.target_is_connection and current in self.conveyor_path_tiles:
+            if self.ensure_tree_conveyor(controller, current):
+                return
+            if not self.has_expected_tree_conveyor(controller, current):
+                self.replan_or_wait_for_connection_tile(controller, current)
+                return
+        while self.path_index < len(self.path) and current == self.path[self.path_index]:
+            self.path_index += 1
+        if self.path_index >= len(self.path):
+            if self.scout_target is not None:
+                if current == self.scout_target:
+                    self.scout_target = None
+                else:
+                    self.reject_scout_target(self.scout_target)
+                    self.select_new_target(controller)
+            elif self.target_ore is not None:
+                if self.target_is_connection:
+                    if not self.harvester_is_connected(self.target_ore):
+                        if self.replan_active_ore_target(controller):
+                            return
+                        self.replan_after_yield = True
+                        return
+                    else:
+                        self.pending_network_ores.discard(self.target_ore)
+                        self.unfinished_branch_tiles.clear()
+                self.clear_ore_target()
+                self.select_new_target(controller)
+            return
+
+        next_pos = self.path[self.path_index]
+        direction = current.direction_to(next_pos)
+        if direction == Direction.CENTRE:
+            self.path_index += 1
+            return
+        if current.distance_squared(next_pos) > 2:
+            if self.target_is_connection:
+                self.schedule_replan_after_yield()
+                return
+            self.select_new_target(controller)
+            return
+        if self.target_is_connection and next_pos in self.conveyor_path_tiles:
+            if self.ensure_tree_conveyor(controller, next_pos):
+                return
+            if not self.has_expected_tree_conveyor(controller, next_pos):
+                self.replan_or_wait_for_connection_tile(controller, next_pos)
+                return
+        if not controller.is_tile_passable(next_pos):
+            self.try_prepare_tile(controller, next_pos)
+        if controller.can_move(direction):
+            controller.move(direction)
+            self.stuck_rounds = 0
+            self.last_progress_round = self.rounds_alive
+        elif not controller.is_tile_passable(next_pos):
+            self.replan_after_blocked_step(controller, next_pos)
+
+    def follow_direct_scout_target(self, controller: Controller, current: Position) -> None:
+        """Advance straight to a frontier and use the right-hand rule around a block."""
+        target = self.scout_target
+        if target is None:
+            self.scout_target_direct = False
+            return
+        if current == target:
+            self.scout_target = None
+            self.scout_target_direct = False
+            return
+
+        direct_direction = current.direction_to(target)
+        if self.try_move_scout_step(controller, current, direct_direction):
+            return
+
+        # The direct line is no longer usable.  Keep the same target, but
+        # inspect the immediate clockwise detour before giving it up.
+        self.scout_heading = direct_direction
+        detour = self.choose_right_hand_scout_step(current)
+        if detour is None:
+            self.reject_scout_target(target)
+            self.scout_retry_pending = True
+            return
+        detour_direction = current.direction_to(detour)
+        if not self.try_move_scout_step(controller, current, detour_direction):
+            self.scout_retry_pending = True
+
+    def try_move_scout_step(
+            self,
+            controller: Controller,
+            current: Position,
+            direction: Direction,
+    ) -> bool:
+        """Prepare and take one legal scouting step in ``direction`` if possible."""
+        if direction == Direction.CENTRE:
+            return False
+        next_pos = current.add(direction)
+        if not controller.is_tile_passable(next_pos):
+            self.try_prepare_tile(controller, next_pos)
+        if not controller.can_move(direction):
+            return False
+        controller.move(direction)
+        self.scout_heading = direction
+        self.stuck_rounds = 0
+        self.last_progress_round = self.rounds_alive
+        return True
+
+    def try_prepare_tile(self, controller: Controller, target: Position) -> None:
+        """Prepare a blocked next tile by building a road or branch conveyor."""
+        if self.target_is_connection and target in self.conveyor_path_tiles:
+            self.ensure_tree_conveyor(controller, target)
+            return
+        if controller.get_tile_builder_bot_id(target) is not None:
+            return
+        if controller.can_build_road(target):
+            controller.build_road(target)
+            self.last_progress_round = self.rounds_alive
+            return
+        self.mark_staticly_blocked(target)
+
+    def replan_after_blocked_step(self, controller: Controller, target: Position) -> None:
+        """Yield or recompute the active job when the next path tile is blocked."""
+        # is_tile_passable() is also false while another builder occupies an
+        # otherwise usable road.  For allied builders, entity IDs reflect spawn
+        # order: the later builder yields, while the earlier one keeps priority.
+        blocking_id = controller.get_tile_builder_bot_id(target)
+        if blocking_id is not None:
+            if controller.get_team(blocking_id) == self.team:
+                if blocking_id < controller.get_id():
+                    self.yield_to_higher_priority_builder(controller, target)
+                return
+            self.schedule_replan_after_yield()
+            return
+        self.mark_staticly_blocked(target)
+        if self.replan_active_ore_target(controller):
+            return
+        if self.target_is_connection:
+            self.replan_after_yield = True
+            return
+        if self.scout_target is not None:
+            self.reject_scout_target(self.scout_target)
+        else:
+            self.path = []
+            self.path_index = 0
+        self.select_new_target(controller)
+
+    def yield_to_higher_priority_builder(self, controller: Controller, blocking_pos: Position) -> None:
+        """Move aside for an earlier allied builder and schedule a fresh route."""
+        current = controller.get_position()
+        self.yield_blocked_until[blocking_pos] = self.current_round + YIELD_ROUTE_AVOID_ROUNDS
+        retreat_positions: list[Position] = []
+        seen: set[Position] = set()
+        for pos in reversed(self.recent_route):
+            if pos == current or pos == blocking_pos or pos in seen:
+                continue
+            seen.add(pos)
+            if current.distance_squared(pos) <= 2:
+                retreat_positions.append(pos)
+
+        # A newly spawned bot may not have route history yet.  In that case use
+        # any free neighbouring road, preferring a step away from the blocker.
+        route_history = set(self.recent_route)
+        fallback_positions = [
+            current.add(direction)
+            for direction in DIRECTIONS
+            if (
+                current.add(direction) != blocking_pos
+                and current.add(direction) not in route_history
+                and self.in_bounds(current.add(direction))
+            )
+        ]
+        fallback_positions.sort(
+            key=lambda pos: pos.distance_squared(blocking_pos),
+            reverse=True,
+        )
+
+        for retreat_pos in fallback_positions + retreat_positions:
+            direction = current.direction_to(retreat_pos)
+            if direction == Direction.CENTRE or not controller.can_move(direction):
+                continue
+            controller.move(direction)
+            self.stuck_rounds = 0
+            self.last_progress_round = self.rounds_alive
+            self.schedule_replan_after_yield()
+            return
+
+        # Even when there is no immediately passable retreat tile, discard the
+        # stale route so the next turn can attempt a different route or goal.
+        self.schedule_replan_after_yield()
+
+    def schedule_replan_after_yield(self) -> None:
+        """Discard the current route so the next turn can plan around a conflict."""
+        if self.target_ore is not None:
+            self.path = []
+            self.path_index = 0
+            self.conveyor_path_tiles = set()
+            self.conveyor_directions = {}
+            self.connection_anchor = None
+            self.replan_after_yield = True
+            return
+        self.scout_target = None
+        self.path = []
+        self.path_index = 0
+        self.conveyor_path_tiles = set()
+        self.conveyor_directions = {}
+        self.connection_anchor = None
+        self.replan_after_yield = True
+
+    def active_yield_blocked_tiles(self) -> set[Position]:
+        """Return tiles still temporarily avoided after yielding to an ally."""
+        return {
+            pos
+            for pos, expires_on_round in self.yield_blocked_until.items()
+            if self.current_round <= expires_on_round
+        }
+
+    def is_yield_blocked(self, pos: Position) -> bool:
+        """Return whether ``pos`` remains temporarily excluded after yielding."""
+        return self.yield_blocked_until.get(pos, -1) >= self.current_round
+
+    def mark_staticly_blocked(self, target: Position) -> None:
+        """Remember a tile as permanently unusable when its obstacle is static."""
+        env = self.known_env.get(target)
+        building = self.known_buildings.get(target)
+        if env != Environment.WALL and env not in ORE_TYPES:
+            if building is None or building[0] in PASSABLE_BUILDINGS:
+                return
+        self.permanently_blocked.add(target)
+
+    def ensure_tree_conveyor(self, controller: Controller, target: Position) -> bool:
+        """Build or safely reuse the correctly directed conveyor at a branch tile."""
+        conveyor_direction = self.get_conveyor_direction(target)
+        building_id = controller.get_tile_building_id(target)
+        if building_id is not None:
+            building_type = controller.get_entity_type(building_id)
+            if (
+                building_type in {EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR}
+                and controller.get_team(building_id) == self.team
+                and controller.get_direction(building_id) == conveyor_direction
+            ):
+                self.known_conveyor_directions[target] = conveyor_direction
+                return False
+            if building_type == EntityType.MARKER:
+                # Order-board markers are deliberately reserved cells.
+                self.permanently_blocked.add(target)
+                return False
+            if (
+                building_type == EntityType.ROAD
+                and controller.get_team(building_id) == self.team
+                and controller.can_destroy(target)
+            ):
+                controller.destroy(target)
+                self.known_buildings[target] = None
+                self.known_conveyor_directions.pop(target, None)
+                self.connected_network_cache = None
+                return True
+            if (
+                building_type in {EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR}
+                and controller.get_team(building_id) == self.team
+                and target in self.unfinished_branch_tiles
+                and target not in self.known_connected_network()
+                and controller.can_destroy(target)
+            ):
+                controller.destroy(target)
+                self.known_buildings[target] = None
+                self.known_conveyor_directions.pop(target, None)
+                self.connected_network_cache = None
+                return True
+            return False
+
+        if controller.can_build_conveyor(target, conveyor_direction):
+            controller.build_conveyor(target, conveyor_direction)
+            self.known_buildings[target] = (EntityType.CONVEYOR, self.team)
+            self.known_conveyor_directions[target] = conveyor_direction
+            self.unfinished_branch_tiles.add(target)
+            self.connected_network_cache = None
+            self.last_progress_round = self.rounds_alive
+            return True
+        return False
+
+    def has_expected_tree_conveyor(self, controller: Controller, target: Position) -> bool:
+        """Check that ``target`` contains the allied conveyor required by the plan."""
+        building_id = controller.get_tile_building_id(target)
+        if building_id is None or controller.get_team(building_id) != self.team:
+            return False
+        if controller.get_entity_type(building_id) not in {
+            EntityType.CONVEYOR,
+            EntityType.ARMOURED_CONVEYOR,
+        }:
+            return False
+        return controller.get_direction(building_id) == self.get_conveyor_direction(target)
+
+    def replan_or_wait_for_connection_tile(self, controller: Controller, target: Position) -> None:
+        """Never step past a branch tile that was not successfully built."""
+        if self.get_conveyor_direction(target) == Direction.CENTRE:
+            self.schedule_replan_after_yield()
+            return
+        if controller.get_tile_building_id(target) is None:
+            # Usually an action cooldown or a temporary resource shortage.
+            # Stay on the branch and try the exact same tile next turn.
+            return
+        # A foreign/indestructible building occupies the planned branch tile.
+        # Exclude it from the next A* search instead of walking through it and
+        # falsely declaring the harvester connected.
+        self.permanently_blocked.add(target)
+        self.schedule_replan_after_yield()
+
+    def get_conveyor_direction(self, target: Position) -> Direction:
+        """Return the planned outgoing direction for a branch conveyor tile."""
+        direction = self.conveyor_directions.get(target)
+        if direction is not None:
+            return direction
+        return Direction.CENTRE

@@ -7,7 +7,8 @@ from bot.geometry import chebyshev
 
 def a_star_to_any(ct: Controller, start: Position, goals: set[Position], traversable_fn,
                   preferred_tiles: set[Position] | None = None,
-                  movement_directions=ORTHOGONAL_DIRECTIONS) -> list[Position]:
+                  movement_directions=ORTHOGONAL_DIRECTIONS,
+                  extra_step_cost_fn=None) -> list[Position]:
     if start in goals:
         return []
 
@@ -39,6 +40,8 @@ def a_star_to_any(ct: Controller, start: Position, goals: set[Position], travers
 
             # Сильно удешевляем стоимость шага, если клетка лежит на ветке дерева Штейнера
             step_cost = 1 if nxt in preferred_tiles else 4
+            if extra_step_cost_fn is not None:
+                step_cost += extra_step_cost_fn(nxt)
             new_cost = cost + step_cost
 
             if new_cost >= g_score.get(nxt, LARGE_NUMBER):

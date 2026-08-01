@@ -38,16 +38,6 @@ def _is_buildable_for_conveyor(
     return True
 
 
-def _core_tiles(core_pos: Position, map_w: int, map_h: int) -> list[Position]:
-    tiles = []
-    for dy in range(-1, 2):
-        for dx in range(-1, 2):
-            p = Position(core_pos.x + dx, core_pos.y + dy)
-            if _in_bounds(p, map_w, map_h):
-                tiles.append(p)
-    return tiles
-
-
 def _collection_points(
         ore: Position,
         known_env: dict,
@@ -113,8 +103,9 @@ def compute_steiner_tree(
     - словарь, по которому строятся направления конвейеров
     """
 
-    core_tile_set: set[Position] = set(_core_tiles(core_pos, map_w, map_h))
-    tree_nodes: set[Position] = set(core_tile_set)
+    # Только сама клетка core уже принимает ресурсы. Соседние пустые клетки
+    # должны получить конвейер, направленный в core, а не быть корнями дерева.
+    tree_nodes: set[Position] = {core_pos}
     parent: dict[Position, Position] = {}
 
     def cheb(p: Position) -> int:
