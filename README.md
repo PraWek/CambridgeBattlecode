@@ -10,7 +10,7 @@ pip install -r requirements.txt
 ```
 Run
 ```
-cambc run starter nexus --watch
+cambc run nexus rc --watch
 ```
 
 ## Game rules

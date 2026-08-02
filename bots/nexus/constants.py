@@ -80,18 +80,6 @@ ORE_PATH_A_STAR_MAX_EXPANSIONS = 32
 CONNECTION_A_STAR_MAX_EXPANSIONS = 32
 CONNECTION_ROUTE_ATTEMPTS = 3
 
-# A harvester produces one stack every four rounds while a transport tile can
-# forward only one stack per round.  More than four harvesters on the same
-# downstream lane therefore cannot improve throughput.
-MAX_HARVESTERS_PER_LINE = 4
-
-# Bridge-aware routing is a fallback for a conveyor route obstructed by walls,
-# buildings, or a saturated transport lane.  Bridges are deliberately priced
-# much higher than conveyors so an ordinary detour wins whenever it is cheap.
-CONVEYOR_ROUTE_COST = 3
-BRIDGE_ROUTE_COST = 20
-BRIDGE_ROUTE_MAX_EXPANSIONS = 64
-
 # A lower-ID builder has right of way at a head-on collision.  The yielding
 # builder avoids the occupied tile long enough to choose a genuinely different
 # route instead of immediately entering the same bottleneck again.

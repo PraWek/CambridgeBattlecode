@@ -9,6 +9,3 @@ __pycache__/
 .venv/
 venv/
 
-# Logging
-log.txt
-cb.txt

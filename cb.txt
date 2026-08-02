@@ -1,44 +1,8 @@
-> ## Documentation Index
-> Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
-> Use this file to discover all available pages before exploring further.
+Cambridge Battlecode
 
-# Cambridge Battlecode
+Documentation for the Cambridge Battlecode programming competition.
+Cambridge Battlecode Cambridge Battlecode is a programming competition where you write Python bots that compete in a turn-based strategy game. Your bots control autonomous mining fleets on Titan — harvesting resources, building infrastructure, and destroying the enemy core. For competition details, dates, prizes, and eligibility, visit the main website.
 
-> Documentation for the Cambridge Battlecode programming competition.
-
-<img className="block dark:hidden" src="https://mintcdn.com/cambridgebattlecode/OKSh4NmznooMGXzL/images/battlecode-logo-dark.png?fit=max&auto=format&n=OKSh4NmznooMGXzL&q=85&s=6a36d0498d6d2aad05206f559c8f1727" alt="Cambridge Battlecode" style={{ maxWidth: 400, marginBottom: 16 }} width="1090" height="303" data-path="images/battlecode-logo-dark.png" />
-
-<img className="hidden dark:block" src="https://mintcdn.com/cambridgebattlecode/OKSh4NmznooMGXzL/images/battlecode-logo-light.png?fit=max&auto=format&n=OKSh4NmznooMGXzL&q=85&s=6cba937ea4ed750e7f6373130a09f373" alt="Cambridge Battlecode" style={{ maxWidth: 400, marginBottom: 16 }} width="1090" height="303" data-path="images/battlecode-logo-light.png" />
-
-Cambridge Battlecode is a programming competition where you write Python bots that compete in a turn-based strategy game. Your bots control autonomous mining fleets on Titan — harvesting resources, building infrastructure, and destroying the enemy core.
-
-For competition details, dates, prizes, and eligibility, visit the [main website](https://battlecode.cam).
-
-## Quick start
-
-```bash theme={"dark"}
-pip install cambc
-cambc starter
-cambc run starter starter --watch
-```
-
-<CardGroup cols={2}>
-  <Card title="Install and scaffold" icon="terminal" href="/getting-started/installation">
-    Install the CLI and run `cambc starter` to set up your project.
-  </Card>
-
-  <Card title="Write your first bot" icon="code" href="/getting-started/first-bot">
-    Learn the basics: spawning builder bots, placing conveyors, and harvesting resources.
-  </Card>
-
-  <Card title="Game rules" icon="book" href="/spec/overview">
-    Full game specification — map, resources, units, buildings, turrets, and win conditions.
-  </Card>
-
-  <Card title="API reference" icon="rectangle-terminal" href="/api/controller">
-    Every method available to your bot via the Controller object.
-  </Card>
-</CardGroup>
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -224,6 +188,7 @@ Only Python standard library modules are available. External packages (e.g. `num
 * **stdout** via `print("msg")` is captured by the engine and saved to the replay. You can view each unit's output in the visualiser.
 * **stderr** prints to the console in real time — use this for debugging during local runs.
 * `c.draw_indicator_line(pos_a, pos_b, r, g, b)` and `c.draw_indicator_dot(pos, r, g, b)` draw debug overlays on the map, saved to the replay.
+
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -320,6 +285,7 @@ When an entity is destroyed, its scaling contribution is removed — costs go ba
 <Tip>
   Every entity you build makes the next one more expensive. Be efficient with what you build!
 </Tip>
+
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -379,6 +345,7 @@ $$
 
 Converted axionite is removed from the Ax collected stat and added to the Ti
 collected stat.
+
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -477,6 +444,7 @@ c.self_destruct()
 ## Markers
 
 Builder bots (like all units) can place one [marker](/spec/other-buildings#marker) per round within action radius, separate from the action cooldown.
+
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -562,6 +530,7 @@ Key rules:
 * Harvesters and splitters prioritise outputting in directions **used least recently**
 * Foundries require one stack each of titanium and raw axionite before outputting one stack of refined axionite
 * Turrets only accept resources when completely empty
+
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -620,6 +589,7 @@ Takes one stack each of **titanium and raw axionite**, then outputs one stack of
 1. Feed titanium (via conveyor) → foundry stores it
 2. Feed raw axionite (via conveyor) → foundry combines them
 3. Foundry outputs one stack of refined axionite to an adjacent accepting building
+
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -696,6 +666,7 @@ Since each unit's `Player` instance is isolated, markers are essential for coord
 * **Scouting reports**: Write enemy positions to markers near your core
 * **Build orders**: Use marker values as state machine flags
 * **Territory claims**: Mark tiles to avoid duplicate work
+
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -886,6 +857,7 @@ a real turret, or `c.can_fire_from(position, direction, turret_type, target)` to
 test a hypothetical shot against the current map's range and obstruction rules.
 
 See the [Controller reference](/api/controller) for full method signatures.
+
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -1332,6 +1304,7 @@ Every entity you build increases the cost multiplier. Scale starts at 1.0x (100%
 $$
 \text{cost} = \lfloor \text{scale} \times \text{base cost} \rfloor
 $$
+
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -1757,6 +1730,7 @@ A single pair of methods that dispatches to the correct type-specific builder. U
 <ResponseField name="draw_indicator_dot(pos: Position, r: int, g: int, b: int)" type="None">
   Draw a debug dot at a position with RGB colour. Saved to the replay.
 </ResponseField>
+
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -1895,6 +1869,7 @@ class GameError(Exception):
 ```
 
 Raised when a player issues an invalid action (e.g., building on an occupied tile, moving with cooldown > 0).
+
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
 > Use this file to discover all available pages before exploring further.
@@ -2002,3 +1977,690 @@ max_turns = GameConstants.MAX_TURNS  # 2000
 | `BREACH_FIRE_COOLDOWN`             | 1       | Turns between breach shots                      |
 | `BREACH_AMMO_COST`                 | 5       | Refined axionite per shot                       |
 | `LAUNCHER_FIRE_COOLDOWN`           | 1       | Turns between launcher throws                   |
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Installation
+
+> Install the Cambridge Battlecode CLI and run your first local match.
+
+## Requirements
+
+* **Python 3.12 or 3.13** (3.14 is not supported)
+* **pip** (comes with Python)
+
+## Install
+
+```bash theme={"dark"}
+pip install cambc
+```
+
+This gives you both the CLI tool and the compiled Rust game engine as a native Python module. No Docker, Rust toolchain, or Node.js required.
+
+<Info>
+  The `cambc` package includes the full game engine compiled for your platform. Supported: macOS (Apple Silicon + Intel), Linux (x86\_64 + ARM64), Windows (x86\_64).
+</Info>
+
+## Verify
+
+```bash theme={"dark"}
+cambc --version
+```
+
+## Set up your project
+
+```bash theme={"dark"}
+cambc starter
+```
+
+This scaffolds a project with a `cambc.toml` config, `bots/` and `maps/` directories, a `.gitignore`, and optionally a starter bot. See the [CLI reference](/getting-started/cli#cambc-starter) for details.
+
+## What's included
+
+| Component             | Description                                                                               |
+| --------------------- | ----------------------------------------------------------------------------------------- |
+| `cambc` CLI           | Run local matches, open the visualiser, submit bots, trigger test runs                    |
+| `cambc` Python module | Game types (`Team`, `EntityType`, `Direction`, `Position`, etc.) for use in your bot code |
+| `titan_runner`        | The compiled Rust game engine (embedded, runs locally with no time limits)                |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Write your first bot" icon="arrow-right" href="/getting-started/first-bot">
+    Create a simple bot that spawns builders and starts harvesting.
+  </Card>
+
+  <Card title="CLI reference" icon="terminal" href="/getting-started/cli">
+    Full reference for all CLI commands.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Your First Bot
+
+> Write a basic bot that spawns builder bots and starts harvesting resources.
+
+## Get started with `cambc starter`
+
+If you haven't already, run `cambc starter` to scaffold your project. When prompted, choose to create the starter bot — it gives you a working bot to build on.
+
+```bash theme={"dark"}
+cambc starter
+```
+
+The starter bot demonstrates core mechanics: the core spawns builder bots, builders explore by laying roads, and when they find ore they build harvesters on it. Run it against itself to see it in action:
+
+```bash theme={"dark"}
+cambc run starter starter --watch
+```
+
+<Info>
+  Teams can have at most **50 living units total**, including the core. In larger bots, use `c.get_unit_count()` with `GameConstants.MAX_TEAM_UNITS` if you want the exact numbers. `c.can_spawn()` and any unit-producing `c.can_build_*()` method already account for the cap.
+</Info>
+
+## Bot structure
+
+Every bot is a Python file containing a `Player` class with a `run` method. The engine creates one `Player` instance per unit and calls `run(controller)` once per round.
+
+```python main.py theme={"dark"}
+"""Starter bot - a simple example to demonstrate usage of the Controller API.
+
+Each unit gets its own Player instance; the engine calls run() once per round.
+Use Controller.get_entity_type() to branch on what kind of unit you are.
+
+This bot:
+  - Core: spawns up to 3 builder bots on random adjacent tiles
+  - Builder bot: builds a harvester on any adjacent ore tile, then moves in a
+    random direction (laying a road first so the tile is passable), and places
+    a marker recording the current round number
+"""
+
+import random
+
+from cambc import Controller, Direction, EntityType, Environment, Position
+
+# non-centre directions
+DIRECTIONS = [d for d in Direction if d != Direction.CENTRE]
+
+class Player:
+    def __init__(self):
+        self.num_spawned = 0 # number of builder bots spawned so far (core)
+
+    def run(self, ct: Controller) -> None:
+        etype = ct.get_entity_type()
+        if etype == EntityType.CORE:
+            if self.num_spawned < 3:
+                # if we haven't spawned 3 builder bots yet, try to spawn one on a random tile
+                spawn_pos = ct.get_position().add(random.choice(DIRECTIONS))
+                if ct.can_spawn(spawn_pos):
+                    ct.spawn_builder(spawn_pos)
+                    self.num_spawned += 1
+        elif etype == EntityType.BUILDER_BOT:
+            # if we are adjacent to an ore tile, build a harvester on it
+            for d in Direction:
+                check_pos = ct.get_position().add(d)
+                if ct.can_build_harvester(check_pos):
+                    ct.build_harvester(check_pos)
+                    break
+
+            # move in a random direction
+            move_dir = random.choice(DIRECTIONS)
+            move_pos = ct.get_position().add(move_dir)
+            # we need to place a conveyor or road to stand on, before we can move onto a tile
+            if ct.can_build_road(move_pos):
+                ct.build_road(move_pos)
+            if ct.can_move(move_dir):
+                ct.move(move_dir)
+
+            # place a marker on an adjacent tile with the current round number
+            marker_pos = ct.get_position().add(random.choice(DIRECTIONS))
+            if ct.can_place_marker(marker_pos):
+                ct.place_marker(marker_pos, ct.get_current_round())
+```
+
+## Key concepts
+
+<AccordionGroup>
+  <Accordion title="One Player instance per unit">
+    Each unit (core, builder bot, turret) gets its own `Player` instance. Instance variables persist across rounds for that unit, but are **not shared** between units. Use [markers](/spec/other-buildings#marker) for inter-unit communication.
+  </Accordion>
+
+  <Accordion title="The Controller object">
+    The `controller` argument passed to `run()` provides all game queries and actions. See the full [Controller API reference](/api/controller).
+  </Accordion>
+
+  <Accordion title="Imports from cambc">
+    `from cambc import *` gives you all game types: `Team`, `EntityType`, `Direction`, `Position`, `ResourceType`, `Environment`, `GameConstants`, `GameError`, and `Controller`.
+  </Accordion>
+
+  <Accordion title="Time limit">
+    Each unit gets **2ms of CPU time** per round, plus a 5% buffer that refills when you use less. Locally there are no time limits — use remote test runs to check performance on the actual hardware.
+  </Accordion>
+
+  <Accordion title="No external packages">
+    Only Python standard library modules are available. External packages like `numpy` or `scipy` cannot be imported — bots run in a sandboxed environment with no `pip install`.
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Run a local match" icon="play" href="/getting-started/running-matches">
+    Test your bot against itself or an example opponent.
+  </Card>
+
+  <Card title="Game rules" icon="book" href="/spec/overview">
+    Understand the full game mechanics before optimising.
+  </Card>
+
+  <Card title="API reference" icon="rectangle-terminal" href="/api/controller">
+    Every method available via the Controller object.
+  </Card>
+
+  <Card title="Types and enums" icon="list" href="/api/types">
+    All game types: Team, EntityType, Direction, Position, and more.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Running Matches
+
+> Run local matches with the CLI and view replays in the visualiser.
+
+## Run a local match
+
+```bash theme={"dark"}
+cambc run <bot_a> <bot_b> [map]
+```
+
+This runs the full game engine locally with **no time limits** — ideal for rapid iteration. The engine outputs a `replay.replay26` file.
+
+Bot paths can be a directory containing `main.py`, a `.py` file, or a bot name from your `bots_dir` (set in `cambc.toml`). The optional map argument is a `.map26` file — if omitted, the first map in your `maps_dir` is used.
+
+```bash theme={"dark"}
+cambc run starter starter                        # bot vs itself
+cambc run my_bot opponent --seed 42              # deterministic seed
+cambc run my_bot opponent maps/custom.map26      # custom map
+cambc run my_bot opponent --replay out.replay26  # custom replay path
+```
+
+## View a replay
+
+```bash theme={"dark"}
+cambc watch replay.replay26
+```
+
+Opens the visualiser in your browser. Supports play/pause, round scrubbing, speed control, and keyboard navigation.
+
+### Run + watch in one command
+
+```bash theme={"dark"}
+cambc run --watch starter starter
+```
+
+### View a platform match
+
+```bash theme={"dark"}
+cambc watch --match <match_id>
+cambc watch --match <match_id> --game 3
+```
+
+## Remote test runs
+
+Remote commands require authentication — run `cambc login` first if you haven't already.
+
+Test your bots on the **same hardware** that runs ladder matches, with full time limit enforcement:
+
+```bash theme={"dark"}
+cambc match test <bot_a> <bot_b> [maps...]
+```
+
+This uploads both bots and runs a match on AWS Graviton3 instances with the 2ms CPU time limit enforced. Use this to catch performance issues before submitting.
+
+Bot paths for `match test` must be a directory containing `main.py` or a `.zip` file (unlike `cambc run`, arbitrary `.py` files are not accepted).
+
+```bash theme={"dark"}
+cambc match test my_bot opponent
+cambc match test my_bot opponent maps/custom.map26
+```
+
+<Warning>
+  Remote test runs are rate-limited: max 10 test/unrated matches per 10 minutes.
+</Warning>
+
+You can also challenge another team to an unrated match using both teams' latest submissions:
+
+```bash theme={"dark"}
+cambc match unrated <opponent_team_id>
+cambc match unrated <opponent_team_id> --map arena --map galaxy   # specific maps
+```
+
+## Debugging
+
+* **stdout** via `print("msg")` is captured and saved to the replay — view it per-unit in the visualiser
+* **stderr** prints to your console in real time
+* Use `c.draw_indicator_line()` and `c.draw_indicator_dot()` to draw debug overlays on the map
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Submit your bot" icon="cloud-arrow-up" href="/getting-started/submitting">
+    Upload your bot to compete on the ladder.
+  </Card>
+
+  <Card title="CLI reference" icon="terminal" href="/getting-started/cli">
+    Full reference for all CLI commands.
+  </Card>
+</CardGroup>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Submitting
+
+> Upload your bot to the platform to compete on the ladder.
+
+## Log in
+
+Before submitting, authenticate the CLI with your platform account:
+
+```bash theme={"dark"}
+cambc login
+```
+
+This opens a browser window to complete the OAuth flow. Your session persists until it expires or you run `cambc logout`.
+
+## Via CLI
+
+```bash theme={"dark"}
+cambc submit ./my_bot/
+```
+
+If you pass a directory, the CLI auto-zips it. You can also submit a zip file directly.
+
+## Via the platform
+
+1. Go to [game.battlecode.cam](https://game.battlecode.cam)
+2. Navigate to **Submissions** in the sidebar
+3. Upload your bot zip
+
+## Bot requirements
+
+Your submission must contain a `main.py` file with a `Player` class. The file can be at the root of the zip or inside a single top-level directory.
+
+| Constraint        | Limit                                                  |
+| ----------------- | ------------------------------------------------------ |
+| Zip size          | 5 MB max                                               |
+| Decompressed size | 50 MB max                                              |
+| File count        | 500 files max                                          |
+| Native extensions | **Not allowed** (`.so`, `.pyd`, `.dylib`, `.dll`)      |
+| Imports           | Must be top-level (file I/O is blocked during `run()`) |
+
+<Warning>
+  All imports must happen at the top of your file, not inside `run()`. The sandbox blocks file reads during gameplay for security.
+</Warning>
+
+## What happens after upload
+
+1. Your zip is validated (structure, size, no native extensions)
+2. Status is set to **ready**
+3. Your latest ready submission becomes your active bot on the ladder (you can also manually select which submission is active from the Submissions page)
+4. The scheduler pairs you against other teams every 10 minutes
+
+## Ladder
+
+The [ladder](https://game.battlecode.cam/ladder) ranks all teams by Elo rating. Every 10 minutes, the scheduler creates one match per team, pairing you with a nearby-rated opponent using greedy nearest-rating matching with small random jitter. Each match consists of **5 games** — the team that wins more games wins the match. Ratings update immediately after each match. See [How matches work](/getting-started/matches) for details.
+
+<Tip>
+  Use `cambc match test` to test your bot with full time limits on the same hardware as the ladder before submitting. Use `cambc match unrated` to challenge specific teams without affecting your rating.
+</Tip>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# How Matches Work
+
+> How ladder matches, Elo ratings, and the 5-game format work.
+
+## Match format
+
+Every match consists of **5 games**. Each game is played on a different map with a different random seed. The team that wins more games wins the match.
+
+### Win conditions per game
+
+A game ends when:
+
+| Condition              | Description                                                                                              |
+| ---------------------- | -------------------------------------------------------------------------------------------------------- |
+| **Core destroyed**     | One team's core reaches 0 HP                                                                             |
+| **Resigned**           | A team called [`resign()`](/api/controller#healing--destruction) — their core is destroyed and they lose |
+| **Axionite collected** | Tiebreaker 1: most total refined axionite delivered to the core                                          |
+| **Titanium collected** | Tiebreaker 2: most total titanium delivered to the core                                                  |
+| **Harvesters**         | Tiebreaker 3: most harvesters currently alive                                                            |
+| **Axionite stored**    | Tiebreaker 4: most axionite currently stored                                                             |
+| **Titanium stored**    | Tiebreaker 5: most titanium currently stored                                                             |
+| **Coinflip**           | Tiebreaker 6: random coinflip if all above are tied                                                      |
+
+If both cores survive 2000 rounds, the [tiebreaker sequence](/spec/overview#win-conditions) is evaluated in order. The match result shows exactly which condition decided the game.
+
+## Ladder
+
+The [ladder](https://game.battlecode.cam/ladder) ranks all teams by **Elo** rating. New teams start unrated and are seeded to 1500 when they upload their first ready submission.
+
+### Scheduling
+
+Every **10 minutes**, the scheduler:
+
+1. Pairs each team with one similarly-rated opponent (greedy nearest-rating matching with small random jitter to avoid repetitive matchups)
+2. Avoids rematches from the last hour
+3. Submits matches to the runner infrastructure
+
+With N teams, each cycle creates floor(N/2) matches — one match per team.
+
+### Rating updates
+
+Ratings are updated using **Elo** immediately after each match completes. Match outcomes use fractional scoring based on the game score (e.g., a 5-0 win counts more than a 3-2 win).
+
+Each team has a single Elo rating that moves up or down after each match.
+
+## Unrated matches
+
+You can challenge any team to an unrated match that doesn't affect ratings:
+
+```bash theme={"dark"}
+cambc match unrated <opponent_team_id>
+cambc match unrated <opponent_team_id> --map arena --map galaxy   # specific maps
+```
+
+Unrated matches use the same infrastructure and time limits as ladder matches but are prioritised for faster execution. You can optionally specify up to 5 maps — if omitted, 5 random maps are used.
+
+## Test runs
+
+Test runs let you upload two local bots and run them against each other on the same hardware as ladder matches:
+
+```bash theme={"dark"}
+cambc match test my_bot opponent
+```
+
+This is the best way to verify your bot works within the 2ms CPU time limit before submitting to the ladder.
+
+<Warning>
+  Rate limits: max 10 test/unrated matches per 10 minutes.
+</Warning>
+
+> ## Documentation Index
+> Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# CLI reference
+
+> Every command available in the cambc CLI.
+
+The `cambc` CLI is your main tool for local development, testing, and interacting with the platform. Install it with `pip install cambc`.
+
+## Project setup
+
+### `cambc starter`
+
+Scaffold a new Cambridge Battlecode project. Run this first after installing.
+
+```bash theme={"dark"}
+cambc starter
+```
+
+Creates the following project structure:
+
+```
+your-project/
+├── cambc.toml          # Project configuration
+├── .gitignore          # Ignores replays, __pycache__, venvs
+├── bots/
+│   └── starter/
+│       └── main.py     # Starter bot (optional, prompted)
+└── maps/               # Custom maps (optional, prompted)
+```
+
+The starter bot demonstrates core gameplay: the core spawns builder bots, builders explore by laying roads, and when they find ore they build harvesters on it.
+
+### `cambc.toml`
+
+The config file created by `cambc starter`. All fields have defaults and all CLI options override config values.
+
+```toml theme={"dark"}
+bots_dir = "bots"           # Where to find bots
+maps_dir = "maps"           # Where to find maps
+replay = "replay.replay26"  # Default replay output path
+seed = 1                    # Default map seed
+```
+
+Bot paths in `cambc run` are resolved by first checking the raw path, then checking inside `bots_dir`. So `cambc run starter opponent` resolves to `bots/starter` and `bots/opponent`.
+
+## Local development
+
+### `cambc run`
+
+Run a local match between two bots. No time limits are enforced locally.
+
+```bash theme={"dark"}
+cambc run <bot_a> <bot_b> [map]
+```
+
+**Arguments:**
+
+| Argument | Description                                                                         |
+| -------- | ----------------------------------------------------------------------------------- |
+| `bot_a`  | First bot — a directory containing `main.py`, a `.py` file, or a name in `bots_dir` |
+| `bot_b`  | Second bot — same formats as `bot_a`                                                |
+| `map`    | Optional `.map26` map file. If omitted, uses the first map in `maps_dir`            |
+
+**Options:**
+
+| Option          | Description                                                        |
+| --------------- | ------------------------------------------------------------------ |
+| `--replay PATH` | Output replay file path (overrides `cambc.toml` default)           |
+| `--seed N`      | Map seed (overrides `cambc.toml` default)                          |
+| `--watch`       | Open the visualiser automatically after the match                  |
+| `--tle N`       | Turn time limit in milliseconds (0 to disable, server uses 2)      |
+| `--map-random`  | Pick a random map from the maps directory instead of the first one |
+
+```bash theme={"dark"}
+cambc run starter starter                           # bot vs itself
+cambc run my_bot opponent --seed 42                 # fixed seed
+cambc run my_bot opponent maps/custom.map26         # custom map
+cambc run --watch my_bot opponent                   # run + auto-open visualiser
+cambc run my_bot opponent --replay out.replay26     # custom replay path
+```
+
+After the match completes, `cambc run` prints a summary showing the winner, win condition, turn count, and a resource breakdown (titanium, axionite, units, and buildings) for each team.
+
+### `cambc watch`
+
+View a replay in the browser-based visualiser.
+
+```bash theme={"dark"}
+cambc watch [replay_file]
+cambc watch --match <match_id> [--game <n>]
+```
+
+**Local replay:** Serves the visualiser on `localhost` and opens your browser. Press `Ctrl+C` to stop the server.
+
+```bash theme={"dark"}
+cambc watch replay.replay26
+```
+
+**Platform match:** Opens the platform visualiser in your browser for a specific match.
+
+```bash theme={"dark"}
+cambc watch --match abc123          # opens match on platform
+cambc watch --match abc123 --game 3 # specific game within the match
+```
+
+### `cambc map-editor`
+
+Open the map editor to create custom `.map26` files.
+
+```bash theme={"dark"}
+cambc map-editor              # local map editor
+cambc map-editor --platform   # open map editor on the platform
+```
+
+## Platform commands
+
+These commands interact with the online platform at [game.battlecode.cam](https://game.battlecode.cam). Most require authentication via `cambc login`.
+
+### `cambc login`
+
+Authenticate with the platform. Opens a browser window for OAuth login and stores your session locally.
+
+```bash theme={"dark"}
+cambc login
+```
+
+The session persists across CLI invocations until it expires or you run `cambc logout`.
+
+### `cambc logout`
+
+Clear stored credentials.
+
+```bash theme={"dark"}
+cambc logout
+```
+
+### `cambc submit`
+
+Upload a bot to compete on the ladder.
+
+```bash theme={"dark"}
+cambc submit <path>
+```
+
+The path can be a directory containing `main.py`, a single `.py` file, or a `.zip`. Directories are auto-zipped before upload. See [submission requirements](/getting-started/submitting#bot-requirements) for constraints.
+
+```bash theme={"dark"}
+cambc submit ./my_bot/       # directory (auto-zipped)
+cambc submit my_bot.py       # single file
+cambc submit my_bot.zip      # pre-zipped
+```
+
+### `cambc status`
+
+Show your current team, rating, rank, and member list.
+
+```bash theme={"dark"}
+cambc status
+```
+
+Displays your username, team name, category, Elo rating, matches played, and team members with roles.
+
+### `cambc match`
+
+The `cambc match` group provides all match-related commands. When called with just a match ID, it defaults to showing match details.
+
+#### `cambc match info`
+
+View details of a specific match including per-game results.
+
+```bash theme={"dark"}
+cambc match info <match_id>
+cambc match <match_id>          # shorthand — defaults to info
+```
+
+Shows match status, teams, score, rating delta, timestamps, and a table of individual games with map, winner, win condition, and turns played.
+
+#### `cambc match list`
+
+View recent match history.
+
+```bash theme={"dark"}
+cambc match list [options]
+```
+
+| Option                     | Description                                     |
+| -------------------------- | ----------------------------------------------- |
+| `--type {ladder\|unrated}` | Filter by match type                            |
+| `--team NAME`              | Filter by team name or ID                       |
+| `--mine`                   | Show only your team's matches                   |
+| `--limit N`                | Number of matches to show (default 20, max 100) |
+| `--cursor CURSOR`          | Pagination cursor from previous results         |
+
+#### `cambc match unrated`
+
+Challenge another team to an unrated match.
+
+```bash theme={"dark"}
+cambc match unrated <opponent_team_id>
+cambc match unrated <opponent_team_id> --match <source_match_id>
+cambc match unrated <opponent_team_id> --map arena --map galaxy
+```
+
+| Option       | Description                                                                              |
+| ------------ | ---------------------------------------------------------------------------------------- |
+| `--match ID` | Use the opponent's submission version from a specific past match instead of their latest |
+| `--map NAME` | Map name (repeatable, up to 5). If omitted, 5 random maps are used                       |
+
+Unrated matches run on the same AWS infrastructure as ladder matches with full time limit enforcement but do not affect ratings. They are prioritised over ladder matches for faster results.
+
+<Warning>
+  Rate limits apply: max 10 test/unrated matches per 10 minutes.
+</Warning>
+
+#### `cambc match test`
+
+Upload two local bots and run a remote match with full time limit enforcement on AWS Graviton3 hardware.
+
+```bash theme={"dark"}
+cambc match test <bot_a> <bot_b> [maps...]
+```
+
+Both bots are packaged and uploaded to the server. Unlike `cambc run`, this enforces the 2ms CPU time limit per round — use this to check your bot's performance before submitting. You can optionally specify `.map26` files — one per game.
+
+```bash theme={"dark"}
+cambc match test my_bot opponent                           # test two bots remotely
+cambc match test my_bot opponent maps/arena.map26          # with a specific map
+```
+
+#### `cambc match replay`
+
+Download replay files for a completed match.
+
+```bash theme={"dark"}
+cambc match replay <match_id>              # download all 5 game replays
+cambc match replay <match_id> --game 3     # download a specific game
+cambc match replay <match_id> -o out.replay26  # custom output path
+```
+
+#### `cambc match watch`
+
+Open a match replay in the browser.
+
+```bash theme={"dark"}
+cambc match watch <match_id>
+cambc match watch <match_id> --game 3
+```
+
+#### `cambc match tests`
+
+View your team's remote test run history.
+
+```bash theme={"dark"}
+cambc match tests [--limit N]
+```
+
+### `cambc team`
+
+Search for teams or view team details.
+
+```bash theme={"dark"}
+cambc team search <query>     # search by name
+cambc team info <team_id>     # view team details
+```
