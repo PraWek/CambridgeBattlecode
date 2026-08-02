@@ -72,6 +72,14 @@ SCOUT_LATERAL_DEVIATION_WEIGHT = 2
 SCOUT_ORE_HINT_PROGRESS_WEIGHT = 4
 SCOUT_FRONTIER_CANDIDATE_LIMIT = 12
 
+# A failed route must leave enough CPU time for the builder to fall back to
+# exploration.  A nearby valid route normally finishes well below this bound;
+# a longer or currently disconnected target is deferred until more terrain is
+# known instead of consuming the whole turn.
+ORE_PATH_A_STAR_MAX_EXPANSIONS = 32
+CONNECTION_A_STAR_MAX_EXPANSIONS = 32
+CONNECTION_ROUTE_ATTEMPTS = 3
+
 # A lower-ID builder has right of way at a head-on collision.  The yielding
 # builder avoids the occupied tile long enough to choose a genuinely different
 # route instead of immediately entering the same bottleneck again.

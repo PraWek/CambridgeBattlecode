@@ -28,9 +28,8 @@ class CoreBot(BaseBot):
         """Initialize the core's map memory, sector orders, and marker board."""
         super().__init__(map_width, map_height)
         self.core_pos: Position | None = None
-        self.team = None
-        self.known_env: dict[Position, Environment] = {}
-        self.known_buildings: dict[Position, tuple[EntityType, object] | None] = {}
+        self.known_env = self.tile_cache.environments
+        self.known_buildings = self.tile_cache.buildings
 
         self.initial_spawned_directions: set[Direction] = set()
         self.replacement_direction_index = 0
@@ -43,10 +42,9 @@ class CoreBot(BaseBot):
 
     def run(self, controller: Controller) -> None:
         """Observe the map, update sector orders, and keep four builders alive."""
-        self.observe_tiles(controller)
-        self.core_pos = controller.get_position()
-        if self.team is None:
-            self.team = controller.get_team()
+        self._scan_turn(controller)
+        self.observe_tiles()
+        self.core_pos = self.get_cached_position()
         if not self.sector_marker_pads:
             self.sector_marker_pads, self.spawn_order_pad = self.find_sector_marker_pads(controller)
             self.sector_marker_values = {
@@ -61,18 +59,12 @@ class CoreBot(BaseBot):
             # write per round is a game rule, so update the board round-robin.
             self.sync_one_changed_sector_marker(controller)
 
-    def observe_tiles(self, controller: Controller) -> None:
+    def observe_tiles(self) -> None:
         """Refresh the core's local terrain and building observations."""
-        for pos in controller.get_nearby_tiles():
-            self.known_env[pos] = controller.get_tile_env(pos)
-            building_id = controller.get_tile_building_id(pos)
-            if building_id is None:
-                self.known_buildings[pos] = None
-            else:
-                self.known_buildings[pos] = (
-                    controller.get_entity_type(building_id),
-                    controller.get_team(building_id),
-                )
+        # BaseBot has already refreshed these shared cache indexes.  This
+        # method deliberately keeps the role-level observation boundary while
+        # performing no additional Controller queries.
+        return
 
     def find_sector_marker_pads(
             self,
@@ -259,7 +251,14 @@ class CoreBot(BaseBot):
             value = encode_marker(kind, ore_pos, BUILDER_DIRECTION_CODES[direction])
         if not controller.can_place_marker(self.spawn_order_pad):
             return False
-        controller.place_marker(self.spawn_order_pad, value)
+        marker_id = controller.place_marker(self.spawn_order_pad, value)
+        self.tile_cache.remember_building(
+            self.spawn_order_pad,
+            marker_id,
+            EntityType.MARKER,
+            self.team,
+            marker_value=value,
+        )
         self.spawn_order_target = None if target is None else target[0]
         return True
 
@@ -269,10 +268,12 @@ class CoreBot(BaseBot):
             return
         if not self.is_harvester_on_tile(self.spawn_order_target):
             return
-        building_id = controller.get_tile_building_id(self.spawn_order_pad)
-        if building_id is not None and controller.get_entity_type(building_id) == EntityType.MARKER:
-            if controller.get_team(building_id) == self.team and controller.can_destroy(self.spawn_order_pad):
+        building_id = self.tile_cache.building_id_at(self.spawn_order_pad)
+        building = self.tile_cache.building_at(self.spawn_order_pad)
+        if building_id is not None and building is not None and building[0] == EntityType.MARKER:
+            if building[1] == self.team and controller.can_destroy(self.spawn_order_pad):
                 controller.destroy(self.spawn_order_pad)
+                self.tile_cache.forget_building(self.spawn_order_pad)
         self.spawn_order_target = None
 
     def desired_sector_marker_value(self, direction: Direction) -> int | None:
@@ -315,13 +316,22 @@ class CoreBot(BaseBot):
         if desired is None:
             # Destruction is free and removes a completed mine from the order
             # board instead of leaving a stale target for a replacement bot.
-            building_id = controller.get_tile_building_id(pad)
-            if building_id is not None and controller.get_entity_type(building_id) == EntityType.MARKER:
-                if controller.get_team(building_id) == self.team and controller.can_destroy(pad):
+            building_id = self.tile_cache.building_id_at(pad)
+            building = self.tile_cache.building_at(pad)
+            if building_id is not None and building is not None and building[0] == EntityType.MARKER:
+                if building[1] == self.team and controller.can_destroy(pad):
                     controller.destroy(pad)
+                    self.tile_cache.forget_building(pad)
             self.sector_marker_values[direction] = None
             return
 
         if controller.can_place_marker(pad):
-            controller.place_marker(pad, desired)
+            marker_id = controller.place_marker(pad, desired)
+            self.tile_cache.remember_building(
+                pad,
+                marker_id,
+                EntityType.MARKER,
+                self.team,
+                marker_value=desired,
+            )
             self.sector_marker_values[direction] = desired

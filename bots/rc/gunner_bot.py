@@ -1,4 +1,4 @@
-from cambc import Controller, Direction, EntityType, Position
+from cambc import Controller, Direction, Position
 
 from base import BaseBot
 from constants import MARKER_KIND_ENEMY
@@ -8,25 +8,31 @@ from geometry import decode_marker
 class GunnerBot(BaseBot):
     def run(self, controller: Controller) -> None:
         """Fire at an available target or rotate toward a shared enemy marker."""
+        self._scan_turn(controller, read_markers=True)
         target = controller.get_gunner_target()
         if target is not None and controller.can_fire(target):
             controller.fire(target)
             return
 
-        marker_target = self.read_enemy_marker(controller)
+        marker_target = self.read_enemy_marker()
         if marker_target is None:
             return
-        desired = controller.get_position().direction_to(marker_target)
-        if desired != Direction.CENTRE and desired != controller.get_direction() and controller.can_rotate(desired):
+        desired = self.get_cached_position().direction_to(marker_target)
+        current_direction = (
+            None if self.entity_id is None
+            else self.tile_cache.entity_direction(self.entity_id)
+        )
+        if desired != Direction.CENTRE and desired != current_direction and controller.can_rotate(desired):
             controller.rotate(desired)
 
-    def read_enemy_marker(self, controller: Controller) -> Position | None:
+    def read_enemy_marker(self) -> Position | None:
         """Return the first nearby marker that contains an enemy position."""
-        for entity_id in controller.get_nearby_entities():
-            if controller.get_entity_type(entity_id) != EntityType.MARKER:
+        for entity_id in self.tile_cache.marker_ids():
+            marker_value = self.tile_cache.marker_values.get(entity_id)
+            if marker_value is None:
                 continue
             try:
-                kind, pos, _ = decode_marker(controller.get_marker_value(entity_id))
+                kind, pos, _ = decode_marker(marker_value)
             except Exception:
                 continue
             if kind == MARKER_KIND_ENEMY:
