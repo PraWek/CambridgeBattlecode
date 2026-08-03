@@ -58,9 +58,6 @@ MARKER_X_BASE = 10_000
 MARKER_Y_BASE = 100
 
 LARGE_NUMBER = 10**9
-STUCK_KILL_ROUNDS = 25
-MAX_IDLE_ROUNDS = 80
-
 SCOUT_ROUTE_MEMORY_TILES = 24
 SCOUT_REVISIT_STEP_PENALTY = 12
 SCOUT_INWARD_STEP_PENALTY = 2
@@ -71,14 +68,19 @@ SCOUT_DISTANCE_WEIGHT = 2
 SCOUT_LATERAL_DEVIATION_WEIGHT = 2
 SCOUT_ORE_HINT_PROGRESS_WEIGHT = 4
 SCOUT_FRONTIER_CANDIDATE_LIMIT = 12
+SCOUT_PATH_MAX_EXPANSIONS = 96
+SCOUT_REPLAN_STUCK_ROUNDS = 3
+SCOUT_PERSISTENT_REVISIT_PENALTY = 4
+SCOUT_DEAD_END_PENALTY = 48
+SCOUT_DEAD_END_AVOID_ROUNDS = 40
 
 # A failed route must leave enough CPU time for the builder to fall back to
 # exploration.  A nearby valid route normally finishes well below this bound;
 # a longer or currently disconnected target is deferred until more terrain is
 # known instead of consuming the whole turn.
 ORE_PATH_A_STAR_MAX_EXPANSIONS = 32
-CONNECTION_A_STAR_MAX_EXPANSIONS = 32
-CONNECTION_ROUTE_ATTEMPTS = 3
+CONNECTION_A_STAR_MAX_EXPANSIONS = 128
+STEINER_MAX_EXPANSIONS = 160
 
 # A harvester produces one stack every four rounds while a transport tile can
 # forward only one stack per round.  More than four harvesters on the same
