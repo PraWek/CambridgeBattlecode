@@ -71,13 +71,26 @@ SCOUT_DISTANCE_WEIGHT = 2
 SCOUT_LATERAL_DEVIATION_WEIGHT = 2
 SCOUT_ORE_HINT_PROGRESS_WEIGHT = 4
 SCOUT_FRONTIER_CANDIDATE_LIMIT = 12
-SCOUT_PATH_MAX_EXPANSIONS = 160
-SCOUT_REPLAN_STUCK_ROUNDS = 3
-SCOUT_PERSISTENT_REVISIT_PENALTY = 4
-SCOUT_DEAD_END_PENALTY = 48
-SCOUT_DEAD_END_AVOID_ROUNDS = 40
 
-STEINER_MAX_EXPANSIONS = 256
+# A failed route must leave enough CPU time for the builder to fall back to
+# exploration.  A nearby valid route normally finishes well below this bound;
+# a longer or currently disconnected target is deferred until more terrain is
+# known instead of consuming the whole turn.
+ORE_PATH_A_STAR_MAX_EXPANSIONS = 32
+CONNECTION_A_STAR_MAX_EXPANSIONS = 32
+CONNECTION_ROUTE_ATTEMPTS = 3
+
+# A harvester produces one stack every four rounds while a transport tile can
+# forward only one stack per round.  More than four harvesters on the same
+# downstream lane therefore cannot improve throughput.
+MAX_HARVESTERS_PER_LINE = 4
+
+# Bridge-aware routing is a fallback for a conveyor route obstructed by walls,
+# buildings, or a saturated transport lane.  Bridges are deliberately priced
+# much higher than conveyors so an ordinary detour wins whenever it is cheap.
+CONVEYOR_ROUTE_COST = 3
+BRIDGE_ROUTE_COST = 20
+BRIDGE_ROUTE_MAX_EXPANSIONS = 64
 
 # A lower-ID builder has right of way at a head-on collision.  The yielding
 # builder avoids the occupied tile long enough to choose a genuinely different
