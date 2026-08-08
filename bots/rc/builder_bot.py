@@ -174,6 +174,7 @@ class BuilderBot(BaseBot):
 
         self.titanium_unlocked = controller.get_global_resources()[0] > AXIONITE_TITANIUM_THRESHOLD
         if not self.target_is_connection and self.try_build_nearby_harvester(controller, current):
+            self.draw_goal_indicator(controller, current)
             return
         if self.replan_after_yield:
             self.replan_after_yield = False
@@ -181,6 +182,7 @@ class BuilderBot(BaseBot):
                 if self.target_is_connection:
                     self.survey_for_connection(controller)
                     self.replan_after_yield = True
+                    self.draw_goal_indicator(controller, current)
                     return
                 self.select_new_target(controller)
         else:
@@ -199,11 +201,13 @@ class BuilderBot(BaseBot):
                 else:
                     self.clear_ore_target()
                     self.select_new_target(controller)
+                self.draw_goal_indicator(controller, current)
                 return
             if controller.can_build_harvester(self.target_ore):
                 harvester_id = controller.build_harvester(self.target_ore)
                 self.record_harvester_built(self.target_ore, harvester_id)
                 self.start_ore_connection(controller, current, self.target_ore)
+                self.draw_goal_indicator(controller, current)
                 return
 
             self.harvester_fail_count += 1
@@ -212,9 +216,17 @@ class BuilderBot(BaseBot):
                 self.clear_ore_target()
                 self.harvester_fail_count = 0
                 self.select_new_target(controller)
+                self.draw_goal_indicator(controller, current)
                 return
 
         self.follow_path_and_build(controller)
+        self.draw_goal_indicator(controller, current)
+
+    def draw_goal_indicator(self, controller: Controller, current: Position) -> None:
+        """Draw a blue replay line from this builder to its active work goal."""
+        target = self.target_ore if self.target_ore is not None else self.scout_target
+        if target is not None:
+            controller.draw_indicator_line(current, target, 0, 0, 255)
 
     def maybe_select_new_target(self, controller: Controller) -> None:
         """Choose a fresh job when the current non-connection job is complete or absent."""

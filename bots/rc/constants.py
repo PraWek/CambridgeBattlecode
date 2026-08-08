@@ -32,6 +32,11 @@ MARKER_KIND_SECTOR_ORE_AX = 6
 MARKER_KIND_SPAWN_DIRECTION = 7
 MARKER_KIND_SPAWN_ORE_TI = 8
 MARKER_KIND_SPAWN_ORE_AX = 9
+# This one-turn order identifies the first spawned builder as an IntruderBot.
+MARKER_KIND_SPAWN_INTRUDER = 10
+# IntruderBot leaves this marker for a newly built LauncherBot.  The position
+# is the desired, already walkable landing tile for the adjacent intruder.
+MARKER_KIND_INTRUDER_LAUNCH = 11
 
 PHASE_BOOTSTRAP = 1
 PHASE_EXPAND_TITANIUM = 2

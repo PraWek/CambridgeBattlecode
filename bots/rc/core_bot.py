@@ -8,6 +8,7 @@ from constants import (
     MARKER_KIND_SECTOR_ORE_AX,
     MARKER_KIND_SECTOR_ORE_TI,
     MARKER_KIND_SPAWN_DIRECTION,
+    MARKER_KIND_SPAWN_INTRUDER,
     MARKER_KIND_SPAWN_ORE_AX,
     MARKER_KIND_SPAWN_ORE_TI,
     ORE_TYPES,
@@ -37,22 +38,39 @@ class CoreBot(BaseBot):
         self.sector_marker_pads: dict[Direction, Position] = {}
         self.sector_marker_values: dict[Direction, int | None] = {}
         self.spawn_order_pad: Position | None = None
+        self.intruder_order_pad: Position | None = None
         self.spawn_order_target: Position | None = None
+        self.intruder_spawned = False
+        self.intruder_spawn_round: int | None = None
         self.marker_sync_cursor = 0
 
     def run(self, controller: Controller) -> None:
-        """Observe the map, update sector orders, and keep four builders alive."""
+        """Spawn the infiltrator first, then maintain four directional builders."""
         self._scan_turn(controller)
         self.observe_tiles()
         self.core_pos = self.get_cached_position()
         if not self.sector_marker_pads:
-            self.sector_marker_pads, self.spawn_order_pad = self.find_sector_marker_pads(controller)
+            (
+                self.sector_marker_pads,
+                self.spawn_order_pad,
+                self.intruder_order_pad,
+            ) = self.find_sector_marker_pads(controller)
             self.sector_marker_values = {
                 direction: None for direction in self.sector_marker_pads
             }
 
         self.refresh_sector_targets(controller)
-        spawned = self.try_spawn_missing_builder(controller)
+        # A marker may be destroyed freely, independently of the Core's spawn
+        # action.  Remove the intruder handoff as soon as its newborn has had
+        # a turn to read it, before another builder can reuse that spawn tile.
+        self.clear_intruder_spawn_order(controller)
+        if not self.intruder_spawned:
+            # The infiltrator is the first non-Core unit.  Until it can be
+            # spawned and marked, do not allocate the directional-builder
+            # slots to another BuilderBot entity.
+            spawned = self.try_spawn_intruder(controller)
+        else:
+            spawned = self.try_spawn_missing_builder(controller)
         if not spawned:
             self.clear_completed_spawn_order(controller)
             # Orders can change after a nearby harvester is built.  One marker
@@ -69,10 +87,10 @@ class CoreBot(BaseBot):
     def find_sector_marker_pads(
             self,
             controller: Controller,
-    ) -> tuple[dict[Direction, Position], Position | None]:
-        """Choose safe tiles for sector orders and spawn handoff markers."""
+    ) -> tuple[dict[Direction, Position], Position | None, Position | None]:
+        """Choose safe tiles for sector orders and both kinds of spawn marker."""
         if self.core_pos is None:
-            return {}, None
+            return {}, None, None
 
         # Corners of the core action radius do not obstruct the four cardinal
         # exits used by the builders.  The remaining entries are fallbacks for
@@ -96,14 +114,21 @@ class CoreBot(BaseBot):
             if not self.in_bounds(pos) or not controller.can_place_marker(pos):
                 continue
             pads.append(pos)
-            if len(pads) == len(BUILDER_WORK_DIRECTIONS) + 1:
+            if len(pads) == len(BUILDER_WORK_DIRECTIONS) + 2:
                 break
         sector_pads = {
             direction: pad
             for direction, pad in zip(BUILDER_WORK_DIRECTIONS, pads[:len(BUILDER_WORK_DIRECTIONS)])
         }
-        spawn_order_pad = pads[len(BUILDER_WORK_DIRECTIONS)] if len(pads) > len(BUILDER_WORK_DIRECTIONS) else None
-        return sector_pads, spawn_order_pad
+        spawn_order_index = len(BUILDER_WORK_DIRECTIONS)
+        spawn_order_pad = pads[spawn_order_index] if len(pads) > spawn_order_index else None
+        intruder_order_index = spawn_order_index + 1
+        intruder_order_pad = (
+            pads[intruder_order_index]
+            if len(pads) > intruder_order_index
+            else None
+        )
+        return sector_pads, spawn_order_pad, intruder_order_pad
 
     def refresh_sector_targets(self, controller: Controller) -> None:
         """Assign each direction its nearest eligible observed ore deposit."""
@@ -173,8 +198,9 @@ class CoreBot(BaseBot):
         # This bot's core creates only builder bots.  Entity IDs outside the
         # core's vision cannot be queried reliably, while get_unit_count() is
         # global, so subtracting the core gives the authoritative live fleet.
-        living_builders = max(0, controller.get_unit_count() - 1)
-        if living_builders >= len(BUILDER_WORK_DIRECTIONS):
+        living_non_core_units = max(0, controller.get_unit_count() - 1)
+        desired_non_core_units = len(BUILDER_WORK_DIRECTIONS) + int(self.intruder_spawned)
+        if living_non_core_units >= desired_non_core_units:
             return False
 
         if len(self.initial_spawned_directions) < len(BUILDER_WORK_DIRECTIONS):
@@ -224,6 +250,78 @@ class CoreBot(BaseBot):
                     ) % len(BUILDER_WORK_DIRECTIONS)
                 return True
         return False
+
+    def try_spawn_intruder(self, controller: Controller) -> bool:
+        """Spawn the first non-Core unit as an infiltrator with an identifying marker."""
+        if (
+            self.core_pos is None
+            or self.intruder_order_pad is None
+            or controller.get_unit_count() >= GameConstants.MAX_TEAM_UNITS
+        ):
+            return False
+
+        target = Position(
+            self.map_width - 1 - self.core_pos.x,
+            self.map_height - 1 - self.core_pos.y,
+        )
+        preferred_direction = self.core_pos.direction_to(target)
+        fallback_positions = [
+            Position(self.core_pos.x + dx, self.core_pos.y + dy)
+            for dx, dy in (
+                (0, 0), (1, -1), (1, 1), (-1, 1), (-1, -1),
+                (0, -1), (1, 0), (0, 1), (-1, 0),
+            )
+        ]
+        preferred = self.core_pos.add(preferred_direction)
+        positions = [preferred] + [pos for pos in fallback_positions if pos != preferred]
+        for spawn_pos in positions:
+            if not controller.can_spawn(spawn_pos):
+                continue
+            if not self.write_intruder_spawn_order(controller, spawn_pos):
+                return False
+            controller.spawn_builder(spawn_pos)
+            self.intruder_spawned = True
+            self.intruder_spawn_round = controller.get_current_round()
+            return True
+        return False
+
+    def write_intruder_spawn_order(self, controller: Controller, spawn_pos: Position) -> bool:
+        """Mark ``spawn_pos`` so its newborn BuilderBot selects IntruderBot logic."""
+        if self.intruder_order_pad is None or not controller.can_place_marker(self.intruder_order_pad):
+            return False
+        value = encode_marker(MARKER_KIND_SPAWN_INTRUDER, spawn_pos)
+        marker_id = controller.place_marker(self.intruder_order_pad, value)
+        self.tile_cache.remember_building(
+            self.intruder_order_pad,
+            marker_id,
+            EntityType.MARKER,
+            self.team,
+            marker_value=value,
+        )
+        return True
+
+    def clear_intruder_spawn_order(self, controller: Controller) -> None:
+        """Remove the intruder handoff marker after the newborn has read it."""
+        if (
+            not self.intruder_spawned
+            or self.intruder_order_pad is None
+            or self.intruder_spawn_round is None
+            # Core acts before a newborn.  Keep the marker through the next
+            # Core turn, then it is safe to remove on the following one.
+            or controller.get_current_round() <= self.intruder_spawn_round + 1
+        ):
+            return
+        building_id = self.tile_cache.building_id_at(self.intruder_order_pad)
+        building = self.tile_cache.building_at(self.intruder_order_pad)
+        if (
+            building_id is not None
+            and building is not None
+            and building[0] == EntityType.MARKER
+            and building[1] == self.team
+            and controller.can_destroy(self.intruder_order_pad)
+        ):
+            controller.destroy(self.intruder_order_pad)
+            self.tile_cache.forget_building(self.intruder_order_pad)
 
     def write_spawn_order(
             self,

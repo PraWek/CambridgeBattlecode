@@ -4,6 +4,8 @@ from base import BaseBot
 from builder_bot import BuilderBot
 from core_bot import CoreBot
 from gunner_bot import GunnerBot
+from intruder_bot import IntruderBot
+from launcher_bot import LauncherBot
 
 class Player:
     def __init__(self) -> None:
@@ -27,6 +29,9 @@ class Player:
         if entity_type == EntityType.CORE:
             self.bot = CoreBot(c.get_map_width(), c.get_map_height())
         elif entity_type == EntityType.BUILDER_BOT:
-            self.bot = BuilderBot(c.get_map_width(), c.get_map_height())
+            bot_class = IntruderBot if IntruderBot.claims_spawn(c) else BuilderBot
+            self.bot = bot_class(c.get_map_width(), c.get_map_height())
         elif entity_type == EntityType.GUNNER:
             self.bot = GunnerBot(c.get_map_width(), c.get_map_height())
+        elif entity_type == EntityType.LAUNCHER:
+            self.bot = LauncherBot(c.get_map_width(), c.get_map_height())
