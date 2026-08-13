@@ -16,7 +16,6 @@ cambc run nexus rc --watch
 ## Game rules
 
 ### Background
-крута
 The year is 2076. A crystalline ore called **axionite** — a room-temperature superconductor — has been discovered on Titan, Saturn's largest moon. At least six corporations have deployed autonomous extraction fleets to Titan's surface.
 
 Titan is lethal to humans: −179°C, a nitrogen-methane atmosphere, and a 76-minute communication delay to Earth. All operations are carried out by robots.
