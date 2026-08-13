@@ -1,5 +1,7 @@
 """Per-turn tile and entity observations shared by all RC bot roles."""
 
+from collections import deque
+
 from cambc import Controller, Direction, EntityType, Environment, Position, Team
 
 
@@ -23,6 +25,10 @@ _CORE_FOOTPRINT_OFFSETS = tuple(
 )
 _BASE_SYMMETRIES = ("rotational", "vertical", "horizontal")
 _DIAGONAL_SYMMETRIES = ("main_diagonal", "anti_diagonal")
+# Confirming a symmetry may happen after a scout has seen hundreds of tiles.
+# Mirroring all of them in one bot turn exceeds the 2 ms limit, so drain the
+# historical cache over several later turns instead.
+_SYMMETRY_BACKFILL_TILES_PER_TURN = 24
 
 
 class TileCache:
@@ -68,6 +74,8 @@ class TileCache:
         self.observed_core_positions: dict[Team, Position] = {}
         self.inferred_core_positions: dict[Team, Position] = {}
         self.inferred_core_tiles: set[Position] = set()
+        self._symmetry_backfill_pending: deque[Position] = deque()
+        self._symmetry_backfill_scheduled: set[Position] = set()
 
         self.observed_tiles: set[Position] = set()
         self.visible_tiles: set[Position] = set()
@@ -314,9 +322,11 @@ class TileCache:
         self._set_building(pos, None, None, None)
 
     def _update_symmetry(self) -> None:
-        """Confirm map symmetry from direct observations, then backfill static data."""
+        """Confirm symmetry and amortize its terrain inference across turns."""
         if self.confirmed_symmetry is not None:
-            self._backfill_symmetric_static_data(self.newly_observed_tiles)
+            self._schedule_symmetric_backfill(self.newly_observed_tiles)
+            self._backfill_symmetric_cores()
+            self._continue_symmetric_backfill()
             return
 
         for symmetry in tuple(self.possible_symmetries):
@@ -329,7 +339,11 @@ class TileCache:
         if len(self.possible_symmetries) != 1:
             return
         self.confirmed_symmetry = next(iter(self.possible_symmetries))
-        self._backfill_symmetric_static_data(self.observed_tiles)
+        # Infer the opposing Core immediately: it supplies a useful target
+        # for scouting, while the much larger terrain mirror is deferred.
+        self._backfill_symmetric_cores()
+        self._schedule_symmetric_backfill(self.observed_tiles)
+        self._continue_symmetric_backfill()
 
     def _symmetry_matches_new_terrain(self, symmetry: str) -> bool:
         """Compare fresh terrain only with its directly observed counterpart."""
@@ -362,19 +376,31 @@ class TileCache:
                 return False
         return True
 
-    def _backfill_symmetric_static_data(
-            self,
-            source_tiles: set[Position],
-    ) -> None:
-        """Mirror newly known immutable terrain and every known Core footprint."""
+    def _schedule_symmetric_backfill(self, source_tiles: set[Position]) -> None:
+        """Queue directly seen cells to be mirrored exactly once."""
+        for pos in source_tiles:
+            if pos in self._symmetry_backfill_scheduled:
+                continue
+            self._symmetry_backfill_scheduled.add(pos)
+            self._symmetry_backfill_pending.append(pos)
+
+    def _continue_symmetric_backfill(self) -> None:
+        """Mirror one bounded terrain batch after symmetry is confirmed."""
         if self.confirmed_symmetry is None:
             return
-        for pos in source_tiles:
+        for _ in range(_SYMMETRY_BACKFILL_TILES_PER_TURN):
+            if not self._symmetry_backfill_pending:
+                return
+            pos = self._symmetry_backfill_pending.popleft()
             self._remember_inferred_environment(
                 self._mirror_position(pos, self.confirmed_symmetry),
                 self.environments[pos],
             )
 
+    def _backfill_symmetric_cores(self) -> None:
+        """Infer only Core footprints immediately after symmetry is known."""
+        if self.confirmed_symmetry is None:
+            return
         for team, core_pos in tuple(self.observed_core_positions.items()):
             opposing_team = self._opposing_team(team)
             if opposing_team in self.observed_core_positions:

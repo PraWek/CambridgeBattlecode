@@ -29,6 +29,10 @@ _SUPPLY_BRIDGE_SEARCH_EXPANSIONS = 96
 _SUPPLY_CONVEYOR_STEP_COST = 3
 _SUPPLY_BRIDGE_STEP_COST = 20
 _RETURN_TO_CORE_A_STAR_MAX_EXPANSIONS = 192
+# A bridge-aware A* search is intentionally fairly thorough, but running one
+# for every visible titanium deposit in a single 2 ms turn is not viable on a
+# fully explored map.  Evaluate the nearest candidates incrementally instead.
+_SUPPLY_ROUTE_PLANS_PER_TURN = 1
 
 
 class IntruderBot(BaseBot):
@@ -71,6 +75,9 @@ class IntruderBot(BaseBot):
         self.supply_bridge_targets: dict[Position, Position] = {}
         self.supply_index = 0
         self.unavailable_titanium: set[Position] = set()
+        self.supply_plan_candidates: list[Position] | None = None
+        self.supply_plan_cursor = 0
+        self.deferred_supply_candidates: list[Position] = []
 
     @staticmethod
     def claims_spawn(controller: Controller) -> bool:
@@ -92,7 +99,7 @@ class IntruderBot(BaseBot):
         self._scan_turn(controller, split_initial_scan=True)
         current = self.get_cached_position()
         self.visited_tiles.add(current)
-        self.draw_visited_tile_indicators(controller)
+        self.draw_visited_tile_indicators(controller, current)
         self.remember_position(current)
         if self.core_pos is None:
             self.core_pos = self.find_friendly_core()
@@ -151,10 +158,19 @@ class IntruderBot(BaseBot):
             self.previous_position = self.last_position
         self.last_position = current
 
-    def draw_visited_tile_indicators(self, controller: Controller) -> None:
-        """Redraw every visited Intruder tile as a red replay indicator dot."""
-        for pos in self.visited_tiles:
-            controller.draw_indicator_dot(pos, 255, 0, 0)
+    def draw_visited_tile_indicators(
+            self,
+            controller: Controller,
+            current: Position,
+    ) -> None:
+        """Draw only this turn's position without making debug work grow forever.
+
+        Replay indicators are cosmetic, while a BuilderBot has a 2 ms turn
+        budget.  Re-emitting one dot for every historical step became more
+        expensive every round and was enough to starve the supply planner just
+        after it had built a forward Gunner.
+        """
+        controller.draw_indicator_dot(current, 255, 0, 0)
 
     def has_unvisited_exploration_exit(self, current: Position) -> bool:
         """Return whether an unvisited neighbouring tile can still be explored.
@@ -682,11 +698,7 @@ class IntruderBot(BaseBot):
             self.team,
             direction=self.gunner_direction,
         )
-        self.supply_ore = None
-        self.supply_path = []
-        self.supply_travel_path = []
-        self.supply_travel_bridges = {}
-        self.supply_index = 0
+        self.reset_supply_plan()
 
     def vacate_gunner_site(self, controller: Controller, site: Position) -> bool:
         """Move off an empty Gunner site so the stationary unit can be built there.
@@ -715,7 +727,15 @@ class IntruderBot(BaseBot):
         """
         if self.enemy_core_pos is None:
             return None
-        candidates: list[tuple[int, int, int, Position, Direction]] = []
+        # Rank candidates locally first.  ``can_fire_from`` crosses into the
+        # game engine and is far more expensive than the geometric checks
+        # below, so defer it until after ranking and stop at the first valid
+        # site.  The rank is unchanged from the previous all-candidates
+        # implementation: maximum firing range, then distance from Core,
+        # then an empty tile, then a deterministic coordinate tie-break.
+        candidates: list[
+            tuple[int, int, int, Position, Direction, Position, bool]
+        ] = []
         seen_sites: set[tuple[Position, Direction]] = set()
         for target in self.enemy_core_edge_tiles():
             for facing in DIRECTIONS:
@@ -746,30 +766,25 @@ class IntruderBot(BaseBot):
                     building = self.known_buildings.get(site)
                     if building is not None and building[0] not in _CLEARABLE_WALKABLE_BUILDINGS:
                         continue
-                    can_fire_from_site = controller.can_fire_from(
-                        site,
-                        facing,
-                        EntityType.GUNNER,
-                        target,
-                    )
                     # ``can_fire_from`` evaluates the board as it is now and
                     # therefore rejects a prospective Gunner sitting on an
                     # enemy road.  At distance one from a Core edge there is
                     # no intervening tile; clearing that road makes the shot
-                    # legal, so retain this exact fallback candidate.
+                    # legal, so retain this exact fallback candidate without
+                    # asking the engine to validate its pre-clear state.
                     clearable_adjacent_site = (
                         building is not None
                         and building[0] in _CLEARABLE_WALKABLE_BUILDINGS
                         and distance == 1
                     )
-                    if not can_fire_from_site and not clearable_adjacent_site:
-                        continue
                     candidates.append((
                         site.distance_squared(target),
                         site.distance_squared(self.enemy_core_pos),
                         int(building is None),
                         site,
                         facing,
+                        target,
+                        clearable_adjacent_site,
                     ))
 
         if not candidates:
@@ -778,8 +793,18 @@ class IntruderBot(BaseBot):
             key=lambda item: (item[0], item[1], item[2], item[3].x, item[3].y),
             reverse=True,
         )
-        _, _, _, site, facing = candidates[0]
-        return site, facing
+        for _, _, _, site, facing, target, clearable_adjacent_site in candidates:
+            if (
+                clearable_adjacent_site
+                or controller.can_fire_from(
+                    site,
+                    facing,
+                    EntityType.GUNNER,
+                    target,
+                )
+            ):
+                return site, facing
+        return None
 
     def enemy_core_edge_tiles(self) -> tuple[Position, ...]:
         """Return all in-bounds perimeter cells of the known 3x3 enemy Core."""
@@ -892,6 +917,11 @@ class IntruderBot(BaseBot):
         """Connect the gunner to the nearest usable titanium harvester or ore deposit."""
         if self.supply_ore is None:
             if not self.select_supply_plan():
+                if self.supply_plan_candidates is not None:
+                    # An expensive route search is deliberately spread across
+                    # turns.  Do not wander away while the next candidate is
+                    # still awaiting its bounded A* attempt.
+                    return
                 self.search_for_titanium(controller)
                 return
 
@@ -929,62 +959,47 @@ class IntruderBot(BaseBot):
             self.supply_index += 1
 
     def select_supply_plan(self) -> bool:
-        """Select the closest usable Ti deposit, even before its full route is known."""
+        """Select the closest usable Ti deposit without unbounded route work."""
         if self.gunner_site is None or self.gunner_direction is None:
             return False
-        ores = [
-            pos
-            for pos, env in self.known_env.items()
-            if env == Environment.ORE_TITANIUM and pos not in self.unavailable_titanium
-        ]
-        routed_candidates: list[
-            tuple[
-                int,
-                int,
-                Position,
-                tuple[
-                    list[Position],
-                    dict[Position, Direction],
-                    dict[Position, Position],
-                    int,
-                ],
-            ]
-        ] = []
-        deferred_candidates: list[Position] = []
-        for ore in ores:
-            building = self.known_buildings.get(ore)
-            if building is not None and building[0] != EntityType.HARVESTER:
-                self.unavailable_titanium.add(ore)
-                continue
-            plan = self.plan_supply_route(ore)
-            if plan is None:
-                deferred_candidates.append(ore)
-                continue
-            routed_candidates.append(
+        if self.supply_plan_candidates is None:
+            self.supply_plan_candidates = sorted(
                 (
-                    plan[3],
-                    ore.distance_squared(self.gunner_site),
-                    ore,
-                    plan,
-                )
+                    pos
+                    for pos, env in self.known_env.items()
+                    if env == Environment.ORE_TITANIUM
+                    and pos not in self.unavailable_titanium
+                    and (
+                        self.known_buildings.get(pos) is None
+                        or self.known_buildings[pos][0] == EntityType.HARVESTER
+                    )
+                ),
+                key=lambda pos: (pos.distance_squared(self.gunner_site), pos.y, pos.x),
             )
+            self.supply_plan_cursor = 0
+            self.deferred_supply_candidates = []
 
-        if routed_candidates:
-            _, _, ore, plan = min(
-                routed_candidates,
-                key=lambda candidate: candidate[:2],
-            )
-            self.store_supply_plan(ore, plan)
-            return True
-        if deferred_candidates:
+        attempts = 0
+        while (
+            self.supply_plan_cursor < len(self.supply_plan_candidates)
+            and attempts < _SUPPLY_ROUTE_PLANS_PER_TURN
+        ):
+            ore = self.supply_plan_candidates[self.supply_plan_cursor]
+            self.supply_plan_cursor += 1
+            attempts += 1
+            plan = self.plan_supply_route(ore)
+            if plan is not None:
+                self.store_supply_plan(ore, plan)
+                return True
+            self.deferred_supply_candidates.append(ore)
+
+        if self.supply_plan_cursor < len(self.supply_plan_candidates):
+            return False
+        if self.deferred_supply_candidates:
             # Terrain which has not entered the cache cannot yet have a valid
             # A* route.  Keep the nearest deposit as a temporary exploration
-            # target, but never replace a cheaper bridge-aware A* route with
-            # a deposit that merely happens to be closer to our Core.
-            ore = min(
-                deferred_candidates,
-                key=lambda candidate: candidate.distance_squared(self.gunner_site),
-            )
+            # target after the bounded attempts have all failed.
+            ore = self.deferred_supply_candidates[0]
             self.supply_ore = ore
             self.supply_path = []
             self.supply_travel_path = []
@@ -994,7 +1009,11 @@ class IntruderBot(BaseBot):
             self.supply_directions = {}
             self.supply_bridge_targets = {}
             self.supply_index = 0
+            self.supply_plan_candidates = None
+            self.supply_plan_cursor = 0
+            self.deferred_supply_candidates = []
             return True
+        self.supply_plan_candidates = None
         return False
 
     def store_supply_plan(
@@ -1020,6 +1039,9 @@ class IntruderBot(BaseBot):
         self.supply_directions = directions
         self.supply_bridge_targets = bridge_targets
         self.supply_index = 0
+        self.supply_plan_candidates = None
+        self.supply_plan_cursor = 0
+        self.deferred_supply_candidates = []
 
     def explore_supply_route(self, controller: Controller, current: Position) -> None:
         """Reveal terrain between a harvested deposit and Gunner until A* can join them."""
@@ -1347,6 +1369,9 @@ class IntruderBot(BaseBot):
         self.supply_directions = {}
         self.supply_bridge_targets = {}
         self.supply_index = 0
+        self.supply_plan_candidates = None
+        self.supply_plan_cursor = 0
+        self.deferred_supply_candidates = []
 
     def search_for_titanium(self, controller: Controller) -> None:
         """Explore away from the enemy core until a cached titanium source becomes visible."""
