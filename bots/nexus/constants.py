@@ -41,6 +41,7 @@ PHASE_STABILIZE = 4
 TITANIUM_LINE_READY_HARVESTERS = 2
 TITANIUM_LINE_READY_SCALE = 118.0
 MAX_BUILDERS_PHASE_ONE = 4
+MAX_REPLACEMENT_BUILDERS = 4
 AXIONITE_TITANIUM_THRESHOLD = 1_000
 
 BUILDER_DIRECTION_CODES = {
@@ -79,10 +80,19 @@ SCOUT_DEAD_END_AVOID_ROUNDS = 40
 # builder alive long enough to backtrack across the largest map, but recycle
 # it once it has failed to reveal a single new tile for a sustained period.
 SCOUT_NO_DISCOVERY_KILL_ROUNDS = 240
+# A builder that cannot retain even a one-step goal is not backtracking: it is
+# repeatedly selecting an immediately invalid route on the same tile.  Recycle
+# this state much sooner than a mobile explorer crossing an already known map.
+SCOUT_NO_GOAL_KILL_ROUNDS = 32
 SCOUT_KILL_STUCK_ROUNDS = 12
 SCOUT_KILL_ROUTE_FAILURES = 24
 SCOUT_KILL_CYCLES = 12
 ORE_SURVEY_NEW_TILES_REQUIRED = 12
+CONNECTION_DEFER_NEW_TILES = 8
+CONNECTION_DEFER_MAX_ROUNDS = 32
+CONNECTION_STALL_ROUNDS = 48
+ORE_TARGET_STALL_ROUNDS = 32
+IDLE_TARGET_RETRY_ROUNDS = 4
 
 # A failed route must leave enough CPU time for the builder to fall back to
 # exploration.  A nearby valid route normally finishes well below this bound;
@@ -91,6 +101,28 @@ ORE_SURVEY_NEW_TILES_REQUIRED = 12
 ORE_PATH_A_STAR_MAX_EXPANSIONS = 32
 CONNECTION_A_STAR_MAX_EXPANSIONS = 32
 CONNECTION_ROUTE_ATTEMPTS = 3
+
+# One transport tile forwards one stack per round while a harvester produces
+# one stack every four rounds.  A fifth source on the same downstream lane
+# therefore adds queues but no throughput.
+MAX_HARVESTERS_PER_LINE = 4
+# Until a builder knows about this many already connected harvesters, route a
+# new mine directly to the core instead of merging.  This creates several
+# independent trunks even when every ore lies near the first cheap branch.
+MIN_DEDICATED_HARVESTER_LINES = 4
+TRANSPORT_BUSY_OBSERVATION_TURNS = 4
+STEINER_MAX_EXPANSIONS = 160
+
+# A bridge is a costly fallback for a wall, hostile building, or saturated
+# lane.  Open ground still uses conveyors because the search charges the live
+# scaled construction costs returned by the controller.
+BRIDGE_ROUTE_MAX_EXPANSIONS = 96
+BRIDGE_MAX_JUMP_DISTANCE = 3
+
+# Occupy the unused cardinal neighbours of a new titanium harvester with
+# inward-facing conveyors.  They reject output from the harvester while
+# preventing an opponent from placing a stealing conveyor or turret there.
+HARVESTER_GUARD_LATEST_ROUND = 1500
 
 # A lower-ID builder has right of way at a head-on collision.  The yielding
 # builder avoids the occupied tile long enough to choose a genuinely different

@@ -10,6 +10,7 @@ from constants import (
     MARKER_KIND_SPAWN_DIRECTION,
     MARKER_KIND_SPAWN_ORE_AX,
     MARKER_KIND_SPAWN_ORE_TI,
+    MAX_REPLACEMENT_BUILDERS,
     ORE_TYPES,
 )
 from geometry import encode_marker
@@ -33,6 +34,7 @@ class CoreBot(BaseBot):
 
         self.initial_spawned_directions: set[Direction] = set()
         self.replacement_direction_index = 0
+        self.replacement_builders_spawned = 0
         self.sector_targets: dict[Direction, tuple[Position, Environment]] = {}
         self.sector_marker_pads: dict[Direction, Position] = {}
         self.sector_marker_values: dict[Direction, int | None] = {}
@@ -184,6 +186,8 @@ class CoreBot(BaseBot):
                 if direction not in self.initial_spawned_directions
             ]
         else:
+            if self.replacement_builders_spawned >= MAX_REPLACEMENT_BUILDERS:
+                return False
             direction = BUILDER_WORK_DIRECTIONS[
                 self.replacement_direction_index % len(BUILDER_WORK_DIRECTIONS)
             ]
@@ -222,6 +226,7 @@ class CoreBot(BaseBot):
                     self.replacement_direction_index = (
                         self.replacement_direction_index + 1
                     ) % len(BUILDER_WORK_DIRECTIONS)
+                    self.replacement_builders_spawned += 1
                 return True
         return False
 
