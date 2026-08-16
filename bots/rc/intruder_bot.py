@@ -10,7 +10,7 @@ from constants import (
     ORTHOGONAL_DIRECTIONS,
     PASSABLE_BUILDINGS,
 )
-from geometry import decode_marker, encode_marker
+from geometry import decode_marker, decode_marker_coordinates, encode_marker
 from navigation import a_star_from_any_with_bridges, a_star_to_any
 
 
@@ -33,6 +33,11 @@ _RETURN_TO_CORE_A_STAR_MAX_EXPANSIONS = 192
 # with the local geometry work.  Validate a prepared Gunner candidate one at
 # a time so an unsuccessful search cannot repeatedly consume the full turn.
 _GUNNER_SITE_VALIDATIONS_PER_TURN = 1
+# Preparing a Gunner candidate list also performs enough local geometry and
+# allocation to exhaust a 2 ms turn after a symmetry has just been confirmed.
+# Keep its cursor in the bot state and inspect only a small fixed batch each
+# turn, so an interruption cannot restart the full enumeration forever.
+_GUNNER_CANDIDATE_PREPARATIONS_PER_TURN = 48
 # A bridge-aware A* search is intentionally fairly thorough, but running one
 # for every visible titanium deposit in a single 2 ms turn is not viable on a
 # fully explored map.  Evaluate the nearest candidates incrementally instead.
@@ -76,6 +81,15 @@ class IntruderBot(BaseBot):
             tuple[Position, Direction, Position, bool]
         ] | None = None
         self.gunner_candidate_cursor = 0
+        self.gunner_candidate_targets: tuple[Position, ...] | None = None
+        self.gunner_candidate_destination: Position | None = None
+        self.gunner_candidate_target_index = 0
+        self.gunner_candidate_facing_index = 0
+        self.gunner_candidate_distance = 0
+        self.gunner_candidate_seen_sites: set[tuple[Position, Direction]] = set()
+        self.gunner_candidate_builds: list[
+            tuple[int, int, int, Position, Direction, Position, bool]
+        ] = []
 
         self.supply_ore: Position | None = None
         self.supply_path: list[Position] = []
@@ -99,10 +113,16 @@ class IntruderBot(BaseBot):
             if controller.get_entity_type(entity_id) != EntityType.MARKER:
                 continue
             try:
-                kind, spawn_pos, _ = decode_marker(controller.get_marker_value(entity_id))
+                kind, x, y, _ = decode_marker_coordinates(
+                    controller.get_marker_value(entity_id)
+                )
             except Exception:
                 continue
-            if kind == MARKER_KIND_SPAWN_INTRUDER and spawn_pos == current:
+            if (
+                kind == MARKER_KIND_SPAWN_INTRUDER
+                and x == current.x
+                and y == current.y
+            ):
                 return True
         return False
 
@@ -115,7 +135,7 @@ class IntruderBot(BaseBot):
         # planning, whose engine validation calls can otherwise turn this
         # already expensive transition into a TLE.
         current = self.get_cached_position()
-        self.visited_tiles.add(current)
+        self.visited_tiles.update((current,))
         self.draw_visited_tile_indicators(controller, current)
         self.remember_position(current)
         if self.core_pos is None:
@@ -192,9 +212,9 @@ class IntruderBot(BaseBot):
         is in a map dead end and therefore must return to its Core.
         """
         for direction in DIRECTIONS:
-            candidate = current.add(direction)
+            candidate = self.tile_cache.neighbor(current, direction)
             if (
-                not self.in_bounds(candidate)
+                candidate is None
                 or candidate in self.visited_tiles
             ):
                 continue
@@ -249,23 +269,12 @@ class IntruderBot(BaseBot):
             self.stop_exploration_wall_following()
             return self.finish_unvisited_movement(controller, target, current)
 
-        path = a_star_to_any(
-            None,
-            current,
-            {target},
-            lambda _controller, pos: self.unvisited_path_traversable(pos),
-            movement_directions=DIRECTIONS,
-            max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
-        )
-        if path:
-            direction = current.direction_to(path[0])
-            if self.try_move_step(controller, direction, avoid_visited=True):
-                self.heading = direction
-                self.wall_following = False
-                self.stop_exploration_wall_following()
-                return True
-
-        # No known unvisited A* route: first probe only the forward sector.
+        # Exploration deliberately stays local even after the enemy Core is
+        # confirmed.  A Core tile itself is not traversable, so an A* whose
+        # sole goal is that tile can never succeed; retrying its bounded
+        # failure each turn exhausts the BuilderBot's CPU budget before the
+        # wall-following fallback can act.
+        # First probe only the forward sector.
         if self.move_towards(
             controller,
             target,
@@ -324,6 +333,7 @@ class IntruderBot(BaseBot):
             current,
             {target},
             lambda _controller, pos: self.is_roadable_position(pos),
+            self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
         )
@@ -344,6 +354,7 @@ class IntruderBot(BaseBot):
             current,
             {self.core_pos},
             lambda _controller, pos: self.return_path_traversable(pos),
+            self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             max_expansions=_RETURN_TO_CORE_A_STAR_MAX_EXPANSIONS,
         )
@@ -482,7 +493,9 @@ class IntruderBot(BaseBot):
         else:
             directions = (desired,)
         for direction in directions:
-            candidate = current.add(direction)
+            candidate = self.tile_cache.neighbor(current, direction)
+            if candidate is None:
+                continue
             if (
                 require_closer
                 and candidate.distance_squared(target) >= current.distance_squared(target)
@@ -652,7 +665,9 @@ class IntruderBot(BaseBot):
         if direction == Direction.CENTRE:
             return False
         current = self.get_cached_position()
-        target = current.add(direction)
+        target = self.tile_cache.neighbor(current, direction)
+        if target is None:
+            return False
         if avoid_visited and target in self.visited_tiles:
             return False
         env = self.known_env.get(target)
@@ -788,7 +803,9 @@ class IntruderBot(BaseBot):
         """Return empty action-radius tiles where a launcher could reach ``landing``."""
         sites = []
         for direction in DIRECTIONS:
-            pos = current.add(direction)
+            pos = self.tile_cache.neighbor(current, direction)
+            if pos is None:
+                continue
             env = self.known_env.get(pos)
             if (
                 env is None
@@ -805,7 +822,9 @@ class IntruderBot(BaseBot):
     def find_launch_marker_site(self, current: Position, launcher_pos: Position) -> Position | None:
         """Find an empty nearby cell visible to both the intruder and its launcher."""
         for direction in DIRECTIONS:
-            pos = current.add(direction)
+            pos = self.tile_cache.neighbor(current, direction)
+            if pos is None:
+                continue
             if pos == launcher_pos:
                 continue
             env = self.known_env.get(pos)
@@ -832,7 +851,7 @@ class IntruderBot(BaseBot):
         building = self.known_buildings.get(site)
         if building is not None:
             if building[0] not in _CLEARABLE_WALKABLE_BUILDINGS:
-                self.rejected_gunner_sites.add(site)
+                self.rejected_gunner_sites.update((site,))
                 self.gunner_site = None
                 self.gunner_direction = None
                 return
@@ -853,7 +872,7 @@ class IntruderBot(BaseBot):
             )
             return
         if self.gunner_direction is None:
-            self.rejected_gunner_sites.add(site)
+            self.rejected_gunner_sites.update((site,))
             self.gunner_site = None
             self.gunner_direction = None
             return
@@ -882,7 +901,9 @@ class IntruderBot(BaseBot):
         """
         current = self.get_cached_position()
         for direction in DIRECTIONS:
-            target = current.add(direction)
+            target = self.tile_cache.neighbor(current, direction)
+            if target is None:
+                continue
             if target == site or not self.is_roadable_position(target):
                 continue
             if self.try_move_step(controller, direction):
@@ -901,11 +922,10 @@ class IntruderBot(BaseBot):
             self.clear_gunner_site_candidates()
             return None
         if self.gunner_site_candidates is None:
-            self.gunner_site_candidates = self.prepare_gunner_site_candidates()
-            self.gunner_candidate_cursor = 0
-            # Candidate enumeration is deliberately its own turn.  Future
-            # turns reuse this stable ranking and pay for engine validation
-            # only after the result has been retained.
+            self.continue_gunner_site_candidate_preparation()
+            # Candidate enumeration is deliberately its own turn.  The
+            # persistent preparation state keeps it bounded even if this
+            # turn is interrupted by the engine.
             return None
 
         validations = 0
@@ -936,76 +956,126 @@ class IntruderBot(BaseBot):
             self.clear_gunner_site_candidates()
         return None
 
-    def prepare_gunner_site_candidates(
-            self,
-    ) -> list[tuple[Position, Direction, Position, bool]]:
-        """Enumerate and rank candidate sites without calling the engine."""
+    def continue_gunner_site_candidate_preparation(self) -> None:
+        """Incrementally enumerate and rank candidate sites without engine calls."""
         enemy_core = self.destination
         if not self.destination_is_confirmed_core or enemy_core is None:
-            return []
-        candidates: list[
-            tuple[int, int, int, Position, Direction, Position, bool]
-        ] = []
-        seen_sites: set[tuple[Position, Direction]] = set()
-        for target in self.enemy_core_edge_tiles():
-            for facing in DIRECTIONS:
-                # A Gunner reaches three cardinal tiles (distance squared 9)
-                # or two diagonal tiles (distance squared 8).  Try the
-                # maximum range first so the completed turret is as far from
-                # the Core as its attack permits.
-                max_steps = 3 if facing in ORTHOGONAL_DIRECTIONS else 2
-                for distance in range(max_steps, 0, -1):
-                    site = target
-                    for _ in range(distance):
-                        site = site.add(facing.opposite())
-                    site_key = (site, facing)
-                    if site_key in seen_sites:
-                        continue
-                    seen_sites.add(site_key)
-                    if (
-                        not self.in_bounds(site)
-                        or site in self.rejected_gunner_sites
-                        or self.known_env.get(site) in {
-                            None,
-                            Environment.WALL,
-                            Environment.ORE_TITANIUM,
-                            Environment.ORE_AXIONITE,
-                        }
-                    ):
-                        continue
-                    building = self.known_buildings.get(site)
-                    if building is not None and building[0] not in _CLEARABLE_WALKABLE_BUILDINGS:
-                        continue
-                    # ``can_fire_from`` rejects a prospective Gunner sitting
-                    # on an enemy road.  Adjacent to a Core edge there is no
-                    # intervening tile, so clearing that road is sufficient.
-                    clearable_adjacent_site = (
-                        building is not None
-                        and building[0] in _CLEARABLE_WALKABLE_BUILDINGS
-                        and distance == 1
-                    )
-                    candidates.append((
-                        site.distance_squared(target),
-                        site.distance_squared(enemy_core),
-                        int(building is None),
-                        site,
-                        facing,
-                        target,
-                        clearable_adjacent_site,
-                    ))
-        candidates.sort(
+            self.clear_gunner_site_candidates()
+            return
+        if (
+            self.gunner_candidate_targets is None
+            or self.gunner_candidate_destination != enemy_core
+        ):
+            self.gunner_candidate_targets = self.enemy_core_edge_tiles()
+            self.gunner_candidate_destination = enemy_core
+            self.gunner_candidate_target_index = 0
+            self.gunner_candidate_facing_index = 0
+            self.gunner_candidate_distance = 0
+            self.gunner_candidate_seen_sites = set()
+            self.gunner_candidate_builds = []
+
+        preparations = 0
+        while (
+            preparations < _GUNNER_CANDIDATE_PREPARATIONS_PER_TURN
+            and self.gunner_candidate_targets is not None
+            and self.gunner_candidate_target_index < len(self.gunner_candidate_targets)
+        ):
+            target = self.gunner_candidate_targets[self.gunner_candidate_target_index]
+            facing = DIRECTIONS[self.gunner_candidate_facing_index]
+            max_steps = 3 if facing in ORTHOGONAL_DIRECTIONS else 2
+            if self.gunner_candidate_distance == 0:
+                self.gunner_candidate_distance = max_steps
+            distance = self.gunner_candidate_distance
+            self.advance_gunner_candidate_cursor()
+            preparations += 1
+
+            site = target
+            for _ in range(distance):
+                site = self.tile_cache.neighbor(site, facing.opposite())
+                if site is None:
+                    break
+            if site is None:
+                continue
+            site_key = (site, facing)
+            if site_key in self.gunner_candidate_seen_sites:
+                continue
+            self.gunner_candidate_seen_sites.update((site_key,))
+            if (
+                site in self.rejected_gunner_sites
+                or self.known_env.get(site) in {
+                    None,
+                    Environment.WALL,
+                    Environment.ORE_TITANIUM,
+                    Environment.ORE_AXIONITE,
+                }
+            ):
+                continue
+            building = self.known_buildings.get(site)
+            if (
+                building is not None
+                and building[0] not in _CLEARABLE_WALKABLE_BUILDINGS
+            ):
+                continue
+            # ``can_fire_from`` rejects a prospective Gunner sitting on an
+            # enemy road.  Adjacent to a Core edge there is no intervening
+            # tile, so clearing that road is sufficient.
+            clearable_adjacent_site = (
+                building is not None
+                and building[0] in _CLEARABLE_WALKABLE_BUILDINGS
+                and distance == 1
+            )
+            self.gunner_candidate_builds.append((
+                site.distance_squared(target),
+                site.distance_squared(enemy_core),
+                int(building is None),
+                site,
+                facing,
+                target,
+                clearable_adjacent_site,
+            ))
+
+        if (
+            self.gunner_candidate_targets is not None
+            and self.gunner_candidate_target_index
+            < len(self.gunner_candidate_targets)
+        ):
+            return
+        self.gunner_candidate_builds.sort(
             key=lambda item: (item[0], item[1], item[2], item[3].x, item[3].y),
             reverse=True,
         )
-        return [
+        self.gunner_site_candidates = [
             (site, facing, target, clearable_adjacent_site)
-            for _, _, _, site, facing, target, clearable_adjacent_site in candidates
+            for _, _, _, site, facing, target, clearable_adjacent_site
+            in self.gunner_candidate_builds
         ]
+        self.gunner_candidate_cursor = 0
+        self.gunner_candidate_targets = None
+        self.gunner_candidate_seen_sites = set()
+        self.gunner_candidate_builds = []
+
+    def advance_gunner_candidate_cursor(self) -> None:
+        """Advance the persistent target/facing/distance candidate cursor."""
+        self.gunner_candidate_distance -= 1
+        if self.gunner_candidate_distance > 0:
+            return
+        self.gunner_candidate_facing_index += 1
+        if self.gunner_candidate_facing_index < len(DIRECTIONS):
+            return
+        self.gunner_candidate_facing_index = 0
+        self.gunner_candidate_target_index += 1
 
     def clear_gunner_site_candidates(self) -> None:
         """Forget a completed or obsolete prepared Gunner-site ranking."""
         self.gunner_site_candidates = None
         self.gunner_candidate_cursor = 0
+        self.gunner_candidate_targets = None
+        self.gunner_candidate_destination = None
+        self.gunner_candidate_target_index = 0
+        self.gunner_candidate_facing_index = 0
+        self.gunner_candidate_distance = 0
+        self.gunner_candidate_seen_sites = set()
+        self.gunner_candidate_builds = []
 
     def enemy_core_edge_tiles(self) -> tuple[Position, ...]:
         """Return all in-bounds perimeter cells of the known 3x3 enemy Core."""
@@ -1013,12 +1083,12 @@ class IntruderBot(BaseBot):
         if not self.destination_is_confirmed_core or enemy_core is None:
             return ()
         return tuple(
-            Position(enemy_core.x + dx, enemy_core.y + dy)
+            pos
             for dx in range(-1, 2)
             for dy in range(-1, 2)
             if (
                 (dx != 0 or dy != 0)
-                and self.in_bounds(Position(enemy_core.x + dx, enemy_core.y + dy))
+                and (pos := self.tile_cache.offset(enemy_core, dx, dy)) is not None
             )
         )
 
@@ -1028,7 +1098,8 @@ class IntruderBot(BaseBot):
         candidates = [
             pos
             for direction in DIRECTIONS
-            if self.is_roadable_position(pos := site.add(direction))
+            if (pos := self.tile_cache.neighbor(site, direction)) is not None
+            and self.is_roadable_position(pos)
         ]
         if not candidates:
             return None
@@ -1272,14 +1343,17 @@ class IntruderBot(BaseBot):
         if self.gunner_site is None or self.gunner_direction is None:
             return None
         ore_entries = {
-            ore.add(direction)
+            entry
             for direction in ORTHOGONAL_DIRECTIONS
-            if self.is_supply_tile(ore.add(direction))
+            if (entry := self.tile_cache.neighbor(ore, direction)) is not None
+            and self.is_supply_tile(entry)
         }
         gunner_entries = {
-            self.gunner_site.add(direction)
+            entry
             for direction in ORTHOGONAL_DIRECTIONS
-            if direction != self.gunner_direction and self.is_supply_tile(self.gunner_site.add(direction))
+            if direction != self.gunner_direction
+            and (entry := self.tile_cache.neighbor(self.gunner_site, direction)) is not None
+            and self.is_supply_tile(entry)
         }
         if not ore_entries or not gunner_entries:
             return None
@@ -1291,6 +1365,7 @@ class IntruderBot(BaseBot):
             lambda _controller, pos: self.is_supply_tile(pos),
             normal_step_cost=_SUPPLY_CONVEYOR_STEP_COST,
             bridge_step_cost=_SUPPLY_BRIDGE_STEP_COST,
+            neighbor_fn=self.tile_cache.neighbor,
             max_expansions=_SUPPLY_BRIDGE_SEARCH_EXPANSIONS,
             bridge_landing_fn=lambda _controller, pos: self.is_cached_tile_passable(pos),
         )
@@ -1333,7 +1408,7 @@ class IntruderBot(BaseBot):
             # enemy harvester can directly feed our adjacent conveyor.
             return True
         if building is not None:
-            self.unavailable_titanium.add(self.supply_ore)
+            self.unavailable_titanium.update((self.supply_ore,))
             self.reset_supply_plan()
             return False
         if current.distance_squared(self.supply_ore) > GameConstants.ACTION_RADIUS_SQ:
@@ -1374,6 +1449,7 @@ class IntruderBot(BaseBot):
                 current,
                 remaining,
                 lambda _controller, pos: self.is_roadable_position(pos),
+                self.tile_cache.neighbor,
                 movement_directions=DIRECTIONS,
                 max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
             )
@@ -1453,6 +1529,7 @@ class IntruderBot(BaseBot):
             current,
             {bridge_tile},
             lambda _controller, pos: self.is_roadable_position(pos),
+            self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
         )
@@ -1586,8 +1663,9 @@ class IntruderBot(BaseBot):
             return
         dx, dy = self.gunner_direction.opposite().delta()
         current = self.get_cached_position()
-        target = Position(
+        target = self.tile_cache.position_at(
             min(self.map_width - 1, max(0, current.x + dx * self.map_width)),
             min(self.map_height - 1, max(0, current.y + dy * self.map_height)),
         )
-        self.move_towards(controller, target)
+        if target is not None:
+            self.move_towards(controller, target)

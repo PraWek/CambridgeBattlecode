@@ -11,6 +11,7 @@ def a_star_to_any(
         start: Position,
         goals: set[Position],
         traversable_fn,
+        neighbor_fn,
         preferred_tiles: set[Position] | None = None,
         movement_directions=ORTHOGONAL_DIRECTIONS,
         extra_step_cost_fn=None,
@@ -50,7 +51,9 @@ def a_star_to_any(
         expansions += 1
 
         for direction in movement_directions:
-            next_pos = current.add(direction)
+            next_pos = neighbor_fn(current, direction)
+            if next_pos is None:
+                continue
             if not traversable_fn(controller, next_pos):
                 continue
             step_cost = 1 if next_pos in preferred_tiles else 4
@@ -74,6 +77,7 @@ def a_star_from_any(
         starts: set[Position],
         goals: set[Position],
         traversable_fn,
+        neighbor_fn,
         movement_directions=ORTHOGONAL_DIRECTIONS,
         max_expansions: int | None = None,
 ) -> list[Position]:
@@ -116,7 +120,9 @@ def a_star_from_any(
         expansions += 1
 
         for direction in movement_directions:
-            next_pos = current.add(direction)
+            next_pos = neighbor_fn(current, direction)
+            if next_pos is None:
+                continue
             if not traversable_fn(controller, next_pos):
                 continue
             new_cost = cost + 1
@@ -141,6 +147,7 @@ def a_star_from_any_with_bridges(
         traversable_fn,
         normal_step_cost: int,
         bridge_step_cost: int,
+        neighbor_fn,
         max_expansions: int | None = None,
         bridge_landing_fn=None,
 ) -> tuple[list[Position], dict[Position, Position], int] | None:
@@ -192,7 +199,9 @@ def a_star_from_any_with_bridges(
         expansions += 1
 
         for direction in ORTHOGONAL_DIRECTIONS:
-            next_pos = current.add(direction)
+            next_pos = neighbor_fn(current, direction)
+            if next_pos is None:
+                continue
             if traversable_fn(controller, next_pos):
                 new_cost = cost + normal_step_cost
                 if new_cost < g_score.get(next_pos, LARGE_NUMBER):
@@ -205,12 +214,16 @@ def a_star_from_any_with_bridges(
                     heappush(queue, (new_cost + heuristic, new_cost, sequence, next_pos))
                     sequence += 1
 
-            dx, dy = direction.delta()
             for distance in (2, 3):
-                bridge_target = Position(
-                    current.x + dx * distance,
-                    current.y + dy * distance,
-                )
+                bridge_positions: list[Position] = []
+                bridge_target = current
+                for _ in range(distance):
+                    bridge_target = neighbor_fn(bridge_target, direction)
+                    if bridge_target is None:
+                        break
+                    bridge_positions.append(bridge_target)
+                if bridge_target is None:
+                    continue
                 if not traversable_fn(controller, bridge_target):
                     continue
                 if (
@@ -218,13 +231,9 @@ def a_star_from_any_with_bridges(
                     and not bridge_landing_fn(controller, bridge_target)
                 ):
                     continue
-                intermediates = [
-                    Position(current.x + dx * step, current.y + dy * step)
-                    for step in range(1, distance)
-                ]
                 if not any(
                     not traversable_fn(controller, pos)
-                    for pos in intermediates
+                    for pos in bridge_positions[:-1]
                 ):
                     continue
                 new_cost = cost + bridge_step_cost

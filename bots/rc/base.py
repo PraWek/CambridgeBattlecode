@@ -27,13 +27,17 @@ class BaseBot:
 
         ``read_markers`` is opt-in because cores write markers but never read
         them; avoiding those values saves several calls on every core turn.
-        TileCache also returns ``True`` after it reaches its per-turn API
-        budget, so no role can chain further work onto a partial scan.
+        A terrain-incomplete scan must yield.  Once terrain and the bot's own
+        position are cached, a role may safely act even if refreshing the
+        remaining dynamic entities has been deferred to later turns.
         """
         if self.entity_id is None:
             self.entity_id = controller.get_id()
         self.tile_cache.scan_turn(controller, self.entity_id)
-        if self.tile_cache.scan_incomplete_this_turn:
+        if (
+            self.tile_cache.scan_incomplete_this_turn
+            and not self.tile_cache.role_cache_ready_this_turn
+        ):
             return True
         self.current_position = self.tile_cache.current_position
         if self.team is None:
@@ -48,7 +52,10 @@ class BaseBot:
                 return True
         return (
             self.tile_cache.symmetry_confirmed_this_turn
-            or self.tile_cache.scan_incomplete_this_turn
+            or (
+                self.tile_cache.scan_incomplete_this_turn
+                and not self.tile_cache.role_cache_ready_this_turn
+            )
         )
 
     def get_cached_position(self) -> Position:

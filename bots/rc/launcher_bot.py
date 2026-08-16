@@ -36,7 +36,10 @@ class LauncherBot(BaseBot):
             if value is None or marker_pos is None:
                 continue
             try:
-                kind, landing, _ = decode_marker(value)
+                kind, landing, _ = decode_marker(
+                    value,
+                    self.tile_cache.position_at,
+                )
             except Exception:
                 continue
             if kind == MARKER_KIND_INTRUDER_LAUNCH:

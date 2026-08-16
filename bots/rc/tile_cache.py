@@ -25,10 +25,10 @@ _CORE_FOOTPRINT_OFFSETS = tuple(
 )
 _BASE_SYMMETRIES = ("rotational", "vertical", "horizontal")
 _DIAGONAL_SYMMETRIES = ("main_diagonal", "anti_diagonal")
-# A cold terrain scan is the most allocation-heavy cache operation.  Sixteen
-# Controller calls leave a conservative margin under the 2 ms turn limit; a
-# later turn resumes the unscanned part of the local vision.
-_SCAN_API_CALL_LIMIT = 16
+# Controller calls have a material CPU cost on crowded maps.  Seven calls leave
+# room for navigation after a partial entity scan; terrain and the own unit
+# are always completed before a role is allowed to act.
+_SCAN_API_CALL_LIMIT = 7
 # Confirming a symmetry may happen after a scout has seen hundreds of tiles.
 # Mirroring all of them in one bot turn exceeds the 2 ms limit, so drain the
 # historical cache over several later turns instead.  This work shares a
@@ -106,6 +106,7 @@ class TileCache:
         # Keep it until the builder sees it again and can legally query it.
         self._pending_terrain_tiles: set[Position] = set()
         self.scan_incomplete_this_turn = False
+        self.role_cache_ready_this_turn = False
         self.scan_api_calls_this_turn = 0
 
         # Entity metadata is immutable except for a builder's position and a
@@ -133,6 +134,7 @@ class TileCache:
         """
         self.symmetry_confirmed_this_turn = False
         self.scan_incomplete_this_turn = False
+        self.role_cache_ready_this_turn = False
         self.scan_api_calls_this_turn = 0
         if not self._take_scan_api_call():
             return
@@ -189,16 +191,20 @@ class TileCache:
         # Cache our mutable position first.  In a crowded vision this keeps
         # the bot's own start-of-turn coordinates available as soon as a scan
         # can complete, instead of putting it behind unrelated buildings.
-        ordered_unit_ids = [
-            entity_id for entity_id in unit_ids if entity_id == own_id
-        ] + [entity_id for entity_id in unit_ids if entity_id != own_id]
-        for entity_id in ordered_unit_ids:
+        # The role needs its own position first.  Process Core/buildings next
+        # so a newly spawned Intruder can find its friendly Core even when a
+        # dense group of nearby builders prevents a complete entity scan.
+        own_unit_ids = [entity_id for entity_id in unit_ids if entity_id == own_id]
+        other_unit_ids = [entity_id for entity_id in unit_ids if entity_id != own_id]
+        for entity_id in own_unit_ids:
             entity = self._entity_for_scan(controller, entity_id)
             if entity is None:
                 self._finish_incomplete_scan()
                 return
             pos, entity_type, team = entity
             self._remember_visible_entity(entity_id)
+            self.current_position = pos
+            self.role_cache_ready_this_turn = True
             self._direction_for_scan(controller, entity_id, entity_type)
             if self.scan_incomplete_this_turn:
                 self._finish_incomplete_scan()
@@ -225,6 +231,20 @@ class TileCache:
                 self._set_building(tile, entity_id, entity_type, team)
                 if direction is not None:
                     self.conveyor_directions[tile] = direction
+
+        for entity_id in other_unit_ids:
+            entity = self._entity_for_scan(controller, entity_id)
+            if entity is None:
+                self._finish_incomplete_scan()
+                return
+            pos, entity_type, team = entity
+            self._remember_visible_entity(entity_id)
+            self._direction_for_scan(controller, entity_id, entity_type)
+            if self.scan_incomplete_this_turn:
+                self._finish_incomplete_scan()
+                return
+            if entity_type == EntityType.BUILDER_BOT:
+                self.visible_builder_ids[pos] = entity_id
 
         own = self.entities.get(own_id)
         if own is None:
@@ -480,7 +500,7 @@ class TileCache:
             pos,
             None if entity_type is None or team is None else (entity_type, team),
         )
-        self.inferred_tiles.add(pos)
+        self.inferred_tiles.update((pos,))
 
     def _remember_observed_core(self, pos: Position, team: Team) -> None:
         """Record one immutable Core centre discovered by the batched scan."""
@@ -503,7 +523,7 @@ class TileCache:
                 continue
             self.tiles[tile] = (self.environments[tile], None, EntityType.CORE, team)
             self.buildings[tile] = (EntityType.CORE, team)
-            self.inferred_core_tiles.add(tile)
+            self.inferred_core_tiles.update((tile,))
 
     def _mirror_position(self, pos: Position, symmetry: str) -> Position:
         """Return a preallocated coordinate transformed by one legal symmetry."""
@@ -545,19 +565,19 @@ class TileCache:
         self.environments[pos] = env
         self.buildings[pos] = None
         self.tiles[pos] = (env, None, None, None)
-        self.observed_tiles.add(pos)
+        self.observed_tiles.update((pos,))
         self._observed_tile_order.append(pos)
         self.inferred_tiles.discard(pos)
         self.inferred_core_tiles.discard(pos)
-        self.newly_observed_tiles.add(pos)
-        self._pending_symmetry_tiles.add(pos)
+        self.newly_observed_tiles.update((pos,))
+        self._pending_symmetry_tiles.update((pos,))
         return True
 
     def _remember_visible_entity(self, entity_id: int) -> None:
         """Record a visible entity once while preserving batched-query order."""
         if entity_id in self.visible_entity_ids:
             return
-        self.visible_entity_ids.add(entity_id)
+        self.visible_entity_ids.update((entity_id,))
         self.visible_entity_order.append(entity_id)
 
     def _entity_for_scan(
@@ -624,9 +644,31 @@ class TileCache:
             if 0 <= pos.x + dx < self.map_width and 0 <= pos.y + dy < self.map_height
         )
 
+    def position_at(self, x: int, y: int) -> Position | None:
+        """Return the canonical tile at ``(x, y)``, or ``None`` off-map."""
+        if not (0 <= x < self.map_width and 0 <= y < self.map_height):
+            return None
+        return self._positions[x][y]
+
+    def canonicalize(self, pos: Position) -> Position:
+        """Convert an in-bounds external coordinate to its cached identity."""
+        canonical = self.position_at(pos.x, pos.y)
+        if canonical is None:
+            raise ValueError(f"position outside map: {pos}")
+        return canonical
+
+    def offset(self, pos: Position, dx: int, dy: int) -> Position | None:
+        """Return the canonical tile offset from ``pos``, or ``None`` off-map."""
+        return self.position_at(pos.x + dx, pos.y + dy)
+
     def _canonical_position(self, pos: Position) -> Position:
-        """Return the preallocated cache coordinate matching an in-bounds position."""
-        return self._positions[pos.x][pos.y]
+        """Backward-compatible private alias for :meth:`canonicalize`."""
+        return self.canonicalize(pos)
+
+    def neighbor(self, pos: Position, direction: Direction) -> Position | None:
+        """Return the canonical adjacent tile, or ``None`` beyond the map edge."""
+        dx, dy = direction.delta()
+        return self.offset(pos, dx, dy)
 
     def _set_building(
             self,
