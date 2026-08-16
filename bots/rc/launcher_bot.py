@@ -12,7 +12,8 @@ class LauncherBot(BaseBot):
 
     def run(self, controller: Controller) -> None:
         """Read one launch order, throw its adjacent friendly builder, then clear it."""
-        self._scan_turn(controller, read_markers=True)
+        if self._scan_turn(controller, read_markers=True):
+            return
         landing, marker_pos = self.read_launch_order()
         if landing is None or marker_pos is None:
             return

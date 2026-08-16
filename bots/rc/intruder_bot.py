@@ -29,6 +29,10 @@ _SUPPLY_BRIDGE_SEARCH_EXPANSIONS = 96
 _SUPPLY_CONVEYOR_STEP_COST = 3
 _SUPPLY_BRIDGE_STEP_COST = 20
 _RETURN_TO_CORE_A_STAR_MAX_EXPANSIONS = 192
+# ``can_fire_from`` crosses into the engine and is unusually costly compared
+# with the local geometry work.  Validate a prepared Gunner candidate one at
+# a time so an unsuccessful search cannot repeatedly consume the full turn.
+_GUNNER_SITE_VALIDATIONS_PER_TURN = 1
 # A bridge-aware A* search is intentionally fairly thorough, but running one
 # for every visible titanium deposit in a single 2 ms turn is not viable on a
 # fully explored map.  Evaluate the nearest candidates incrementally instead.
@@ -44,12 +48,16 @@ class IntruderBot(BaseBot):
         self.known_env = self.tile_cache.environments
         self.known_buildings = self.tile_cache.buildings
         self.core_pos: Position | None = None
-        self.enemy_core_pos: Position | None = None
+        # One target position throughout the role: first a symmetry guess,
+        # then the confirmed opposing Core.  Only its certainty is separate.
         self.destination: Position | None = None
+        self.destination_is_confirmed_core = False
 
         self.mode = "infiltrate"
         self.heading: Direction | None = None
         self.wall_following = False
+        self.exploration_wall_heading: Direction | None = None
+        self.exploration_wall_side: str | None = None
         self.last_position: Position | None = None
         self.previous_position: Position | None = None
         # Exploration never revisits a tile.  The only exception is the
@@ -64,6 +72,10 @@ class IntruderBot(BaseBot):
         self.gunner_direction: Direction | None = None
         self.rejected_gunner_sites: set[Position] = set()
         self.gunner_id: int | None = None
+        self.gunner_site_candidates: list[
+            tuple[Position, Direction, Position, bool]
+        ] | None = None
+        self.gunner_candidate_cursor = 0
 
         self.supply_ore: Position | None = None
         self.supply_path: list[Position] = []
@@ -96,7 +108,12 @@ class IntruderBot(BaseBot):
 
     def run(self, controller: Controller) -> None:
         """Execute one cached turn of infiltration, gunner construction, or supply."""
-        self._scan_turn(controller, split_initial_scan=True)
+        if self._scan_turn(controller):
+            return
+        # Confirming a symmetry schedules the historical terrain backfill and
+        # infers the opposite Core.  Do not immediately follow it with Gunner
+        # planning, whose engine validation calls can otherwise turn this
+        # already expensive transition into a TLE.
         current = self.get_cached_position()
         self.visited_tiles.add(current)
         self.draw_visited_tile_indicators(controller, current)
@@ -129,15 +146,9 @@ class IntruderBot(BaseBot):
         self.draw_goal_indicator(controller, current)
 
     def infiltrate(self, controller: Controller, current: Position) -> None:
-        """Use one navigation policy before and after the enemy Core is known.
-
-        Before the Core is known the current destination is only a symmetry
-        hypothesis.  Afterwards the same movement helper approaches a legal
-        Gunner site.  The distinction changes the construction action, never
-        the rules for choosing or abandoning the next movement tile.
-        """
-        if self.enemy_core_pos is None:
-            self.advance_towards_target(controller, self.destination)
+        """Explore toward a Core hypothesis, then establish a forward Gunner."""
+        if not self.destination_is_confirmed_core:
+            self.advance_towards_unvisited_target(controller, self.destination)
             return
         self.build_forward_gunner(controller, current)
 
@@ -207,48 +218,122 @@ class IntruderBot(BaseBot):
                 return True
         return False
 
-    def advance_towards_target(
+    def advance_towards_unvisited_target(
             self,
             controller: Controller,
             target: Position | None,
-            allow_revisit: bool = False,
     ) -> bool:
-        """Advance toward a target or start the A* return route at a true dead end.
-
-        Both pre-Core scouting and the approach to a Gunner site share this
-        movement policy.  Exploration avoids revisits to cover new terrain;
-        a selected Gunner site is the deliberate exception, because a legal
-        firing position may lie just behind the Intruder's arrival route.
-        """
+        """Explore toward ``target`` through new cells, then return from a dead end."""
         if target is None:
             return False
         current = self.get_cached_position()
-        if allow_revisit:
-            path = a_star_to_any(
-                None,
-                current,
-                {target},
-                lambda _controller, pos: self.is_roadable_position(pos),
-                movement_directions=DIRECTIONS,
-                max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
-            )
-            if path and self.try_move_step(
-                    controller,
-                    current.direction_to(path[0]),
-                    avoid_visited=False,
+        if self.exploration_wall_side is not None:
+            # A wall-following mode ends only when direct forward progress is
+            # again available, or when its chosen wall side has no unvisited
+            # continuation.  Do not restart A*, switch sides, or take a wide
+            # fallback while the wall can still be followed.
+            if self.move_towards(
+                controller,
+                target,
+                avoid_visited=True,
+                forward_sector_only=True,
+                require_closer=True,
+            ):
+                self.stop_exploration_wall_following()
+                return True
+            if self.continue_exploration_wall_following(
+                controller,
+                avoid_visited=True,
             ):
                 return True
+            self.stop_exploration_wall_following()
+            return self.finish_unvisited_movement(controller, target, current)
+
+        path = a_star_to_any(
+            None,
+            current,
+            {target},
+            lambda _controller, pos: self.unvisited_path_traversable(pos),
+            movement_directions=DIRECTIONS,
+            max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
+        )
+        if path:
+            direction = current.direction_to(path[0])
+            if self.try_move_step(controller, direction, avoid_visited=True):
+                self.heading = direction
+                self.wall_following = False
+                self.stop_exploration_wall_following()
+                return True
+
+        # No known unvisited A* route: first probe only the forward sector.
         if self.move_towards(
             controller,
             target,
-            allow_launcher=True,
-            avoid_visited=not allow_revisit,
-            full_directional_spectrum=not allow_revisit,
+            avoid_visited=True,
+            forward_sector_only=True,
+            require_closer=True,
+        ):
+            return True
+        # Choose one side of the obstacle.  Once a side can advance, it is
+        # retained across turns until forward progress resumes or it ends.
+        if self.start_exploration_wall_following(
+            controller,
+            target,
+            side="left",
+            avoid_visited=True,
+        ):
+            return True
+        if self.start_exploration_wall_following(
+            controller,
+            target,
+            side="right",
+            avoid_visited=True,
+        ):
+            return True
+        return self.finish_unvisited_movement(controller, target, current)
+
+    def finish_unvisited_movement(
+            self,
+            controller: Controller,
+            target: Position,
+            current: Position,
+    ) -> bool:
+        """Use the broad fallback only after no wall-following route remains."""
+        if self.move_towards(
+            controller,
+            target,
+            avoid_visited=True,
+            remaining_directional_spectrum=True,
         ):
             return True
         if not self.has_unvisited_exploration_exit(current):
             self.begin_return_to_core(current)
         return False
+
+    def advance_towards_revisitable_target(
+            self,
+            controller: Controller,
+            target: Position | None,
+    ) -> bool:
+        """Reach a selected target, allowing known tiles to be used again."""
+        if target is None:
+            return False
+        current = self.get_cached_position()
+        path = a_star_to_any(
+            None,
+            current,
+            {target},
+            lambda _controller, pos: self.is_roadable_position(pos),
+            movement_directions=DIRECTIONS,
+            max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
+        )
+        if path and self.try_move_step(
+                controller,
+                current.direction_to(path[0]),
+                avoid_visited=False,
+        ):
+            return True
+        return self.move_towards(controller, target)
 
     def begin_return_to_core(self, current: Position) -> None:
         """Plan a known-terrain A* route back to the friendly Core after a dead end."""
@@ -334,16 +419,18 @@ class IntruderBot(BaseBot):
                 self.tile_cache.entity_type(entity_id) == EntityType.CORE
                 and self.tile_cache.entity_team(entity_id) != self.team
             ):
-                self.enemy_core_pos = self.tile_cache.entity_position(entity_id)
-                self.destination = self.enemy_core_pos
+                self.destination = self.tile_cache.entity_position(entity_id)
+                self.destination_is_confirmed_core = True
                 self.wall_following = False
+                self.stop_exploration_wall_following()
                 return
 
         inferred_core = self.tile_cache.enemy_core_position(self.team)
         if inferred_core is not None:
-            self.enemy_core_pos = inferred_core
             self.destination = inferred_core
+            self.destination_is_confirmed_core = True
             self.wall_following = False
+            self.stop_exploration_wall_following()
             return
 
         if self.destination is None:
@@ -376,9 +463,10 @@ class IntruderBot(BaseBot):
             self,
             controller: Controller,
             target: Position | None,
-            allow_launcher: bool,
             avoid_visited: bool = False,
-            full_directional_spectrum: bool = False,
+            forward_sector_only: bool = False,
+            remaining_directional_spectrum: bool = False,
+            require_closer: bool = False,
     ) -> bool:
         """Advance greedily, optionally avoiding explored cells, or follow a wall."""
         if target is None:
@@ -387,30 +475,31 @@ class IntruderBot(BaseBot):
         desired = current.direction_to(target)
         if desired == Direction.CENTRE:
             return False
-
-        directions = (
-            self.forward_directions(desired)
-            if full_directional_spectrum
-            else (desired,)
-        )
+        if forward_sector_only:
+            directions = self.forward_sector_directions(desired)
+        elif remaining_directional_spectrum:
+            directions = self.remaining_exploration_directions(desired)
+        else:
+            directions = (desired,)
         for direction in directions:
+            candidate = current.add(direction)
+            if (
+                require_closer
+                and candidate.distance_squared(target) >= current.distance_squared(target)
+            ):
+                continue
             if self.try_move_step(controller, direction, avoid_visited=avoid_visited):
                 self.heading = direction
                 self.wall_following = False
                 return True
 
-        next_pos = current.add(desired)
+        # Explicit exploration probes do not spill into a different movement
+        # policy.  The caller decides whether to try wall following or the
+        # remaining direction spectrum next.
         if (
-            allow_launcher
-            and self.known_env.get(next_pos) == Environment.WALL
-            and self.start_launcher_crossing(controller, current, desired, target)
+            forward_sector_only
+            or remaining_directional_spectrum
         ):
-            return True
-
-        # Exploration has already tried every direction in its priority
-        # spectrum.  Do not spend this turn repeating those same checks in the
-        # generic wall-following fallback.
-        if full_directional_spectrum:
             return False
 
         self.wall_following = True
@@ -446,26 +535,101 @@ class IntruderBot(BaseBot):
             return True
         return False
 
-    def forward_directions(self, desired: Direction) -> tuple[Direction, ...]:
-        """Return all eight directions ordered from most to least forward.
+    def forward_sector_directions(self, desired: Direction) -> tuple[Direction, ...]:
+        """Return the direct heading and its two adjacent forward diagonals."""
+        return (
+            desired,
+            desired.rotate_left(),
+            desired.rotate_right(),
+        )
 
-        The closest alternatives are checked first, alternating around the
-        intended heading.  For WEST this yields WEST, SOUTHWEST, NORTHWEST,
-        SOUTH, NORTH, SOUTHEAST, NORTHEAST, EAST.  The tuple contains every
-        non-centre direction once, so a failed scan conclusively establishes
-        that this local area contains no available unvisited step.
+    def remaining_exploration_directions(
+            self,
+            desired: Direction,
+    ) -> tuple[Direction, ...]:
+        """Return the five directions deferred until wall following fails.
+
+        For NORTH the order is EAST, WEST, SOUTHEAST, SOUTHWEST, SOUTH.
         """
         left = desired.rotate_left()
         right = desired.rotate_right()
         return (
-            desired,
-            left,
-            right,
-            left.rotate_left(),
             right.rotate_right(),
-            desired.opposite().rotate_right(),
-            desired.opposite().rotate_left(),
+            left.rotate_left(),
+            right.rotate_right().rotate_right(),
+            left.rotate_left().rotate_left(),
             desired.opposite(),
+        )
+
+    def start_exploration_wall_following(
+            self,
+            controller: Controller,
+            target: Position | None,
+            side: str,
+            avoid_visited: bool,
+    ) -> bool:
+        """Choose a wall side and make the first unvisited bypass step."""
+        if target is None:
+            return False
+        current = self.get_cached_position()
+        desired = current.direction_to(target)
+        if desired == Direction.CENTRE:
+            return False
+        self.stop_exploration_wall_following()
+        self.exploration_wall_side = side
+        self.exploration_wall_heading = (
+            desired.rotate_right().rotate_right()
+            if side == "left"
+            else desired.rotate_left().rotate_left()
+        )
+        self.wall_following = True
+        if self.continue_exploration_wall_following(controller, avoid_visited):
+            return True
+        self.stop_exploration_wall_following()
+        return False
+
+    def continue_exploration_wall_following(
+            self,
+            controller: Controller,
+            avoid_visited: bool,
+    ) -> bool:
+        """Continue on the selected side; never switch sides implicitly."""
+        side = self.exploration_wall_side
+        heading = self.exploration_wall_heading
+        if side is None or heading is None:
+            return False
+        directions = (
+            self.left_wall_directions(heading)
+            if side == "left"
+            else self.right_wall_directions(heading)
+        )
+        for direction in directions:
+            if self.try_move_step(controller, direction, avoid_visited=avoid_visited):
+                self.exploration_wall_heading = direction
+                self.heading = direction
+                return True
+        return False
+
+    def stop_exploration_wall_following(self) -> None:
+        """Forget the selected exploration-wall side and its heading."""
+        self.exploration_wall_heading = None
+        self.exploration_wall_side = None
+        self.wall_following = False
+
+    def left_wall_directions(self, heading: Direction) -> tuple[Direction, ...]:
+        """Return the left-hand wall-following choices from a current heading."""
+        return (
+            heading.rotate_left(),
+            heading,
+            heading.rotate_right(),
+        )
+
+    def right_wall_directions(self, heading: Direction) -> tuple[Direction, ...]:
+        """Return the right-hand wall-following choices from a current heading."""
+        return (
+            heading.rotate_right(),
+            heading,
+            heading.rotate_left(),
         )
 
     def right_hand_directions(self, heading: Direction) -> tuple[Direction, ...]:
@@ -504,6 +668,15 @@ class IntruderBot(BaseBot):
                 return False
             road_id = controller.build_road(target)
             self.tile_cache.remember_building(target, road_id, EntityType.ROAD, self.team)
+        elif building[0] == EntityType.MARKER and building[1] == self.team:
+            # A persistent Core order can block the sole exit from a narrow
+            # spawn corridor.  Friendly markers are free to destroy from the
+            # adjacent BuilderBot tile; open it now and step through next turn.
+            if not controller.can_destroy(target):
+                return False
+            controller.destroy(target)
+            self.tile_cache.forget_building(target)
+            return True
         elif building[0] not in PASSABLE_BUILDINGS:
             return False
         elif building[0] == EntityType.CORE and building[1] != self.team:
@@ -651,7 +824,7 @@ class IntruderBot(BaseBot):
         if self.gunner_site is None:
             site_data = self.choose_gunner_site(controller)
             if site_data is None:
-                self.advance_towards_target(controller, self.enemy_core_pos)
+                self.advance_towards_unvisited_target(controller, self.destination)
                 return
             self.gunner_site, self.gunner_direction = site_data
 
@@ -664,7 +837,7 @@ class IntruderBot(BaseBot):
                 self.gunner_direction = None
                 return
             if current != site:
-                self.advance_towards_target(controller, site, allow_revisit=True)
+                self.advance_towards_revisitable_target(controller, site)
                 return
             self.clear_walkable_tile(controller, site, allow_enemy_road=True)
             return
@@ -674,10 +847,9 @@ class IntruderBot(BaseBot):
             return
         if current.distance_squared(site) > GameConstants.ACTION_RADIUS_SQ:
             approach = self.construction_approach(site)
-            self.advance_towards_target(
+            self.advance_towards_revisitable_target(
                 controller,
                 approach or site,
-                allow_revisit=True,
             )
             return
         if self.gunner_direction is None:
@@ -725,14 +897,52 @@ class IntruderBot(BaseBot):
         rejects the centre as an obstructed target.  Aim at each perimeter
         tile instead: that is the first Core tile on a valid attack ray.
         """
-        if self.enemy_core_pos is None:
+        if not self.destination_is_confirmed_core or self.destination is None:
+            self.clear_gunner_site_candidates()
             return None
-        # Rank candidates locally first.  ``can_fire_from`` crosses into the
-        # game engine and is far more expensive than the geometric checks
-        # below, so defer it until after ranking and stop at the first valid
-        # site.  The rank is unchanged from the previous all-candidates
-        # implementation: maximum firing range, then distance from Core,
-        # then an empty tile, then a deterministic coordinate tie-break.
+        if self.gunner_site_candidates is None:
+            self.gunner_site_candidates = self.prepare_gunner_site_candidates()
+            self.gunner_candidate_cursor = 0
+            # Candidate enumeration is deliberately its own turn.  Future
+            # turns reuse this stable ranking and pay for engine validation
+            # only after the result has been retained.
+            return None
+
+        validations = 0
+        while (
+            self.gunner_candidate_cursor < len(self.gunner_site_candidates)
+            and validations < _GUNNER_SITE_VALIDATIONS_PER_TURN
+        ):
+            site, facing, target, clearable_adjacent_site = (
+                self.gunner_site_candidates[self.gunner_candidate_cursor]
+            )
+            self.gunner_candidate_cursor += 1
+            validations += 1
+            if (
+                clearable_adjacent_site
+                or controller.can_fire_from(
+                    site,
+                    facing,
+                    EntityType.GUNNER,
+                    target,
+                )
+            ):
+                self.clear_gunner_site_candidates()
+                return site, facing
+        if self.gunner_candidate_cursor >= len(self.gunner_site_candidates):
+            # All retained candidates have been checked against the current
+            # engine state.  Allow a fresh local enumeration next turn after
+            # additional terrain may have entered the cache.
+            self.clear_gunner_site_candidates()
+        return None
+
+    def prepare_gunner_site_candidates(
+            self,
+    ) -> list[tuple[Position, Direction, Position, bool]]:
+        """Enumerate and rank candidate sites without calling the engine."""
+        enemy_core = self.destination
+        if not self.destination_is_confirmed_core or enemy_core is None:
+            return []
         candidates: list[
             tuple[int, int, int, Position, Direction, Position, bool]
         ] = []
@@ -766,12 +976,9 @@ class IntruderBot(BaseBot):
                     building = self.known_buildings.get(site)
                     if building is not None and building[0] not in _CLEARABLE_WALKABLE_BUILDINGS:
                         continue
-                    # ``can_fire_from`` evaluates the board as it is now and
-                    # therefore rejects a prospective Gunner sitting on an
-                    # enemy road.  At distance one from a Core edge there is
-                    # no intervening tile; clearing that road makes the shot
-                    # legal, so retain this exact fallback candidate without
-                    # asking the engine to validate its pre-clear state.
+                    # ``can_fire_from`` rejects a prospective Gunner sitting
+                    # on an enemy road.  Adjacent to a Core edge there is no
+                    # intervening tile, so clearing that road is sufficient.
                     clearable_adjacent_site = (
                         building is not None
                         and building[0] in _CLEARABLE_WALKABLE_BUILDINGS
@@ -779,44 +986,39 @@ class IntruderBot(BaseBot):
                     )
                     candidates.append((
                         site.distance_squared(target),
-                        site.distance_squared(self.enemy_core_pos),
+                        site.distance_squared(enemy_core),
                         int(building is None),
                         site,
                         facing,
                         target,
                         clearable_adjacent_site,
                     ))
-
-        if not candidates:
-            return None
         candidates.sort(
             key=lambda item: (item[0], item[1], item[2], item[3].x, item[3].y),
             reverse=True,
         )
-        for _, _, _, site, facing, target, clearable_adjacent_site in candidates:
-            if (
-                clearable_adjacent_site
-                or controller.can_fire_from(
-                    site,
-                    facing,
-                    EntityType.GUNNER,
-                    target,
-                )
-            ):
-                return site, facing
-        return None
+        return [
+            (site, facing, target, clearable_adjacent_site)
+            for _, _, _, site, facing, target, clearable_adjacent_site in candidates
+        ]
+
+    def clear_gunner_site_candidates(self) -> None:
+        """Forget a completed or obsolete prepared Gunner-site ranking."""
+        self.gunner_site_candidates = None
+        self.gunner_candidate_cursor = 0
 
     def enemy_core_edge_tiles(self) -> tuple[Position, ...]:
         """Return all in-bounds perimeter cells of the known 3x3 enemy Core."""
-        if self.enemy_core_pos is None:
+        enemy_core = self.destination
+        if not self.destination_is_confirmed_core or enemy_core is None:
             return ()
         return tuple(
-            Position(self.enemy_core_pos.x + dx, self.enemy_core_pos.y + dy)
+            Position(enemy_core.x + dx, enemy_core.y + dy)
             for dx in range(-1, 2)
             for dy in range(-1, 2)
             if (
                 (dx != 0 or dy != 0)
-                and self.in_bounds(Position(self.enemy_core_pos.x + dx, self.enemy_core_pos.y + dy))
+                and self.in_bounds(Position(enemy_core.x + dx, enemy_core.y + dy))
             )
         )
 
@@ -842,6 +1044,10 @@ class IntruderBot(BaseBot):
             building[0] in PASSABLE_BUILDINGS
             and (building[0] != EntityType.CORE or building[1] == self.team)
         )
+
+    def unvisited_path_traversable(self, pos: Position) -> bool:
+        """Restrict exploratory A* to known roadable cells not visited before."""
+        return pos not in self.visited_tiles and self.is_roadable_position(pos)
 
     def clear_walkable_tile(
             self,
@@ -950,7 +1156,7 @@ class IntruderBot(BaseBot):
                 self.supply_index += 1
             return
         if current != tile:
-            self.move_towards(controller, tile, allow_launcher=False)
+            self.move_towards(controller, tile)
             return
         if tile in self.supply_bridge_targets:
             self.step_off_supply_bridge(controller)
@@ -1051,7 +1257,7 @@ class IntruderBot(BaseBot):
         # toward the Gunner.  Each step refreshes the local cache; the next
         # turn retries A* and begins construction as soon as a full known
         # conveyor route exists.
-        self.move_towards(controller, self.gunner_site, allow_launcher=False)
+        self.move_towards(controller, self.gunner_site)
 
     def plan_supply_route(
             self,
@@ -1103,12 +1309,13 @@ class IntruderBot(BaseBot):
         return path, directions, bridge_targets, cost
 
     def is_supply_tile(self, pos: Position) -> bool:
-        """Allow known ground that can become a conveyor, including enemy roads.
+        """Allow known ground that can become a conveyor, including enemy logistics.
 
-        An enemy road is a valid route cell: the Intruder can stand on it,
-        fire at it from that cell, then replace it with a friendly conveyor.
-        Other foreign infrastructure remains excluded because it cannot be
-        safely converted while preserving the branch's direction.
+        An enemy road or conveyor is a valid route cell: the Intruder can
+        stand on it, fire at it from that cell, then replace it with a
+        friendly conveyor.  Other foreign infrastructure remains excluded
+        because it cannot be safely converted while preserving the branch's
+        direction.
         """
         env = self.known_env.get(pos)
         if env is None or env in {Environment.WALL, Environment.ORE_TITANIUM, Environment.ORE_AXIONITE}:
@@ -1276,12 +1483,12 @@ class IntruderBot(BaseBot):
         if (
             is_planned_tile
             and building is not None
-            and building[0] == EntityType.ROAD
+            and building[0] in _CLEARABLE_WALKABLE_BUILDINGS
             and building[1] != self.team
         ):
-            # Builders can only fire at their own tile.  First enter the
-            # usable enemy road; follow_supply_travel_path will then remove
-            # it and replace it with our conveyor on subsequent turns.
+            # Builders can only fire at a building underneath themselves.
+            # First enter the usable enemy logistics tile; subsequent turns
+            # will remove it and replace it with our conveyor.
             return self.try_move_step(controller, direction, build_road=False)
         if is_planned_tile and not self.supply_tile_complete(target):
             if not self.build_supply_tile(controller, target):
@@ -1383,4 +1590,4 @@ class IntruderBot(BaseBot):
             min(self.map_width - 1, max(0, current.x + dx * self.map_width)),
             min(self.map_height - 1, max(0, current.y + dy * self.map_height)),
         )
-        self.move_towards(controller, target, allow_launcher=False)
+        self.move_towards(controller, target)

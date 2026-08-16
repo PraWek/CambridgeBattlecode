@@ -129,7 +129,8 @@ class BuilderBot(BaseBot):
 
     def run(self, controller: Controller) -> None:
         """Execute one turn of scouting, mining, or conveyor construction."""
-        self._scan_turn(controller, read_markers=True, split_initial_scan=True)
+        if self._scan_turn(controller, read_markers=True):
+            return
         self.rounds_alive += 1
         self.current_round = controller.get_current_round()
         current = self.get_cached_position()

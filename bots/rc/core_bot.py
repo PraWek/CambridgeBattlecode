@@ -46,7 +46,8 @@ class CoreBot(BaseBot):
 
     def run(self, controller: Controller) -> None:
         """Spawn the infiltrator first, then maintain four directional builders."""
-        self._scan_turn(controller)
+        if self._scan_turn(controller):
+            return
         self.observe_tiles()
         self.core_pos = self.get_cached_position()
         if not self.sector_marker_pads:

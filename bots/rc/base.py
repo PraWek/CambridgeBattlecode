@@ -22,29 +22,34 @@ class BaseBot:
             self,
             controller: Controller,
             read_markers: bool = False,
-            split_initial_scan: bool = False,
-    ) -> None:
-        """Fill this role's shared tile cache exactly once for the current turn.
+    ) -> bool:
+        """Fill this role's cache and report when this turn must yield.
 
         ``read_markers`` is opt-in because cores write markers but never read
         them; avoiding those values saves several calls on every core turn.
-        Builders may split their cold terrain scan across two turns to stay
-        below the per-turn CPU limit.
+        TileCache also returns ``True`` after it reaches its per-turn API
+        budget, so no role can chain further work onto a partial scan.
         """
         if self.entity_id is None:
             self.entity_id = controller.get_id()
-        self.tile_cache.scan_turn(
-            controller,
-            self.entity_id,
-            split_initial_scan=split_initial_scan,
-        )
+        self.tile_cache.scan_turn(controller, self.entity_id)
+        if self.tile_cache.scan_incomplete_this_turn:
+            return True
         self.current_position = self.tile_cache.current_position
         if self.team is None:
             self.team = self.tile_cache.entity_team(self.entity_id)
             if self.team is None:
                 self.team = controller.get_team()
-        if read_markers:
-            self.tile_cache.cache_friendly_marker_values(controller, self.team)
+        # A caller that sees ``True`` must immediately yield this turn.  Do
+        # not add marker reads after TileCache has spent the confirmation turn
+        # scheduling its historical symmetry backfill.
+        if read_markers and not self.tile_cache.symmetry_confirmed_this_turn:
+            if not self.tile_cache.cache_friendly_marker_values(controller, self.team):
+                return True
+        return (
+            self.tile_cache.symmetry_confirmed_this_turn
+            or self.tile_cache.scan_incomplete_this_turn
+        )
 
     def get_cached_position(self) -> Position:
         """Return this entity's start-of-turn position without an API call."""
