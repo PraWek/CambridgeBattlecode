@@ -31,8 +31,10 @@ _DIAGONAL_SYMMETRIES = ("main_diagonal", "anti_diagonal")
 _SCAN_API_CALL_LIMIT = 16
 # Confirming a symmetry may happen after a scout has seen hundreds of tiles.
 # Mirroring all of them in one bot turn exceeds the 2 ms limit, so drain the
-# historical cache over several later turns instead.
-_SYMMETRY_BACKFILL_TILES_PER_TURN = 24
+# historical cache over several later turns instead.  This work shares a
+# 2 ms turn with the ordinary scan and role logic; six tiles leave room for
+# both even on a large map with a crowded vision disc.
+_SYMMETRY_BACKFILL_TILES_PER_TURN = 6
 
 
 class TileCache:
