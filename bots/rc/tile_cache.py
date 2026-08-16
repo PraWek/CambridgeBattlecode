@@ -32,9 +32,11 @@ _SCAN_API_CALL_LIMIT = 16
 # Confirming a symmetry may happen after a scout has seen hundreds of tiles.
 # Mirroring all of them in one bot turn exceeds the 2 ms limit, so drain the
 # historical cache over several later turns instead.  This work shares a
-# 2 ms turn with the ordinary scan and role logic; six tiles leave room for
-# both even on a large map with a crowded vision disc.
-_SYMMETRY_BACKFILL_TILES_PER_TURN = 6
+# 2 ms turn with the ordinary scan and role logic, so process only one tile
+# at a time.  The historical source uses direct-observation order and a
+# cursor, avoiding one large scheduling pass at the exact turn symmetry
+# becomes known.
+_SYMMETRY_BACKFILL_TILES_PER_TURN = 1
 
 
 class TileCache:
@@ -85,9 +87,11 @@ class TileCache:
         self.inferred_core_positions: dict[Team, Position] = {}
         self.inferred_core_tiles: set[Position] = set()
         self._symmetry_backfill_pending: deque[Position] = deque()
-        self._symmetry_backfill_scheduled: set[Position] = set()
+        self._symmetry_backfill_historical_index = 0
+        self._symmetry_backfill_historical_end = 0
 
         self.observed_tiles: set[Position] = set()
+        self._observed_tile_order: list[Position] = []
         self.visible_tiles: set[Position] = set()
         self.newly_visible_tiles: set[Position] = set()
         self.newly_observed_tiles: set[Position] = set()
@@ -388,7 +392,8 @@ class TileCache:
         # Infer the opposing Core immediately: it supplies a useful target
         # for scouting, while the much larger terrain mirror is deferred.
         self._backfill_symmetric_cores()
-        self._schedule_symmetric_backfill(self.observed_tiles)
+        self._symmetry_backfill_historical_index = 0
+        self._symmetry_backfill_historical_end = len(self._observed_tile_order)
         self._continue_symmetric_backfill()
 
     def _symmetry_matches_pending_terrain(self, symmetry: str) -> bool:
@@ -423,21 +428,26 @@ class TileCache:
         return True
 
     def _schedule_symmetric_backfill(self, source_tiles: set[Position]) -> None:
-        """Queue directly seen cells to be mirrored exactly once."""
-        for pos in source_tiles:
-            if pos in self._symmetry_backfill_scheduled:
-                continue
-            self._symmetry_backfill_scheduled.add(pos)
-            self._symmetry_backfill_pending.append(pos)
+        """Queue terrain first observed after symmetry confirmation."""
+        self._symmetry_backfill_pending.extend(source_tiles)
 
     def _continue_symmetric_backfill(self) -> None:
         """Mirror one bounded terrain batch after symmetry is confirmed."""
         if self.confirmed_symmetry is None:
             return
         for _ in range(_SYMMETRY_BACKFILL_TILES_PER_TURN):
-            if not self._symmetry_backfill_pending:
+            if self._symmetry_backfill_pending:
+                pos = self._symmetry_backfill_pending.popleft()
+            elif (
+                self._symmetry_backfill_historical_index
+                < self._symmetry_backfill_historical_end
+            ):
+                pos = self._observed_tile_order[
+                    self._symmetry_backfill_historical_index
+                ]
+                self._symmetry_backfill_historical_index += 1
+            else:
                 return
-            pos = self._symmetry_backfill_pending.popleft()
             self._remember_inferred_environment(
                 self._mirror_position(pos, self.confirmed_symmetry),
                 self.environments[pos],
@@ -536,6 +546,7 @@ class TileCache:
         self.buildings[pos] = None
         self.tiles[pos] = (env, None, None, None)
         self.observed_tiles.add(pos)
+        self._observed_tile_order.append(pos)
         self.inferred_tiles.discard(pos)
         self.inferred_core_tiles.discard(pos)
         self.newly_observed_tiles.add(pos)
