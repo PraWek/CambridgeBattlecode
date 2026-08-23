@@ -29,15 +29,10 @@ _SUPPLY_BRIDGE_SEARCH_EXPANSIONS = 96
 _SUPPLY_CONVEYOR_STEP_COST = 3
 _SUPPLY_BRIDGE_STEP_COST = 20
 _RETURN_TO_CORE_A_STAR_MAX_EXPANSIONS = 192
-# ``can_fire_from`` crosses into the engine and is unusually costly compared
-# with the local geometry work.  Validate a prepared Gunner candidate one at
-# a time so an unsuccessful search cannot repeatedly consume the full turn.
-_GUNNER_SITE_VALIDATIONS_PER_TURN = 1
-# Preparing a Gunner candidate list also performs enough local geometry and
-# allocation to exhaust a 2 ms turn after a symmetry has just been confirmed.
-# Keep its cursor in the bot state and inspect only a small fixed batch each
-# turn, so an interruption cannot restart the full enumeration forever.
-_GUNNER_CANDIDATE_PREPARATIONS_PER_TURN = 48
+# ``can_fire_from`` is a Controller call.  Keep enough of the 2 ms turn for
+# cache refresh and later construction, then resume this persisted queue next
+# round rather than changing the target-selection priority.
+_GUNNER_SITE_VALIDATIONS_PER_TURN = 7
 # A bridge-aware A* search is intentionally fairly thorough, but running one
 # for every visible titanium deposit in a single 2 ms turn is not viable on a
 # fully explored map.  Evaluate the nearest candidates incrementally instead.
@@ -77,19 +72,10 @@ class IntruderBot(BaseBot):
         self.gunner_direction: Direction | None = None
         self.rejected_gunner_sites: set[Position] = set()
         self.gunner_id: int | None = None
-        self.gunner_site_candidates: list[
-            tuple[Position, Direction, Position, bool]
-        ] | None = None
-        self.gunner_candidate_cursor = 0
-        self.gunner_candidate_targets: tuple[Position, ...] | None = None
-        self.gunner_candidate_destination: Position | None = None
-        self.gunner_candidate_target_index = 0
-        self.gunner_candidate_facing_index = 0
-        self.gunner_candidate_distance = 0
-        self.gunner_candidate_seen_sites: set[tuple[Position, Direction]] = set()
-        self.gunner_candidate_builds: list[
-            tuple[int, int, int, Position, Direction, Position, bool]
-        ] = []
+        self.gunner_site_candidates: list[tuple[Position, Direction, Position]] = []
+        self.gunner_site_candidate_cursor = 0
+        self.gunner_search_origin: Position | None = None
+        self.gunner_search_destination: Position | None = None
 
         self.supply_ore: Position | None = None
         self.supply_path: list[Position] = []
@@ -104,6 +90,13 @@ class IntruderBot(BaseBot):
         self.supply_plan_candidates: list[Position] | None = None
         self.supply_plan_cursor = 0
         self.deferred_supply_candidates: list[Position] = []
+        # Once a supply route exists, newly scanned deposits are considered
+        # incrementally.  This lets the Intruder abandon an early, distant
+        # discovery for a genuinely cheaper route without repeating A* for
+        # every already-known deposit each turn.
+        self.supply_seen_ores: set[Position] = set()
+        self.supply_replan_candidates: list[Position] = []
+        self.supply_plan_cost: int | None = None
 
     @staticmethod
     def claims_spawn(controller: Controller) -> bool:
@@ -839,10 +832,18 @@ class IntruderBot(BaseBot):
         return None
 
     def build_forward_gunner(self, controller: Controller, current: Position) -> None:
-        """Reach a maximum-range core shot, clear it if needed, and build the gunner."""
+        """Choose a viable Core shot, then reach and build the Gunner."""
         if self.gunner_site is None:
-            site_data = self.choose_gunner_site(controller)
+            site_data = self.choose_gunner_site(controller, current)
             if site_data is None:
+                if self.gunner_site_search_pending():
+                    # The engine-check budget was spent before this ordered
+                    # search reached a conclusion.  Keep the Intruder still
+                    # so the next turn checks the same remaining candidates.
+                    return
+                # Only after every locally known Core-edge shot has been
+                # checked across one or more turns may ordinary exploration
+                # look for more terrain and a different firing position.
                 self.advance_towards_unvisited_target(controller, self.destination)
                 return
             self.gunner_site, self.gunner_direction = site_data
@@ -910,172 +911,181 @@ class IntruderBot(BaseBot):
                 return True
         return False
 
-    def choose_gunner_site(self, controller: Controller) -> tuple[Position, Direction] | None:
-        """Choose the farthest clearable site whose ray reaches a Core edge tile.
+    def choose_gunner_site(
+            self,
+            controller: Controller,
+            current: Position,
+    ) -> tuple[Position, Direction] | None:
+        """Immediately select the first viable Core shot near this Intruder.
 
-        A Core is a 3x3 building.  A gunner firing at its centre would first
-        hit the nearer edge of that same Core, so the Controller correctly
-        rejects the centre as an obstructed target.  Aim at each perimeter
-        tile instead: that is the first Core tile on a valid attack ray.
+        The first three Core-edge targets are the closest to ``current``.
+        For each one, firing directions nearest the direct Intruder-to-target
+        line are tried first.  Only if those three targets have no valid shot
+        does the search fan out to Core edges farther from that direct line.
         """
         if not self.destination_is_confirmed_core or self.destination is None:
-            self.clear_gunner_site_candidates()
+            self.clear_gunner_site_search()
             return None
-        if self.gunner_site_candidates is None:
-            self.continue_gunner_site_candidate_preparation()
-            # Candidate enumeration is deliberately its own turn.  The
-            # persistent preparation state keeps it bounded even if this
-            # turn is interrupted by the engine.
-            return None
+
+        if (
+            self.gunner_search_origin != current
+            or self.gunner_search_destination != self.destination
+        ):
+            self.start_gunner_site_search(current)
 
         validations = 0
         while (
-            self.gunner_candidate_cursor < len(self.gunner_site_candidates)
+            self.gunner_site_candidate_cursor < len(self.gunner_site_candidates)
             and validations < _GUNNER_SITE_VALIDATIONS_PER_TURN
         ):
-            site, facing, target, clearable_adjacent_site = (
-                self.gunner_site_candidates[self.gunner_candidate_cursor]
-            )
-            self.gunner_candidate_cursor += 1
+            site, facing, target = self.gunner_site_candidates[
+                self.gunner_site_candidate_cursor
+            ]
+            self.gunner_site_candidate_cursor += 1
+            if not self.is_gunner_site_locally_viable(site):
+                continue
             validations += 1
-            if (
-                clearable_adjacent_site
-                or controller.can_fire_from(
-                    site,
-                    facing,
-                    EntityType.GUNNER,
-                    target,
-                )
-            ):
-                self.clear_gunner_site_candidates()
-                return site, facing
-        if self.gunner_candidate_cursor >= len(self.gunner_site_candidates):
-            # All retained candidates have been checked against the current
-            # engine state.  Allow a fresh local enumeration next turn after
-            # additional terrain may have entered the cache.
-            self.clear_gunner_site_candidates()
-        return None
-
-    def continue_gunner_site_candidate_preparation(self) -> None:
-        """Incrementally enumerate and rank candidate sites without engine calls."""
-        enemy_core = self.destination
-        if not self.destination_is_confirmed_core or enemy_core is None:
-            self.clear_gunner_site_candidates()
-            return
-        if (
-            self.gunner_candidate_targets is None
-            or self.gunner_candidate_destination != enemy_core
-        ):
-            self.gunner_candidate_targets = self.enemy_core_edge_tiles()
-            self.gunner_candidate_destination = enemy_core
-            self.gunner_candidate_target_index = 0
-            self.gunner_candidate_facing_index = 0
-            self.gunner_candidate_distance = 0
-            self.gunner_candidate_seen_sites = set()
-            self.gunner_candidate_builds = []
-
-        preparations = 0
-        while (
-            preparations < _GUNNER_CANDIDATE_PREPARATIONS_PER_TURN
-            and self.gunner_candidate_targets is not None
-            and self.gunner_candidate_target_index < len(self.gunner_candidate_targets)
-        ):
-            target = self.gunner_candidate_targets[self.gunner_candidate_target_index]
-            facing = DIRECTIONS[self.gunner_candidate_facing_index]
-            max_steps = 3 if facing in ORTHOGONAL_DIRECTIONS else 2
-            if self.gunner_candidate_distance == 0:
-                self.gunner_candidate_distance = max_steps
-            distance = self.gunner_candidate_distance
-            self.advance_gunner_candidate_cursor()
-            preparations += 1
-
-            site = target
-            for _ in range(distance):
-                site = self.tile_cache.neighbor(site, facing.opposite())
-                if site is None:
-                    break
-            if site is None:
-                continue
-            site_key = (site, facing)
-            if site_key in self.gunner_candidate_seen_sites:
-                continue
-            self.gunner_candidate_seen_sites.update((site_key,))
-            if (
-                site in self.rejected_gunner_sites
-                or self.known_env.get(site) in {
-                    None,
-                    Environment.WALL,
-                    Environment.ORE_TITANIUM,
-                    Environment.ORE_AXIONITE,
-                }
-            ):
-                continue
-            building = self.known_buildings.get(site)
-            if (
-                building is not None
-                and building[0] not in _CLEARABLE_WALKABLE_BUILDINGS
-            ):
-                continue
-            # ``can_fire_from`` rejects a prospective Gunner sitting on an
-            # enemy road.  Adjacent to a Core edge there is no intervening
-            # tile, so clearing that road is sufficient.
-            clearable_adjacent_site = (
-                building is not None
-                and building[0] in _CLEARABLE_WALKABLE_BUILDINGS
-                and distance == 1
-            )
-            self.gunner_candidate_builds.append((
-                site.distance_squared(target),
-                site.distance_squared(enemy_core),
-                int(building is None),
+            if controller.can_fire_from(
                 site,
                 facing,
+                EntityType.GUNNER,
                 target,
-                clearable_adjacent_site,
-            ))
+            ):
+                self.clear_gunner_site_search()
+                return site, facing
 
-        if (
-            self.gunner_candidate_targets is not None
-            and self.gunner_candidate_target_index
-            < len(self.gunner_candidate_targets)
-        ):
-            return
-        self.gunner_candidate_builds.sort(
-            key=lambda item: (item[0], item[1], item[2], item[3].x, item[3].y),
+        if self.gunner_site_candidate_cursor >= len(self.gunner_site_candidates):
+            self.clear_gunner_site_search()
+        return None
+
+    def start_gunner_site_search(self, current: Position) -> None:
+        """Create one ordered, resumable queue of Core-shot candidates."""
+        self.clear_gunner_site_search()
+        self.gunner_search_origin = current
+        self.gunner_search_destination = self.destination
+        closest, fallback = self.gunner_target_groups(current)
+        for targets in (closest, fallback):
+            for target in targets:
+                for facing in self.gunner_facing_directions(current, target):
+                    max_distance = 3 if facing in ORTHOGONAL_DIRECTIONS else 2
+                    for distance in range(max_distance, 0, -1):
+                        site = target
+                        for _ in range(distance):
+                            site = self.tile_cache.neighbor(site, facing.opposite())
+                            if site is None:
+                                break
+                        if site is not None:
+                            self.gunner_site_candidates.append((site, facing, target))
+
+    def gunner_site_search_pending(self) -> bool:
+        """Return whether the current Core-shot queue still has untried entries."""
+        return self.gunner_site_candidate_cursor < len(self.gunner_site_candidates)
+
+    def clear_gunner_site_search(self) -> None:
+        """Discard a completed or obsolete Gunner-site candidate queue."""
+        self.gunner_site_candidates = []
+        self.gunner_site_candidate_cursor = 0
+        self.gunner_search_origin = None
+        self.gunner_search_destination = None
+
+    def ordered_gunner_targets(self, current: Position) -> tuple[Position, ...]:
+        """Prioritise the three Core edges nearest the Intruder.
+
+        Once those direct targets fail, try the remaining edge cells from the
+        greatest perpendicular offset from the Core-to-Intruder segment.  The
+        fallback therefore deliberately fans out from the direct approach.
+        """
+        closest, fallback = self.gunner_target_groups(current)
+        return closest + fallback
+
+    def gunner_target_groups(
+            self,
+            current: Position,
+    ) -> tuple[tuple[Position, ...], tuple[Position, ...]]:
+        """Return nearest Core edges and their lateral fallback separately."""
+        enemy_core = self.destination
+        if enemy_core is None:
+            return (), ()
+        targets = self.enemy_core_edge_tiles()
+        closest = sorted(
+            targets,
+            key=lambda pos: (
+                pos.distance_squared(current),
+                self.distance_squared_to_core_segment(pos, enemy_core, current),
+                pos.y,
+                pos.x,
+            ),
+        )[:3]
+        closest_set = set(closest)
+        fallback = sorted(
+            (pos for pos in targets if pos not in closest_set),
+            key=lambda pos: (
+                self.distance_squared_to_core_segment(pos, enemy_core, current),
+                pos.distance_squared(current),
+                pos.y,
+                pos.x,
+            ),
             reverse=True,
         )
-        self.gunner_site_candidates = [
-            (site, facing, target, clearable_adjacent_site)
-            for _, _, _, site, facing, target, clearable_adjacent_site
-            in self.gunner_candidate_builds
-        ]
-        self.gunner_candidate_cursor = 0
-        self.gunner_candidate_targets = None
-        self.gunner_candidate_seen_sites = set()
-        self.gunner_candidate_builds = []
+        return tuple(closest), tuple(fallback)
 
-    def advance_gunner_candidate_cursor(self) -> None:
-        """Advance the persistent target/facing/distance candidate cursor."""
-        self.gunner_candidate_distance -= 1
-        if self.gunner_candidate_distance > 0:
-            return
-        self.gunner_candidate_facing_index += 1
-        if self.gunner_candidate_facing_index < len(DIRECTIONS):
-            return
-        self.gunner_candidate_facing_index = 0
-        self.gunner_candidate_target_index += 1
+    @staticmethod
+    def distance_squared_to_core_segment(
+            pos: Position,
+            core: Position,
+            intruder: Position,
+    ) -> int:
+        """Return a common-scale squared distance from ``pos`` to Core--Intruder."""
+        dx = intruder.x - core.x
+        dy = intruder.y - core.y
+        length_squared = dx * dx + dy * dy
+        if length_squared == 0:
+            return pos.distance_squared(core)
+        offset_x = pos.x - core.x
+        offset_y = pos.y - core.y
+        projection = offset_x * dx + offset_y * dy
+        if projection <= 0:
+            return pos.distance_squared(core) * length_squared
+        if projection >= length_squared:
+            return pos.distance_squared(intruder) * length_squared
+        cross_product = offset_x * dy - offset_y * dx
+        return cross_product * cross_product
 
-    def clear_gunner_site_candidates(self) -> None:
-        """Forget a completed or obsolete prepared Gunner-site ranking."""
-        self.gunner_site_candidates = None
-        self.gunner_candidate_cursor = 0
-        self.gunner_candidate_targets = None
-        self.gunner_candidate_destination = None
-        self.gunner_candidate_target_index = 0
-        self.gunner_candidate_facing_index = 0
-        self.gunner_candidate_distance = 0
-        self.gunner_candidate_seen_sites = set()
-        self.gunner_candidate_builds = []
+    @staticmethod
+    def gunner_facing_directions(
+            current: Position,
+            target: Position,
+    ) -> tuple[Direction, ...]:
+        """List Gunner facings from the direct Intruder-to-target ray outward."""
+        direct = current.direction_to(target)
+        if direct == Direction.CENTRE:
+            return tuple(DIRECTIONS)
+        directions = [direct]
+        left = direct
+        right = direct
+        for _ in range(3):
+            left = left.rotate_left()
+            right = right.rotate_right()
+            directions.extend((left, right))
+        directions.append(direct.opposite())
+        return tuple(dict.fromkeys(directions))
+
+    def is_gunner_site_locally_viable(self, site: Position) -> bool:
+        """Reject unscanned terrain, resources, solid buildings, and rejected sites."""
+        if site in self.rejected_gunner_sites:
+            return False
+        if self.known_env.get(site) in {
+            None,
+            Environment.WALL,
+            Environment.ORE_TITANIUM,
+            Environment.ORE_AXIONITE,
+        }:
+            return False
+        building = self.known_buildings.get(site)
+        return (
+            building is None
+            or building[0] in _CLEARABLE_WALKABLE_BUILDINGS
+        )
 
     def enemy_core_edge_tiles(self) -> tuple[Position, ...]:
         """Return all in-bounds perimeter cells of the known 3x3 enemy Core."""
@@ -1201,6 +1211,8 @@ class IntruderBot(BaseBot):
                     return
                 self.search_for_titanium(controller)
                 return
+        else:
+            self.reconsider_supply_plan()
 
         if not self.ensure_supply_harvester(controller, current):
             return
@@ -1253,6 +1265,7 @@ class IntruderBot(BaseBot):
                 ),
                 key=lambda pos: (pos.distance_squared(self.gunner_site), pos.y, pos.x),
             )
+            self.supply_seen_ores.update(self.supply_plan_candidates)
             self.supply_plan_cursor = 0
             self.deferred_supply_candidates = []
 
@@ -1293,6 +1306,52 @@ class IntruderBot(BaseBot):
         self.supply_plan_candidates = None
         return False
 
+    def reconsider_supply_plan(self) -> bool:
+        """Replace an active route when a newly seen Ti deposit is cheaper.
+
+        The first visible deposit is often only a provisional choice.  A
+        supply branch can encounter a much closer deposit while travelling
+        toward it, so compare each *new* usable deposit with the saved A*
+        cost.  The candidate queue and one-search limit keep this from
+        turning map exploration into an unbounded per-turn route search.
+        """
+        if self.gunner_site is None or self.supply_ore is None:
+            return False
+
+        known_ores = {
+            pos
+            for pos, env in self.known_env.items()
+            if env == Environment.ORE_TITANIUM
+            and pos not in self.unavailable_titanium
+            and (
+                self.known_buildings.get(pos) is None
+                or self.known_buildings[pos][0] == EntityType.HARVESTER
+            )
+        }
+        new_ores = known_ores - self.supply_seen_ores
+        if new_ores:
+            self.supply_seen_ores.update(new_ores)
+            self.supply_replan_candidates.extend(sorted(
+                new_ores,
+                key=lambda pos: (pos.distance_squared(self.gunner_site), pos.y, pos.x),
+            ))
+
+        if not self.supply_replan_candidates:
+            return False
+
+        # A bridge-aware search can be expensive.  One bounded attempt per
+        # turn is enough to react immediately to a single newly seen deposit
+        # while retaining the same timing guarantee as initial planning.
+        ore = self.supply_replan_candidates.pop(0)
+        plan = self.plan_supply_route(ore)
+        if plan is None:
+            return False
+        if self.supply_plan_cost is not None and plan[3] >= self.supply_plan_cost:
+            return False
+
+        self.store_supply_plan(ore, plan)
+        return True
+
     def store_supply_plan(
             self,
             ore: Position,
@@ -1304,8 +1363,10 @@ class IntruderBot(BaseBot):
             ],
     ) -> None:
         """Persist a Gunner-origin A* route and reset its conveyor build cursor."""
-        path, directions, bridge_targets, _ = plan
+        path, directions, bridge_targets, cost = plan
         self.supply_ore = ore
+        self.supply_seen_ores.update((ore,))
+        self.supply_plan_cost = cost
         self.supply_path = path
         self.supply_travel_path = list(reversed(path))
         self.supply_travel_bridges = {
@@ -1656,6 +1717,9 @@ class IntruderBot(BaseBot):
         self.supply_plan_candidates = None
         self.supply_plan_cursor = 0
         self.deferred_supply_candidates = []
+        self.supply_seen_ores = set()
+        self.supply_replan_candidates = []
+        self.supply_plan_cost = None
 
     def search_for_titanium(self, controller: Controller) -> None:
         """Explore away from the enemy core until a cached titanium source becomes visible."""

@@ -2,7 +2,7 @@
 
 from collections import deque
 
-from cambc import Controller, Direction, EntityType, Environment, Position, Team
+from cambc import Controller, Direction, EntityType, Environment, GameError, Position, Team
 
 
 TileRecord = tuple[Environment, int | None, EntityType | None, Team | None]
@@ -119,6 +119,14 @@ class TileCache:
         self.visible_builder_ids: dict[Position, int] = {}
         self.marker_values: dict[int, int] = {}
         self.current_position: Position | None = None
+        # One dense vision can contain dozens of roads around a Core.  Keep a
+        # single entity-list snapshot and resume it across turns; restarting
+        # from the first ID after every seven-call budget would starve the
+        # role forever while the cache is required to be complete.
+        self._entity_scan_pending = False
+        self._entity_scan_visible_tiles: set[Position] = set()
+        self._entity_scan_queue: list[tuple[int, bool, bool]] = []
+        self._entity_scan_cursor = 0
 
     def scan_turn(
             self,
@@ -134,7 +142,7 @@ class TileCache:
         """
         self.symmetry_confirmed_this_turn = False
         self.scan_incomplete_this_turn = False
-        self.role_cache_ready_this_turn = False
+        self.role_cache_ready_this_turn = self.current_position is not None
         self.scan_api_calls_this_turn = 0
         if not self._take_scan_api_call():
             return
@@ -166,93 +174,198 @@ class TileCache:
                 return
             self._pending_terrain_tiles.discard(pos)
 
-        # Buildings and builders are dynamic.  Reset only visible, non-wall
-        # cells before repopulating them from two batched ID lists.  A known
-        # wall can never contain either, so it receives no further work.
-        for pos in visible_tiles:
-            env = self.environments.get(pos)
-            if env is None or env == Environment.WALL:
-                continue
-            self._set_building(pos, None, None, None)
+        if (
+            self._entity_scan_pending
+            and visible_tiles != self._entity_scan_visible_tiles
+        ):
+            self._clear_entity_scan_queue()
+        if self._entity_scan_pending:
+            if not self._refresh_entity_scan_queue(controller, own_id, visible_tiles):
+                self._finish_incomplete_scan()
+                return
+        if not self._entity_scan_pending:
+            if not self._start_entity_scan(controller, own_id, visible_tiles):
+                self._finish_incomplete_scan()
+                return
 
-        if not self._take_scan_api_call():
-            self._finish_incomplete_scan()
-            return
-        unit_ids = controller.get_nearby_units()
-        if not self._take_scan_api_call():
-            self._finish_incomplete_scan()
-            return
-        building_ids = controller.get_nearby_buildings()
-        self.visible_entity_ids = set()
-        self.visible_entity_order = []
-        self.visible_builder_ids = {}
-        self.marker_values = {}
-
-        # Cache our mutable position first.  In a crowded vision this keeps
-        # the bot's own start-of-turn coordinates available as soon as a scan
-        # can complete, instead of putting it behind unrelated buildings.
-        # The role needs its own position first.  Process Core/buildings next
-        # so a newly spawned Intruder can find its friendly Core even when a
-        # dense group of nearby builders prevents a complete entity scan.
-        own_unit_ids = [entity_id for entity_id in unit_ids if entity_id == own_id]
-        other_unit_ids = [entity_id for entity_id in unit_ids if entity_id != own_id]
-        for entity_id in own_unit_ids:
-            entity = self._entity_for_scan(controller, entity_id)
-            if entity is None:
+        while self._entity_scan_cursor < len(self._entity_scan_queue):
+            entity_id, is_building, is_own = self._entity_scan_queue[
+                self._entity_scan_cursor
+            ]
+            if not self._scan_queued_entity(
+                    controller,
+                    entity_id,
+                    is_building,
+                    is_own,
+            ):
                 self._finish_incomplete_scan()
                 return
-            pos, entity_type, team = entity
-            self._remember_visible_entity(entity_id)
-            self.current_position = pos
-            self.role_cache_ready_this_turn = True
-            self._direction_for_scan(controller, entity_id, entity_type)
-            if self.scan_incomplete_this_turn:
-                self._finish_incomplete_scan()
-                return
-            if entity_type == EntityType.BUILDER_BOT:
-                self.visible_builder_ids[pos] = entity_id
-
-        for entity_id in building_ids:
-            entity = self._entity_for_scan(controller, entity_id)
-            if entity is None:
-                self._finish_incomplete_scan()
-                return
-            pos, entity_type, team = entity
-            self._remember_visible_entity(entity_id)
-            if entity_type == EntityType.CORE:
-                self._remember_observed_core(pos, team)
-            direction = self._direction_for_scan(controller, entity_id, entity_type)
-            if self.scan_incomplete_this_turn:
-                self._finish_incomplete_scan()
-                return
-            for tile in self._building_tiles(pos, entity_type):
-                if tile not in visible_tiles or tile not in self.environments:
-                    continue
-                self._set_building(tile, entity_id, entity_type, team)
-                if direction is not None:
-                    self.conveyor_directions[tile] = direction
-
-        for entity_id in other_unit_ids:
-            entity = self._entity_for_scan(controller, entity_id)
-            if entity is None:
-                self._finish_incomplete_scan()
-                return
-            pos, entity_type, team = entity
-            self._remember_visible_entity(entity_id)
-            self._direction_for_scan(controller, entity_id, entity_type)
-            if self.scan_incomplete_this_turn:
-                self._finish_incomplete_scan()
-                return
-            if entity_type == EntityType.BUILDER_BOT:
-                self.visible_builder_ids[pos] = entity_id
+            self._entity_scan_cursor += 1
 
         own = self.entities.get(own_id)
         if own is None:
             self._finish_incomplete_scan()
             return
         self.current_position = own[0]
+        self.role_cache_ready_this_turn = True
+        self._clear_entity_scan_queue()
         self._update_symmetry()
         self._last_vision_set = visible_tiles
+
+    def _start_entity_scan(
+            self,
+            controller: Controller,
+            own_id: int,
+            visible_tiles: set[Position],
+    ) -> bool:
+        """Snapshot visible entity IDs and begin a resumable refresh job."""
+        # Buildings and builders are dynamic.  Clear only after terrain is
+        # complete, and repopulate from this one persisted ID snapshot.  No
+        # role may act until the queue below has finished.
+        for pos in visible_tiles:
+            env = self.environments.get(pos)
+            if env is None or env == Environment.WALL:
+                continue
+            self._set_building(pos, None, None, None)
+        if not self._take_scan_api_call():
+            return False
+        unit_ids = controller.get_nearby_units()
+        if not self._take_scan_api_call():
+            return False
+        building_ids = controller.get_nearby_buildings()
+
+        own_unit_ids = [entity_id for entity_id in unit_ids if entity_id == own_id]
+        other_unit_ids = [entity_id for entity_id in unit_ids if entity_id != own_id]
+        self.visible_entity_ids = set()
+        self.visible_entity_order = []
+        self.visible_builder_ids = {}
+        self.marker_values = {}
+        self._entity_scan_pending = True
+        self._entity_scan_visible_tiles = set(visible_tiles)
+        self._entity_scan_queue = [
+            *((entity_id, False, True) for entity_id in own_unit_ids),
+            *((entity_id, True, False) for entity_id in building_ids),
+            *((entity_id, False, False) for entity_id in other_unit_ids),
+        ]
+        self._entity_scan_cursor = 0
+        return True
+
+    def _refresh_entity_scan_queue(
+            self,
+            controller: Controller,
+            own_id: int,
+            visible_tiles: set[Position],
+    ) -> bool:
+        """Keep an unfinished scan valid as nearby entities appear or disappear."""
+        if not self._take_scan_api_call():
+            return False
+        unit_ids = controller.get_nearby_units()
+        if not self._take_scan_api_call():
+            return False
+        building_ids = controller.get_nearby_buildings()
+        unit_id_set = set(unit_ids)
+        building_id_set = set(building_ids)
+        current_entity_ids = unit_id_set | building_id_set
+
+        # A building can be destroyed while this multi-turn refresh is in
+        # progress.  Remove its old footprint before a role may see the
+        # completed cache.
+        for pos in visible_tiles:
+            building_id = self.building_id_at(pos)
+            if building_id is not None and building_id not in building_id_set:
+                self._set_building(pos, None, None, None)
+        self.visible_entity_ids.intersection_update(current_entity_ids)
+        self.visible_entity_order = [
+            entity_id
+            for entity_id in self.visible_entity_order
+            if entity_id in current_entity_ids
+        ]
+        self.visible_builder_ids = {
+            pos: entity_id
+            for pos, entity_id in self.visible_builder_ids.items()
+            if entity_id in unit_id_set
+        }
+
+        processed = self._entity_scan_queue[:self._entity_scan_cursor]
+        pending = [
+            item
+            for item in self._entity_scan_queue[self._entity_scan_cursor:]
+            if item[0] in (building_id_set if item[1] else unit_id_set)
+        ]
+        queued_ids = {entity_id for entity_id, _, _ in processed + pending}
+        additions = [
+            *((entity_id, False, True)
+              for entity_id in unit_ids
+              if entity_id == own_id and entity_id not in queued_ids),
+            *((entity_id, True, False)
+              for entity_id in building_ids
+              if entity_id not in queued_ids),
+            *((entity_id, False, False)
+              for entity_id in unit_ids
+              if entity_id != own_id and entity_id not in queued_ids),
+        ]
+        self._entity_scan_queue = processed + pending + additions
+        return True
+
+    def _scan_queued_entity(
+            self,
+            controller: Controller,
+            entity_id: int,
+            is_building: bool,
+            is_own: bool,
+    ) -> bool:
+        """Refresh one queued entity, stopping before an incomplete record."""
+        try:
+            entity = self._entity_for_scan(controller, entity_id)
+        except GameError:
+            # The batched list can become stale between turns.  The next
+            # refresh will omit this ID; dropping it now preserves scan
+            # progress without ever exposing a partial cache to the role.
+            self._forget_queued_entity(entity_id, is_building)
+            return True
+        if entity is None:
+            return False
+        pos, entity_type, team = entity
+        direction = self._direction_for_scan(controller, entity_id, entity_type)
+        if self.scan_incomplete_this_turn:
+            return False
+        self._remember_visible_entity(entity_id)
+        if is_own:
+            self.current_position = pos
+            self.role_cache_ready_this_turn = True
+        if entity_type == EntityType.BUILDER_BOT:
+            self.visible_builder_ids[pos] = entity_id
+        if not is_building:
+            return True
+        if entity_type == EntityType.CORE:
+            self._remember_observed_core(pos, team)
+        for tile in self._building_tiles(pos, entity_type):
+            if tile not in self._entity_scan_visible_tiles or tile not in self.environments:
+                continue
+            self._set_building(tile, entity_id, entity_type, team)
+            if direction is not None:
+                self.conveyor_directions[tile] = direction
+        return True
+
+    def _forget_queued_entity(self, entity_id: int, is_building: bool) -> None:
+        """Remove an entity that vanished after its previous visibility snapshot."""
+        entity = self.entities.pop(entity_id, None)
+        self.entity_directions.pop(entity_id, None)
+        self.marker_values.pop(entity_id, None)
+        self.visible_entity_ids.discard(entity_id)
+        if entity is None or not is_building:
+            return
+        pos, entity_type, _ = entity
+        for tile in self._building_tiles(pos, entity_type):
+            if self.building_id_at(tile) == entity_id:
+                self._set_building(tile, None, None, None)
+
+    def _clear_entity_scan_queue(self) -> None:
+        """Forget the current entity-refresh snapshot after completion or a view change."""
+        self._entity_scan_pending = False
+        self._entity_scan_visible_tiles = set()
+        self._entity_scan_queue = []
+        self._entity_scan_cursor = 0
 
     def cache_friendly_marker_values(self, controller: Controller, own_team: Team) -> bool:
         """Read each visible friendly marker once for consumers of the cache."""

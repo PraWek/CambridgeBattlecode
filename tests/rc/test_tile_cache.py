@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cambc import EntityType, Environment, Position, Team
+from cambc import Direction, EntityType, Environment, Position, Team
 
 
 RC_BOT_DIRECTORY = Path(__file__).resolve().parents[2] / "bots" / "rc"
@@ -175,8 +175,8 @@ class TileCacheSymmetryTests(unittest.TestCase):
             historical_index + 1,
         )
 
-    def test_entity_budget_keeps_terrain_and_own_position_usable(self) -> None:
-        """A crowded dynamic scan may defer entities without freezing the role."""
+    def test_entity_budget_keeps_terrain_and_own_position_cached(self) -> None:
+        """A crowded dynamic scan records the bot position before yielding."""
         cache = TileCache(5, 6)
         controller = _CrowdedEntityController({})
 
@@ -186,14 +186,35 @@ class TileCacheSymmetryTests(unittest.TestCase):
         self.assertTrue(cache.role_cache_ready_this_turn)
         self.assertEqual(cache.current_position, Position(1, 2))
 
-    def test_base_bot_continues_after_partial_entity_scan(self) -> None:
-        """The role runs once terrain and its own position are cached."""
+    def test_base_bot_yields_after_partial_entity_scan(self) -> None:
+        """No role action may use a partially rebuilt dynamic cache."""
         controller = _CrowdedEntityController({})
         controller.get_id = lambda: 1
         bot = BaseBot(5, 6)
 
-        self.assertFalse(bot._scan_turn(controller))
-        self.assertEqual(bot.get_cached_position(), Position(1, 2))
+        self.assertTrue(bot._scan_turn(controller))
+        self.assertIsNone(bot.current_position)
+        self.assertEqual(bot.tile_cache.current_position, Position(1, 2))
+
+    def test_entity_scan_resumes_its_existing_queue_on_the_next_turn(self) -> None:
+        """A crowded view eventually completes instead of restarting at its first ID."""
+        cache = TileCache(5, 6)
+        controller = _CrowdedEntityController({})
+
+        cache.scan_turn(controller, own_id=1)
+        self.assertTrue(cache.scan_incomplete_this_turn)
+        self.assertEqual(cache._entity_scan_cursor, 1)
+
+        cache.scan_turn(controller, own_id=1)
+
+        self.assertTrue(cache.scan_incomplete_this_turn)
+        self.assertEqual(cache._entity_scan_cursor, 2)
+
+        cache.scan_turn(controller, own_id=1)
+
+        self.assertFalse(cache.scan_incomplete_this_turn)
+        self.assertFalse(cache._entity_scan_pending)
+        self.assertEqual(cache.visible_entity_ids, {1, 2, 3})
 
 
 class TileCacheNavigationTests(unittest.TestCase):
@@ -233,25 +254,169 @@ class TileCacheNavigationTests(unittest.TestCase):
 
             search.assert_not_called()
 
-    def test_intruder_prepares_gunner_candidates_incrementally(self) -> None:
-        """Gunner-site enumeration must not become one repeatable TLE turn."""
-        bot = IntruderBot(10, 10)
-        bot.destination = bot.tile_cache.position_at(5, 5)
+    def test_intruder_selects_nearest_core_edge_and_direct_firing_ray(self) -> None:
+        """The first valid shot is checked beside the Intruder, not globally ranked."""
+        bot = IntruderBot(20, 20)
+        bot.destination = bot.tile_cache.position_at(10, 16)
         bot.destination_is_confirmed_core = True
+        current = bot.tile_cache.position_at(13, 14)
+        assert current is not None
+        bot.known_env.update({
+            pos: Environment.EMPTY
+            for column in bot.tile_cache._positions
+            for pos in column
+        })
 
-        bot.choose_gunner_site(None)
+        calls: list[tuple[Position, Direction, EntityType, Position]] = []
 
-        self.assertIsNone(bot.gunner_site_candidates)
-        self.assertIsNotNone(bot.gunner_candidate_targets)
+        class _GunnerController:
+            @staticmethod
+            def can_fire_from(
+                    site: Position,
+                    facing: Direction,
+                    entity_type: EntityType,
+                    target: Position,
+            ) -> bool:
+                calls.append((site, facing, entity_type, target))
+                return True
 
-        # Eight Core-edge tiles have twenty position/facing/distance probes
-        # each.  The bounded preparer consumes 48 per call, then retains the
-        # completed (possibly empty) ranking for validation next turn.
-        for _ in range(3):
-            bot.choose_gunner_site(None)
+        site_data = bot.choose_gunner_site(_GunnerController(), current)
 
-        self.assertEqual(bot.gunner_site_candidates, [])
-        self.assertIsNone(bot.gunner_candidate_targets)
+        expected_site = bot.tile_cache.position_at(13, 13)
+        expected_target = bot.tile_cache.position_at(11, 15)
+        self.assertEqual(site_data, (expected_site, Direction.SOUTHWEST))
+        self.assertEqual(
+            calls,
+            [(expected_site, Direction.SOUTHWEST, EntityType.GUNNER, expected_target)],
+        )
+
+    def test_intruder_checks_next_near_core_edge_when_first_target_fails(self) -> None:
+        """A failed target resumes through its rays before the next nearby edge."""
+        bot = IntruderBot(20, 20)
+        bot.destination = bot.tile_cache.position_at(10, 16)
+        bot.destination_is_confirmed_core = True
+        current = bot.tile_cache.position_at(13, 14)
+        assert current is not None
+        bot.known_env.update({
+            pos: Environment.EMPTY
+            for column in bot.tile_cache._positions
+            for pos in column
+        })
+
+        first_target = bot.tile_cache.position_at(11, 15)
+        second_target = bot.tile_cache.position_at(11, 16)
+        assert first_target is not None
+        assert second_target is not None
+        checked_targets: list[Position] = []
+
+        class _GunnerController:
+            @staticmethod
+            def can_fire_from(
+                    _site: Position,
+                    _facing: Direction,
+                    _entity_type: EntityType,
+                    target: Position,
+            ) -> bool:
+                checked_targets.append(target)
+                return target == second_target
+
+        controller = _GunnerController()
+        self.assertIsNone(bot.choose_gunner_site(controller, current))
+        self.assertTrue(bot.gunner_site_search_pending())
+        self.assertIsNone(bot.choose_gunner_site(controller, current))
+        self.assertTrue(bot.gunner_site_search_pending())
+        self.assertIsNotNone(bot.choose_gunner_site(controller, current))
+        self.assertEqual(set(checked_targets[:-1]), {first_target})
+        self.assertEqual(checked_targets[-1], second_target)
+
+    def test_intruder_keeps_untried_gunner_candidates_after_seven_engine_checks(self) -> None:
+        """A seven-call Gunner probe budget yields without abandoning the search."""
+        bot = IntruderBot(20, 20)
+        bot.destination = bot.tile_cache.position_at(10, 16)
+        bot.destination_is_confirmed_core = True
+        current = bot.tile_cache.position_at(13, 14)
+        assert current is not None
+        bot.known_env.update({
+            pos: Environment.EMPTY
+            for column in bot.tile_cache._positions
+            for pos in column
+        })
+
+        calls: list[tuple[Position, Direction, EntityType, Position]] = []
+
+        class _GunnerController:
+            @staticmethod
+            def can_fire_from(
+                    site: Position,
+                    facing: Direction,
+                    entity_type: EntityType,
+                    target: Position,
+            ) -> bool:
+                calls.append((site, facing, entity_type, target))
+                return False
+
+        controller = _GunnerController()
+        self.assertIsNone(bot.choose_gunner_site(controller, current))
+        self.assertEqual(len(calls), 7)
+        first_cursor = bot.gunner_site_candidate_cursor
+        self.assertTrue(bot.gunner_site_search_pending())
+
+        self.assertIsNone(bot.choose_gunner_site(controller, current))
+        self.assertEqual(len(calls), 14)
+        self.assertGreater(bot.gunner_site_candidate_cursor, first_cursor)
+        self.assertTrue(bot.gunner_site_search_pending())
+
+    def test_intruder_fans_out_after_the_three_nearest_core_edges(self) -> None:
+        """Fallback targets are ordered by their distance from the direct approach."""
+        bot = IntruderBot(20, 20)
+        bot.destination = bot.tile_cache.position_at(10, 16)
+        bot.destination_is_confirmed_core = True
+        current = bot.tile_cache.position_at(13, 14)
+        assert current is not None
+
+        self.assertEqual(
+            bot.ordered_gunner_targets(current),
+            tuple(
+                bot.tile_cache.position_at(x, y)
+                for x, y in (
+                    (11, 15),
+                    (11, 16),
+                    (10, 15),
+                    (9, 17),
+                    (9, 15),
+                    (11, 17),
+                    (9, 16),
+                    (10, 17),
+                )
+            ),
+        )
+
+    def test_intruder_replans_supply_for_a_new_cheaper_titanium_deposit(self) -> None:
+        """A later, nearer deposit replaces the provisional supply endpoint."""
+        bot = IntruderBot(30, 30)
+        gunner = bot.tile_cache.position_at(12, 12)
+        old_ore = bot.tile_cache.position_at(22, 17)
+        new_ore = bot.tile_cache.position_at(16, 17)
+        old_tile = bot.tile_cache.position_at(21, 17)
+        new_tile = bot.tile_cache.position_at(15, 17)
+        assert all((gunner, old_ore, new_ore, old_tile, new_tile))
+        bot.gunner_site = gunner
+        bot.gunner_direction = Direction.EAST
+        bot.known_env[old_ore] = Environment.ORE_TITANIUM
+        old_plan = ([old_tile], {old_tile: Direction.WEST}, {}, 30)
+        new_plan = ([new_tile], {new_tile: Direction.WEST}, {}, 12)
+        bot.store_supply_plan(old_ore, old_plan)
+
+        # This is the state immediately after the turn-137 scan: the route
+        # to (22, 17) already exists and the nearer (16, 17) has just entered
+        # the cache.
+        bot.known_env[new_ore] = Environment.ORE_TITANIUM
+        bot.plan_supply_route = lambda ore: new_plan if ore is new_ore else None
+
+        self.assertTrue(bot.reconsider_supply_plan())
+        self.assertIs(bot.supply_ore, new_ore)
+        self.assertEqual(bot.supply_path, [new_tile])
+        self.assertEqual(bot.supply_plan_cost, 12)
 
 
 class CoreBootstrapTests(unittest.TestCase):
