@@ -12,7 +12,8 @@ class LauncherBot(BaseBot):
 
     def run(self, controller: Controller) -> None:
         """Read one launch order, throw its adjacent friendly builder, then clear it."""
-        self._scan_turn(controller, read_markers=True)
+        if self._scan_turn(controller, read_markers=True):
+            return
         landing, marker_pos = self.read_launch_order()
         if landing is None or marker_pos is None:
             return
@@ -35,7 +36,10 @@ class LauncherBot(BaseBot):
             if value is None or marker_pos is None:
                 continue
             try:
-                kind, landing, _ = decode_marker(value)
+                kind, landing, _ = decode_marker(
+                    value,
+                    self.tile_cache.position_at,
+                )
             except Exception:
                 continue
             if kind == MARKER_KIND_INTRUDER_LAUNCH:

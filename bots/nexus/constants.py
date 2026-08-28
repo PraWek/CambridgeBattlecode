@@ -41,7 +41,13 @@ PHASE_STABILIZE = 4
 TITANIUM_LINE_READY_HARVESTERS = 2
 TITANIUM_LINE_READY_SCALE = 118.0
 MAX_BUILDERS_PHASE_ONE = 4
-MAX_REPLACEMENT_BUILDERS = 4
+MAX_ECONOMY_BUILDERS = 8
+ECONOMY_EXPANSION_START_ROUND = 100
+ECONOMY_EXPANSION_INTERVAL_ROUNDS = 100
+# Includes expansion builders and replacements after the initial four.  The
+# separate cap prevents a fully explored map from entering an endless
+# self-destruct/spawn loop.
+MAX_ADDITIONAL_BUILDER_SPAWNS = 12
 AXIONITE_TITANIUM_THRESHOLD = 1_000
 
 BUILDER_DIRECTION_CODES = {
@@ -70,9 +76,16 @@ SCOUT_LATERAL_DEVIATION_WEIGHT = 2
 SCOUT_ORE_HINT_PROGRESS_WEIGHT = 4
 SCOUT_FRONTIER_CANDIDATE_LIMIT = 12
 SCOUT_PATH_GOAL_LIMIT = 12
-SCOUT_PATH_MAX_EXPANSIONS = 96
+SCOUT_PATH_MAX_EXPANSIONS = 32
+NETWORK_PATROL_GOAL_LIMIT = 8
+NETWORK_PATROL_MAX_EXPANSIONS = 64
 SCOUT_SECTOR_BONUS = 24
 SCOUT_REPLAN_STUCK_ROUNDS = 3
+SCOUT_ESCAPE_FAILURE_KILL_ROUNDS = 64
+# This is based on confirmed end-of-turn positions, not accepted move
+# commands.  It catches permanent builder collisions even when they still
+# hold a mining or exploration target.
+SCOUT_CONFIRMED_STALL_KILL_ROUNDS = 96
 SCOUT_PERSISTENT_REVISIT_PENALTY = 4
 SCOUT_DEAD_END_PENALTY = 48
 SCOUT_DEAD_END_AVOID_ROUNDS = 40
@@ -80,10 +93,6 @@ SCOUT_DEAD_END_AVOID_ROUNDS = 40
 # builder alive long enough to backtrack across the largest map, but recycle
 # it once it has failed to reveal a single new tile for a sustained period.
 SCOUT_NO_DISCOVERY_KILL_ROUNDS = 240
-# A builder that cannot retain even a one-step goal is not backtracking: it is
-# repeatedly selecting an immediately invalid route on the same tile.  Recycle
-# this state much sooner than a mobile explorer crossing an already known map.
-SCOUT_NO_GOAL_KILL_ROUNDS = 32
 SCOUT_KILL_STUCK_ROUNDS = 12
 SCOUT_KILL_ROUTE_FAILURES = 24
 SCOUT_KILL_CYCLES = 12
@@ -100,17 +109,20 @@ IDLE_TARGET_RETRY_ROUNDS = 4
 # known instead of consuming the whole turn.
 ORE_PATH_A_STAR_MAX_EXPANSIONS = 32
 CONNECTION_A_STAR_MAX_EXPANSIONS = 32
-CONNECTION_ROUTE_ATTEMPTS = 3
 
 # One transport tile forwards one stack per round while a harvester produces
 # one stack every four rounds.  A fifth source on the same downstream lane
 # therefore adds queues but no throughput.
 MAX_HARVESTERS_PER_LINE = 4
-# Until a builder knows about this many already connected harvesters, route a
-# new mine directly to the core instead of merging.  This creates several
-# independent trunks even when every ore lies near the first cheap branch.
-MIN_DEDICATED_HARVESTER_LINES = 4
+# Four harvesters produce exactly one stack per round, matching one conveyor's
+# forwarding rate.  A new line excludes all existing transport tiles from its
+# direct route, so it cannot silently merge a fifth source into an old trunk.
+PLANNED_HARVESTERS_PER_LINE = 4
 TRANSPORT_BUSY_OBSERVATION_TURNS = 4
+# Resource-state controller calls are relatively expensive.  Structural load
+# is authoritative for ordinary lanes; sample only one nearby transport per
+# turn to detect a genuinely full merge without recreating the TLE cascade.
+TRANSPORT_BUSY_SAMPLE_LIMIT = 1
 STEINER_MAX_EXPANSIONS = 160
 
 # A bridge is a costly fallback for a wall, hostile building, or saturated

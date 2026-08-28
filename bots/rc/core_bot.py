@@ -42,19 +42,28 @@ class CoreBot(BaseBot):
         self.spawn_order_target: Position | None = None
         self.intruder_spawned = False
         self.intruder_spawn_round: int | None = None
+        self.first_turn_intruder_spawn_pending = True
         self.marker_sync_cursor = 0
 
     def run(self, controller: Controller) -> None:
         """Spawn the infiltrator first, then maintain four directional builders."""
-        self._scan_turn(controller)
+        if self.try_first_turn_intruder_spawn(controller):
+            return
+        if self._scan_turn(controller):
+            return
         self.observe_tiles()
         self.core_pos = self.get_cached_position()
         if not self.sector_marker_pads:
             (
                 self.sector_marker_pads,
                 self.spawn_order_pad,
-                self.intruder_order_pad,
+                discovered_intruder_order_pad,
             ) = self.find_sector_marker_pads(controller)
+            # The first-turn marker can be on a different valid pad from the
+            # normal sector board.  Retain it until its newborn has consumed
+            # the order and the Core can safely remove it.
+            if self.intruder_order_pad is None:
+                self.intruder_order_pad = discovered_intruder_order_pad
             self.sector_marker_values = {
                 direction: None for direction in self.sector_marker_pads
             }
@@ -76,6 +85,38 @@ class CoreBot(BaseBot):
             # Orders can change after a nearby harvester is built.  One marker
             # write per round is a game rule, so update the board round-robin.
             self.sync_one_changed_sector_marker(controller)
+
+    def try_first_turn_intruder_spawn(self, controller: Controller) -> bool:
+        """Spawn and mark the Intruder before the initial terrain scan.
+
+        The normal role loop waits until terrain and the Core's own cached
+        position are ready.  The initial Intruder is intentionally exempt: it
+        has no terrain-dependent decision to make, and its marker payload can
+        be produced from the Core's canonical position alone.
+        """
+        if not self.first_turn_intruder_spawn_pending:
+            return False
+        self.first_turn_intruder_spawn_pending = False
+        self.entity_id = controller.get_id()
+        self.team = controller.get_team()
+        self.core_pos = self.tile_cache.canonicalize(controller.get_position())
+        self.intruder_order_pad = self.find_first_intruder_order_pad(controller)
+        if self.intruder_order_pad is None:
+            return False
+        return self.try_spawn_intruder(controller)
+
+    def find_first_intruder_order_pad(self, controller: Controller) -> Position | None:
+        """Pick one usable marker pad without scanning terrain or entities."""
+        if self.core_pos is None:
+            return None
+        for dx, dy in (
+            (-2, -2), (2, -2), (2, 2), (-2, 2),
+            (-2, 0), (0, -2), (2, 0), (0, 2),
+        ):
+            pad = self.tile_cache.offset(self.core_pos, dx, dy)
+            if pad is not None and controller.can_place_marker(pad):
+                return pad
+        return None
 
     def observe_tiles(self) -> None:
         """Refresh the core's local terrain and building observations."""
@@ -110,8 +151,8 @@ class CoreBot(BaseBot):
                     offsets.append((dx, dy))
         pads: list[Position] = []
         for dx, dy in offsets:
-            pos = Position(self.core_pos.x + dx, self.core_pos.y + dy)
-            if not self.in_bounds(pos) or not controller.can_place_marker(pos):
+            pos = self.tile_cache.offset(self.core_pos, dx, dy)
+            if pos is None or not controller.can_place_marker(pos):
                 continue
             pads.append(pos)
             if len(pads) == len(BUILDER_WORK_DIRECTIONS) + 2:
@@ -168,7 +209,7 @@ class CoreBot(BaseBot):
                 ),
             )
             self.sector_targets[direction] = target
-            used_targets.add(target[0])
+            used_targets.update((target[0],))
 
     def sector_for(self, pos: Position) -> Direction:
         """Return the cardinal sector containing ``pos`` relative to the core."""
@@ -216,15 +257,16 @@ class CoreBot(BaseBot):
             directions = [direction]
 
         fallback_positions = [
-            Position(self.core_pos.x + dx, self.core_pos.y + dy)
+            pos
             for dx, dy in (
                 (0, 0), (1, -1), (1, 1), (-1, 1), (-1, -1),
                 (0, -1), (1, 0), (0, 1), (-1, 0),
             )
+            if (pos := self.tile_cache.offset(self.core_pos, dx, dy)) is not None
         ]
         for direction in directions:
-            preferred = self.core_pos.add(direction)
-            positions = [preferred]
+            preferred = self.tile_cache.neighbor(self.core_pos, direction)
+            positions = [] if preferred is None else [preferred]
             if self.spawn_order_pad is not None:
                 positions.extend(pos for pos in fallback_positions if pos != preferred)
             for spawn_pos in positions:
@@ -243,7 +285,7 @@ class CoreBot(BaseBot):
                     self.sync_sector_marker(controller, direction)
                 controller.spawn_builder(spawn_pos)
                 if len(self.initial_spawned_directions) < len(BUILDER_WORK_DIRECTIONS):
-                    self.initial_spawned_directions.add(direction)
+                    self.initial_spawned_directions.update((direction,))
                 else:
                     self.replacement_direction_index = (
                         self.replacement_direction_index + 1
@@ -260,20 +302,25 @@ class CoreBot(BaseBot):
         ):
             return False
 
-        target = Position(
+        target = self.tile_cache.position_at(
             self.map_width - 1 - self.core_pos.x,
             self.map_height - 1 - self.core_pos.y,
         )
+        if target is None:
+            return False
         preferred_direction = self.core_pos.direction_to(target)
         fallback_positions = [
-            Position(self.core_pos.x + dx, self.core_pos.y + dy)
+            pos
             for dx, dy in (
                 (0, 0), (1, -1), (1, 1), (-1, 1), (-1, -1),
                 (0, -1), (1, 0), (0, 1), (-1, 0),
             )
+            if (pos := self.tile_cache.offset(self.core_pos, dx, dy)) is not None
         ]
-        preferred = self.core_pos.add(preferred_direction)
-        positions = [preferred] + [pos for pos in fallback_positions if pos != preferred]
+        preferred = self.tile_cache.neighbor(self.core_pos, preferred_direction)
+        positions = (
+            [] if preferred is None else [preferred]
+        ) + [pos for pos in fallback_positions if pos != preferred]
         for spawn_pos in positions:
             if not controller.can_spawn(spawn_pos):
                 continue
@@ -291,13 +338,17 @@ class CoreBot(BaseBot):
             return False
         value = encode_marker(MARKER_KIND_SPAWN_INTRUDER, spawn_pos)
         marker_id = controller.place_marker(self.intruder_order_pad, value)
-        self.tile_cache.remember_building(
-            self.intruder_order_pad,
-            marker_id,
-            EntityType.MARKER,
-            self.team,
-            marker_value=value,
-        )
+        # The forced first-turn spawn deliberately happens before terrain has
+        # entered the cache.  The marker will be indexed by the later normal
+        # scan; do not fabricate an environment just to cache it now.
+        if self.tile_cache.environment_at(self.intruder_order_pad) is not None:
+            self.tile_cache.remember_building(
+                self.intruder_order_pad,
+                marker_id,
+                EntityType.MARKER,
+                self.team,
+                marker_value=value,
+            )
         return True
 
     def clear_intruder_spawn_order(self, controller: Controller) -> None:

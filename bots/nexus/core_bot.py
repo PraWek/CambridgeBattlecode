@@ -5,14 +5,18 @@ from constants import (
     AXIONITE_TITANIUM_THRESHOLD,
     BUILDER_DIRECTION_CODES,
     BUILDER_WORK_DIRECTIONS,
+    ECONOMY_EXPANSION_INTERVAL_ROUNDS,
+    ECONOMY_EXPANSION_START_ROUND,
     MARKER_KIND_SECTOR_ORE_AX,
     MARKER_KIND_SECTOR_ORE_TI,
     MARKER_KIND_SPAWN_DIRECTION,
     MARKER_KIND_SPAWN_ORE_AX,
     MARKER_KIND_SPAWN_ORE_TI,
-    MAX_REPLACEMENT_BUILDERS,
+    MAX_ADDITIONAL_BUILDER_SPAWNS,
+    MAX_ECONOMY_BUILDERS,
     ORE_TYPES,
 )
+from economy import desired_builder_count
 from geometry import encode_marker
 
 
@@ -43,8 +47,9 @@ class CoreBot(BaseBot):
         self.marker_sync_cursor = 0
 
     def run(self, controller: Controller) -> None:
-        """Observe the map, update sector orders, and keep four builders alive."""
-        self._scan_turn(controller)
+        """Observe the map, update sector orders, and maintain the economy fleet."""
+        if self._scan_turn(controller):
+            return
         self.observe_tiles()
         self.core_pos = self.get_cached_position()
         if not self.sector_marker_pads:
@@ -94,8 +99,8 @@ class CoreBot(BaseBot):
                     offsets.append((dx, dy))
         pads: list[Position] = []
         for dx, dy in offsets:
-            pos = Position(self.core_pos.x + dx, self.core_pos.y + dy)
-            if not self.in_bounds(pos) or not controller.can_place_marker(pos):
+            pos = self.tile_cache.offset(self.core_pos, dx, dy)
+            if pos is None or not controller.can_place_marker(pos):
                 continue
             pads.append(pos)
             if len(pads) == len(BUILDER_WORK_DIRECTIONS) + 1:
@@ -176,7 +181,14 @@ class CoreBot(BaseBot):
         # core's vision cannot be queried reliably, while get_unit_count() is
         # global, so subtracting the core gives the authoritative live fleet.
         living_builders = max(0, controller.get_unit_count() - 1)
-        if living_builders >= len(BUILDER_WORK_DIRECTIONS):
+        desired_builders = desired_builder_count(
+            controller.get_current_round(),
+            len(BUILDER_WORK_DIRECTIONS),
+            MAX_ECONOMY_BUILDERS,
+            ECONOMY_EXPANSION_START_ROUND,
+            ECONOMY_EXPANSION_INTERVAL_ROUNDS,
+        )
+        if living_builders >= desired_builders:
             return False
 
         if len(self.initial_spawned_directions) < len(BUILDER_WORK_DIRECTIONS):
@@ -186,7 +198,7 @@ class CoreBot(BaseBot):
                 if direction not in self.initial_spawned_directions
             ]
         else:
-            if self.replacement_builders_spawned >= MAX_REPLACEMENT_BUILDERS:
+            if self.replacement_builders_spawned >= MAX_ADDITIONAL_BUILDER_SPAWNS:
                 return False
             direction = BUILDER_WORK_DIRECTIONS[
                 self.replacement_direction_index % len(BUILDER_WORK_DIRECTIONS)
@@ -194,14 +206,17 @@ class CoreBot(BaseBot):
             directions = [direction]
 
         fallback_positions = [
-            Position(self.core_pos.x + dx, self.core_pos.y + dy)
+            pos
             for dx, dy in (
                 (0, 0), (1, -1), (1, 1), (-1, 1), (-1, -1),
                 (0, -1), (1, 0), (0, 1), (-1, 0),
             )
+            if (pos := self.tile_cache.offset(self.core_pos, dx, dy)) is not None
         ]
         for direction in directions:
-            preferred = self.core_pos.add(direction)
+            preferred = self.tile_cache.neighbor(self.core_pos, direction)
+            if preferred is None:
+                continue
             positions = [preferred]
             if self.spawn_order_pad is not None:
                 positions.extend(pos for pos in fallback_positions if pos != preferred)

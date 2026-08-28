@@ -10,7 +10,6 @@ from constants import (
     CONNECTION_A_STAR_MAX_EXPANSIONS,
     CONNECTION_DEFER_NEW_TILES,
     CONNECTION_DEFER_MAX_ROUNDS,
-    CONNECTION_ROUTE_ATTEMPTS,
     CONNECTION_STALL_ROUNDS,
     BRIDGE_MAX_JUMP_DISTANCE,
     BRIDGE_ROUTE_MAX_EXPANSIONS,
@@ -23,17 +22,21 @@ from constants import (
     MARKER_KIND_SPAWN_ORE_AX,
     MARKER_KIND_SPAWN_ORE_TI,
     MAX_HARVESTERS_PER_LINE,
-    MIN_DEDICATED_HARVESTER_LINES,
+    NETWORK_PATROL_GOAL_LIMIT,
+    NETWORK_PATROL_MAX_EXPANSIONS,
     ORE_SURVEY_NEW_TILES_REQUIRED,
     ORE_PATH_A_STAR_MAX_EXPANSIONS,
     ORE_TARGET_STALL_ROUNDS,
     ORE_TYPES,
     ORTHOGONAL_DIRECTIONS,
     PASSABLE_BUILDINGS,
+    PLANNED_HARVESTERS_PER_LINE,
     RESOURCE_AXIONITE,
     RESOURCE_TITANIUM,
     HARVESTER_GUARD_LATEST_ROUND,
     SCOUT_DISTANCE_WEIGHT,
+    SCOUT_CONFIRMED_STALL_KILL_ROUNDS,
+    SCOUT_ESCAPE_FAILURE_KILL_ROUNDS,
     SCOUT_DEAD_END_AVOID_ROUNDS,
     SCOUT_DEAD_END_PENALTY,
     SCOUT_FORWARD_PROGRESS_WEIGHT,
@@ -46,7 +49,6 @@ from constants import (
     SCOUT_LATERAL_DEVIATION_WEIGHT,
     SCOUT_NEW_VISION_WEIGHT,
     SCOUT_NO_DISCOVERY_KILL_ROUNDS,
-    SCOUT_NO_GOAL_KILL_ROUNDS,
     SCOUT_ORE_HINT_PROGRESS_WEIGHT,
     SCOUT_PATH_GOAL_LIMIT,
     SCOUT_PATH_MAX_EXPANSIONS,
@@ -58,10 +60,24 @@ from constants import (
     SCOUT_SECTOR_BONUS,
     STEINER_MAX_EXPANSIONS,
     TRANSPORT_BUSY_OBSERVATION_TURNS,
+    TRANSPORT_BUSY_SAMPLE_LIMIT,
     YIELD_ROUTE_AVOID_ROUNDS,
 )
 from geometry import decode_marker
+from exploration import (
+    choose_information_gain_step,
+    is_static_step_obstacle,
+    should_recycle_stalled_builder,
+)
 from navigation import a_star_to_any
+from network_memory import NetworkMemory
+from network_planner import (
+    dedicated_route_tree,
+    sector_entry_offsets,
+    sector_receiver_offsets,
+    starts_new_line,
+)
+from orders import spawn_order_for
 from steiner import incremental_steiner_branch
 
 
@@ -92,14 +108,24 @@ class BuilderBot(BaseBot):
         self.known_bridge_targets: dict[Position, Position] = {}
         self.known_bridge_ids: dict[Position, int] = {}
         self.connected_network_cache: set[Position] | None = None
-        self.transport_busy_history: dict[Position, deque[bool]] = {}
-        # A durable local blueprint lets the builder notice and immediately
-        # restore transport tiles it has built or audited before.
-        self.network_blueprint: dict[
+        self.observed_network_state: dict[
             Position,
-            tuple[EntityType, Direction | None, Position | None],
+            tuple[EntityType, Direction | None, Position | None] | None,
         ] = {}
-        self.damaged_network_tiles: set[Position] = set()
+        self.network_memory = NetworkMemory(TRANSPORT_BUSY_OBSERVATION_TURNS)
+        # Compatibility aliases keep the routing code terse while the memory,
+        # damage detection, and saturation history live in their own module.
+        self.transport_busy_history = self.network_memory.busy_history
+        self.network_blueprint = self.network_memory.blueprint
+        self.damaged_network_tiles = self.network_memory.damaged_tiles
+        # Ownership is the distributed capacity contract.  Bots cannot share
+        # Python counters, so a builder may merge only into transport it laid
+        # itself; other allied lanes are crossed, never silently overloaded.
+        self.owned_network_tiles: set[Position] = set()
+        self.active_line_tiles: set[Position] = set()
+        self.harvesters_built_count = 0
+        self.connection_starts_new_line = False
+        self.last_plan_starts_new_line = False
         self.observed_tiles = self.tile_cache.observed_tiles
         self.inferred_ores: dict[Position, Environment] = {}
         self.reported_ores: dict[Position, Environment] = {}
@@ -123,6 +149,7 @@ class BuilderBot(BaseBot):
         self.conveyor_directions: dict[Position, Direction] = {}
         self.bridge_targets: dict[Position, Position] = {}
         self.connection_anchor: Position | None = None
+        self.dedicated_line_committed = False
         # Tiles laid by this builder for its current, not-yet-connected mine.
         # They may be safely reused after a newly discovered obstacle forces a
         # replan; conveyors made by any other builder remain immutable.
@@ -155,17 +182,28 @@ class BuilderBot(BaseBot):
         self.scout_cycle_count = 0
         self.scout_route_failures = 0
         self.scout_rounds_without_discovery = 0
+        self.idle_escape_failures = 0
 
     def run(self, controller: Controller) -> None:
         """Execute one turn of scouting, mining, or conveyor construction."""
-        self._scan_turn(controller, read_markers=True, split_initial_scan=True)
+        if self._scan_turn(controller, read_markers=True):
+            return
         self.rounds_alive += 1
         self.current_round = controller.get_current_round()
         current = self.get_cached_position()
         if self.last_pos is not None and current == self.last_pos:
             self.stuck_rounds += 1
+            if self.target_ore is None and self.scout_target is None:
+                # Controller.can_move() can accept a command which loses a
+                # simultaneous collision.  Count confirmed positions on the
+                # following turn instead of treating the issued command as
+                # progress.
+                self.idle_escape_failures += 1
+            else:
+                self.idle_escape_failures = 0
         else:
             self.stuck_rounds = 0
+            self.idle_escape_failures = 0
             self.last_progress_round = self.rounds_alive
             self.remember_route_position(current)
         self.last_pos = current
@@ -177,6 +215,18 @@ class BuilderBot(BaseBot):
         else:
             self.scout_rounds_without_discovery += 1
 
+        # ``can_move`` describes whether a command may be submitted, not
+        # whether it survives simultaneous movement resolution.  Use the
+        # position observed on the following turn, together with the last
+        # successful build/repair/attack, to recycle a genuinely wedged bot.
+        if should_recycle_stalled_builder(
+            self.stuck_rounds,
+            self.rounds_alive - self.last_progress_round,
+            SCOUT_CONFIRMED_STALL_KILL_ROUNDS,
+        ):
+            controller.self_destruct()
+            return
+
         # A temporary collision or a newly revealed wall should trigger a
         # cheap replan, not kill a useful builder.  Cyclic movement is detected
         # separately because it resets the ordinary "same position" counter.
@@ -187,20 +237,13 @@ class BuilderBot(BaseBot):
         ):
             self.cancel_scout_route()
 
-        # Self-destruction is now a last resort for a genuinely exhausted
-        # explorer.  Movement alone is not progress, but a long, non-repeating
-        # backtrack remains useful; require either immobility or repeated visits
-        # in addition to a long period without discovering a new tile.
+        # Never recycle a builder merely because it failed to retain a target.
+        # A TLE also looks like inactivity, and the old 32-round rule therefore
+        # created an endless spawn/TLE/self-destruct loop on game 4's map.
+        # Genuine exhaustion still has the much longer guarded condition below.
         if (
             self.target_ore is None
-            and self.scout_target is None
-            and self.stuck_rounds >= SCOUT_NO_GOAL_KILL_ROUNDS
-            and self.scout_rounds_without_discovery >= SCOUT_NO_GOAL_KILL_ROUNDS
-        ):
-            controller.self_destruct()
-            return
-        if (
-            self.target_ore is None
+            and not self.owned_network_tiles
             and self.scout_rounds_without_discovery >= SCOUT_NO_DISCOVERY_KILL_ROUNDS
             and (
                 self.stuck_rounds >= SCOUT_KILL_STUCK_ROUNDS
@@ -217,7 +260,7 @@ class BuilderBot(BaseBot):
         if self.core_pos is None:
             return
         if self.enemy_estimate is None:
-            self.enemy_estimate = Position(
+            self.enemy_estimate = self.tile_cache.position_at(
                 self.map_width - 1 - self.core_pos.x,
                 self.map_height - 1 - self.core_pos.y,
             )
@@ -233,6 +276,8 @@ class BuilderBot(BaseBot):
             self.scout_sweep_direction = self.work_direction.rotate_right().rotate_right()
 
         self.titanium_unlocked = controller.get_global_resources()[0] > AXIONITE_TITANIUM_THRESHOLD
+        if self.try_repair_nearby_network(controller, current):
+            return
         if (
             self.target_is_connection
             and self.target_ore is not None
@@ -260,6 +305,15 @@ class BuilderBot(BaseBot):
         else:
             self.maybe_select_new_target(controller)
         if self.target_ore is None and self.scout_target is None:
+            emergency_step = self.choose_right_hand_scout_step(current)
+            if emergency_step is not None:
+                self.try_move_scout_step(
+                    controller,
+                    current,
+                    current.direction_to(emergency_step),
+                )
+            if self.idle_escape_failures >= SCOUT_ESCAPE_FAILURE_KILL_ROUNDS:
+                controller.self_destruct()
             return
 
         if (
@@ -321,9 +375,9 @@ class BuilderBot(BaseBot):
 
     def observe_tiles(self, controller: Controller) -> None:
         """Refresh known terrain, buildings, conveyor directions, and scout frontier."""
-        # Buildings can change on every turn, so any previous transport graph
-        # snapshot is no longer authoritative.
-        self.connected_network_cache = None
+        network_changed = False
+        busy_candidates: list[tuple[int, Position, int]] = []
+        current = self.get_cached_position()
         for pos in self.tile_cache.visible_tiles:
             self.inferred_ores.pop(pos, None)
             self.reported_ores.pop(pos, None)
@@ -337,26 +391,35 @@ class BuilderBot(BaseBot):
                 self.known_bridge_targets.pop(pos, None)
                 self.known_bridge_ids.pop(pos, None)
 
-            expected = self.network_blueprint.get(pos)
-            if expected is not None:
-                expected_type, expected_direction, expected_target = expected
-                matches = (
-                    building is not None
-                    and building[1] == self.team
-                    and building[0] == expected_type
-                    and (
-                        expected_type != EntityType.CONVEYOR
-                        or self.known_conveyor_directions.get(pos) == expected_direction
-                    )
-                    and (
-                        expected_type != EntityType.BRIDGE
-                        or self.known_bridge_targets.get(pos) == expected_target
-                    )
+            transport_state = None
+            if (
+                building is not None
+                and building[1] == self.team
+                and building[0] in {
+                    EntityType.CONVEYOR,
+                    EntityType.ARMOURED_CONVEYOR,
+                    EntityType.BRIDGE,
+                }
+            ):
+                transport_state = (
+                    building[0],
+                    self.known_conveyor_directions.get(pos),
+                    self.known_bridge_targets.get(pos),
                 )
-                if matches:
-                    self.damaged_network_tiles.discard(pos)
-                else:
-                    self.damaged_network_tiles.add(pos)
+            previous_state = self.observed_network_state.get(pos)
+            if previous_state != transport_state and (
+                previous_state is not None or transport_state is not None
+            ):
+                network_changed = True
+            self.observed_network_state[pos] = transport_state
+
+            self.network_memory.audit(
+                pos,
+                None if building is None else building[0],
+                building is not None and building[1] == self.team,
+                self.known_conveyor_directions.get(pos),
+                self.known_bridge_targets.get(pos),
+            )
 
             if (
                 building is not None
@@ -368,22 +431,103 @@ class BuilderBot(BaseBot):
                 }
                 and building_id is not None
             ):
-                history = self.transport_busy_history.setdefault(
-                    pos,
-                    deque(maxlen=TRANSPORT_BUSY_OBSERVATION_TURNS),
-                )
-                history.append(controller.get_stored_resource(building_id) is not None)
                 if pos not in self.network_blueprint:
-                    self.network_blueprint[pos] = (
+                    self.network_memory.remember(
+                        pos,
                         building[0],
                         self.known_conveyor_directions.get(pos),
                         self.known_bridge_targets.get(pos),
                     )
+                # Stored-resource reads are one of the expensive controller
+                # calls.  Structural source counts handle normal capacity;
+                # sample only the nearest transport to spot a persistently
+                # full merge without inspecting the entire visible network.
+                busy_candidates.append((current.distance_squared(pos), pos, building_id))
+        busy_candidates.sort(key=lambda item: (item[0], item[1].x, item[1].y))
+        for _, pos, building_id in busy_candidates[:TRANSPORT_BUSY_SAMPLE_LIMIT]:
+            self.network_memory.record_busy(
+                pos,
+                controller.get_stored_resource(building_id) is not None,
+            )
+        if network_changed:
+            self.connected_network_cache = None
         for pos in self.tile_cache.newly_observed_tiles:
             env = self.known_env[pos]
             self.update_scout_frontier(pos)
             if env in ORE_TYPES:
                 self.infer_symmetric(pos, env)
+
+    def try_repair_nearby_network(self, controller: Controller, current: Position) -> bool:
+        """Restore a visible broken transport tile before extending the network.
+
+        Empty or friendly-road damage is repaired immediately.  Hostile
+        conveyors are deliberately not fought for ten turns here: the
+        connection planner treats them as blocks and may bridge around them.
+        """
+        candidates = sorted(
+            (
+                pos for pos in self.damaged_network_tiles
+                if current.distance_squared(pos) <= GameConstants.ACTION_RADIUS_SQ
+            ),
+            key=lambda pos: (self.core_distance(pos), pos.x, pos.y),
+        )
+        for pos in candidates:
+            expected = self.network_blueprint.get(pos)
+            if expected is None:
+                self.damaged_network_tiles.discard(pos)
+                continue
+            building = self.known_buildings.get(pos)
+            if building is not None:
+                if (
+                    building[0] == EntityType.ROAD
+                    and building[1] == self.team
+                    and controller.can_destroy(pos)
+                ):
+                    controller.destroy(pos)
+                    self.tile_cache.forget_building(pos)
+                    self.connected_network_cache = None
+                    return True
+                # An enemy rewrite or incompatible allied transport is fed
+                # back to the capacity planner as an obstacle; a detour/bridge
+                # is cheaper and faster than repeatedly firing at it.
+                continue
+
+            entity_type, direction, bridge_target = expected
+            if entity_type == EntityType.BRIDGE and bridge_target is not None:
+                if not controller.can_build_bridge(pos, bridge_target):
+                    continue
+                entity_id = controller.build_bridge(pos, bridge_target)
+                self.tile_cache.remember_building(
+                    pos,
+                    entity_id,
+                    EntityType.BRIDGE,
+                    self.team,
+                )
+                self.known_bridge_targets[pos] = bridge_target
+                self.known_bridge_ids[pos] = entity_id
+            elif (
+                entity_type in {EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR}
+                and direction is not None
+                and controller.can_build_conveyor(pos, direction)
+            ):
+                entity_id = controller.build_conveyor(pos, direction)
+                self.tile_cache.remember_building(
+                    pos,
+                    entity_id,
+                    EntityType.CONVEYOR,
+                    self.team,
+                    direction=direction,
+                )
+                # Armoured tiles are restored as ordinary conveyors when
+                # titanium is available but axionite is not; continuity wins.
+                self.network_memory.remember(pos, EntityType.CONVEYOR, direction)
+            else:
+                continue
+            self.damaged_network_tiles.discard(pos)
+            self.connected_network_cache = None
+            self.last_progress_round = self.rounds_alive
+            return True
+        return False
 
     def read_ore_markers(self) -> None:
         """Read core orders and shared ore hints from nearby marker buildings."""
@@ -393,7 +537,10 @@ class BuilderBot(BaseBot):
             if marker_value is None:
                 continue
             try:
-                kind, pos, payload = decode_marker(marker_value)
+                kind, pos, payload = decode_marker(
+                    marker_value,
+                    self.tile_cache.position_at,
+                )
             except Exception:
                 continue
             records.append((kind, pos, payload))
@@ -402,22 +549,24 @@ class BuilderBot(BaseBot):
         # one handoff marker in the same round as spawn, which is necessary
         # when a map edge forces it to use a non-cardinal core tile.
         if self.work_direction is None:
-            for kind, pos, payload in records:
-                if kind not in {
+            current = self.get_cached_position()
+            order = spawn_order_for(
+                records,
+                current,
+                {
                     MARKER_KIND_SPAWN_DIRECTION,
                     MARKER_KIND_SPAWN_ORE_TI,
                     MARKER_KIND_SPAWN_ORE_AX,
-                }:
-                    continue
-                direction = BUILDER_CODE_DIRECTIONS.get(payload)
-                if direction is None:
-                    continue
+                },
+                BUILDER_CODE_DIRECTIONS,
+            )
+            if order is not None:
+                kind, pos, direction = order
                 self.work_direction = direction
                 if kind == MARKER_KIND_SPAWN_ORE_TI:
                     self.assigned_ores[pos] = Environment.ORE_TITANIUM
                 elif kind == MARKER_KIND_SPAWN_ORE_AX:
                     self.assigned_ores[pos] = Environment.ORE_AXIONITE
-                break
 
         if self.work_direction is None and self.spawn_direction in ORTHOGONAL_DIRECTIONS:
             self.work_direction = self.spawn_direction
@@ -442,11 +591,9 @@ class BuilderBot(BaseBot):
                 )
 
     def infer_symmetric(self, pos: Position, env: Environment) -> None:
-        """Record the mirrored position as an exploration hint for observed ore."""
-        mirror = Position(self.map_width - 1 - pos.x, self.map_height - 1 - pos.y)
-        if mirror not in self.observed_tiles:
-            # Symmetry gives a useful exploration hint, but it is not enough
-            # evidence to construct a harvester or a conveyor branch there.
+        """Record an ore hint only after the cache proves map symmetry."""
+        mirror = self.tile_cache.mirrored_position(pos)
+        if mirror is not None and mirror not in self.observed_tiles:
             self.inferred_ores[mirror] = env
 
     def update_scout_frontier(self, known_pos: Position) -> None:
@@ -471,10 +618,10 @@ class BuilderBot(BaseBot):
         ):
             return
         for direction in DIRECTIONS:
-            probe = known_pos.add(direction)
-            if not self.in_bounds(probe):
+            probe = self.tile_cache.neighbor(known_pos, direction)
+            if probe is None:
                 continue
-            if probe in self.known_env:
+            if probe in self.observed_tiles:
                 self.scout_frontier.discard(probe)
             else:
                 self.scout_frontier.add(probe)
@@ -588,18 +735,23 @@ class BuilderBot(BaseBot):
         self.reported_ores.pop(ore, None)
         self.deferred_ores_until.pop(ore, None)
         self.pending_network_ores.add(ore)
+        if self.connection_starts_new_line:
+            self.active_line_tiles.clear()
+        self.harvesters_built_count += 1
         if self.current_round <= HARVESTER_GUARD_LATEST_ROUND:
             branch_receivers = {
-                ore.add(direction)
+                receiver
                 for direction in ORTHOGONAL_DIRECTIONS
-                if ore.add(direction) in self.conveyor_path_tiles
+                if (receiver := self.tile_cache.neighbor(ore, direction)) is not None
+                and receiver in self.conveyor_path_tiles
             }
             self.harvester_guard_tiles = {
-                ore.add(direction)
+                guard
                 for direction in ORTHOGONAL_DIRECTIONS
+                if (guard := self.tile_cache.neighbor(ore, direction)) is not None
                 if (
-                    ore.add(direction) not in branch_receivers
-                    and self.traversable_for_connection(ore.add(direction))
+                    guard not in branch_receivers
+                    and self.traversable_for_connection(guard)
                 )
             }
 
@@ -611,9 +763,10 @@ class BuilderBot(BaseBot):
         # First give the harvester one real receiver.  Its initial production
         # can then enter the branch while the remaining sides are protected.
         has_live_receiver = any(
-            self.has_expected_tree_conveyor(controller, ore.add(direction))
+            self.has_expected_tree_conveyor(controller, receiver)
             for direction in ORTHOGONAL_DIRECTIONS
-            if ore.add(direction) in self.conveyor_path_tiles
+            if (receiver := self.tile_cache.neighbor(ore, direction)) is not None
+            and receiver in self.conveyor_path_tiles
         )
         if not has_live_receiver:
             return False
@@ -728,6 +881,7 @@ class BuilderBot(BaseBot):
             current,
             set(approaches),
             self.traversable_for_ore_path,
+            self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             max_expansions=ORE_PATH_A_STAR_MAX_EXPANSIONS,
         )
@@ -789,6 +943,8 @@ class BuilderBot(BaseBot):
         self.pending_network_ores.discard(self.target_ore)
         self.deferred_connections_observed_count.pop(self.target_ore, None)
         self.deferred_connections_until_round.pop(self.target_ore, None)
+        if self.connection_anchor is not None and self.is_core_receiver_tile(self.connection_anchor):
+            self.dedicated_line_committed = True
         self.unfinished_branch_tiles.clear()
         self.clear_ore_target()
         return True
@@ -816,9 +972,10 @@ class BuilderBot(BaseBot):
     def ore_action_approaches(self, ore: Position) -> list[Position]:
         """Return movement tiles from which a builder can act on an ore deposit."""
         return [
-            ore.add(direction)
+            approach
             for direction in DIRECTIONS
-            if self.traversable_for_ore_path(None, ore.add(direction))
+            if (approach := self.tile_cache.neighbor(ore, direction)) is not None
+            and self.traversable_for_ore_path(None, approach)
         ]
 
     def core_receiver_tiles(self) -> set[Position]:
@@ -826,11 +983,61 @@ class BuilderBot(BaseBot):
         if self.core_pos is None:
             return set()
         return {
-            Position(self.core_pos.x + dx, self.core_pos.y + dy)
+            pos
             for dx in range(-1, 2)
             for dy in range(-1, 2)
-            if self.in_bounds(Position(self.core_pos.x + dx, self.core_pos.y + dy))
+            if (pos := self.tile_cache.offset(self.core_pos, dx, dy)) is not None
         }
+
+    def sector_core_receiver_tiles(self) -> set[Position]:
+        """Reserve one Core edge for this builder's distributed lane family."""
+        if self.core_pos is None or self.work_direction is None:
+            return self.core_receiver_tiles()
+        offsets = sector_receiver_offsets(self.work_direction)
+        return {
+            pos
+            for dx, dy in offsets
+            if (pos := self.tile_cache.offset(self.core_pos, dx, dy)) is not None
+        }
+
+    def sector_core_entry_tiles(self) -> set[Position]:
+        """Return the three non-overlapping outer intake tiles for this sector."""
+        if self.core_pos is None or self.work_direction is None:
+            return set()
+        offsets = sector_entry_offsets(self.work_direction)
+        return {
+            pos
+            for dx, dy in offsets
+            if (pos := self.tile_cache.offset(self.core_pos, dx, dy)) is not None
+        }
+
+    def core_entry_tiles(self) -> set[Position]:
+        """Return every cardinal perimeter tile that can feed the 3x3 core."""
+        if self.core_pos is None:
+            return set()
+        entries: set[Position] = set()
+        for direction in ORTHOGONAL_DIRECTIONS:
+            for dx, dy in sector_entry_offsets(direction):
+                pos = self.tile_cache.offset(self.core_pos, dx, dy)
+                if pos is not None:
+                    entries.add(pos)
+        return entries
+
+    def network_plan_receiver_accepts(
+            self,
+            receiver: Position,
+            source: Position,
+            allowed_core_entries: set[Position] | None = None,
+    ) -> bool:
+        """Apply the sector intake reservation while planning new transport."""
+        if self.is_core_receiver_tile(receiver):
+            entries = (
+                self.sector_core_entry_tiles()
+                if allowed_core_entries is None
+                else allowed_core_entries
+            )
+            return source in entries
+        return self.network_receiver_accepts(receiver, source)
 
     def is_core_receiver_tile(self, pos: Position) -> bool:
         """Return whether a conveyor at ``pos`` can send resources into the core."""
@@ -852,7 +1059,9 @@ class BuilderBot(BaseBot):
             if building[0] in {EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR}:
                 direction = self.known_conveyor_directions.get(pos)
                 if direction is not None:
-                    incoming.setdefault(pos.add(direction), []).append(pos)
+                    receiver = self.tile_cache.neighbor(pos, direction)
+                    if receiver is not None:
+                        incoming.setdefault(receiver, []).append(pos)
             elif building[0] == EntityType.BRIDGE:
                 target = self.known_bridge_targets.get(pos)
                 if target is not None:
@@ -888,7 +1097,7 @@ class BuilderBot(BaseBot):
             return None
         if building[0] in {EntityType.CONVEYOR, EntityType.ARMOURED_CONVEYOR}:
             direction = self.known_conveyor_directions.get(pos)
-            return None if direction is None else pos.add(direction)
+            return None if direction is None else self.tile_cache.neighbor(pos, direction)
         if building[0] == EntityType.BRIDGE:
             return self.known_bridge_targets.get(pos)
         return None
@@ -908,10 +1117,11 @@ class BuilderBot(BaseBot):
         )
         for ore in harvesters:
             receivers = [
-                ore.add(direction)
+                receiver
                 for direction in ORTHOGONAL_DIRECTIONS
-                if ore.add(direction) in network
-                and self.network_receiver_accepts(ore.add(direction), ore)
+                if (receiver := self.tile_cache.neighbor(ore, direction)) is not None
+                and receiver in network
+                and self.network_receiver_accepts(receiver, ore)
             ]
             if not receivers:
                 continue
@@ -937,29 +1147,15 @@ class BuilderBot(BaseBot):
             return False
         if loads.get(pos, 0) >= MAX_HARVESTERS_PER_LINE:
             return True
-        history = self.transport_busy_history.get(pos)
-        return (
-            history is not None
-            and len(history) >= TRANSPORT_BUSY_OBSERVATION_TURNS
-            and all(history)
-        )
-
-    def known_connected_harvester_count(self) -> int:
-        """Count known sources with a valid route into the core."""
-        return sum(
-            1
-            for pos, building in self.known_buildings.items()
-            if building is not None
-            and building[1] == self.team
-            and building[0] == EntityType.HARVESTER
-            and self.harvester_is_connected(pos)
-        )
+        return self.network_memory.continuously_busy(pos)
 
     def harvester_is_connected(self, ore: Position) -> bool:
         """Return whether a harvester has a directed allied conveyor path to core."""
         network = self.known_connected_network()
         for direction in ORTHOGONAL_DIRECTIONS:
-            receiver = ore.add(direction)
+            receiver = self.tile_cache.neighbor(ore, direction)
+            if receiver is None:
+                continue
             if receiver in network and self.network_receiver_accepts(receiver, ore):
                 return True
         return False
@@ -979,23 +1175,26 @@ class BuilderBot(BaseBot):
         network = self.known_connected_network()
         if not network:
             return None
-        loads = self.known_network_loads(network)
-        available_network = {
-            pos
-            for pos in network
-            if not self.transport_lane_is_saturated(pos, loads)
-        } | self.core_receiver_tiles()
-        if not available_network:
+        core_receivers = self.sector_core_receiver_tiles()
+        if not core_receivers:
             return None
 
-        # The first four known sources are deliberately independent.  After
-        # that, merge greedily only into lanes with residual capacity.
-        direct_tree = self.core_receiver_tiles()
-        force_direct = self.known_connected_harvester_count() < MIN_DEDICATED_HARVESTER_LINES
-        primary_tree = direct_tree if force_direct else available_network
+        direct_tree = dedicated_route_tree(core_receivers)
+        start_new_line = starts_new_line(
+            self.harvesters_built_count,
+            bool(self.active_line_tiles),
+            PLANNED_HARVESTERS_PER_LINE,
+        )
+        active_merge_tree = direct_tree | (
+            network & self.active_line_tiles
+        )
+        primary_tree = direct_tree if start_new_line else active_merge_tree
+        # The active-line counter belongs to this process, so it stays exact
+        # without global communication.  Four sources exactly fill one owned
+        # trunk; the next source starts a physically separate route.
         conveyor_cost = controller.get_conveyor_cost()[0]
 
-        def plan_to(tree: set[Position]):
+        def plan_to(tree: set[Position], allowed_core_entries: set[Position]):
             def can_use_tile(pos: Position) -> bool:
                 return pos not in network and self.traversable_for_connection(pos)
 
@@ -1021,33 +1220,65 @@ class BuilderBot(BaseBot):
                 starts=self.buildable_approaches(ore),
                 tree=tree,
                 directions=ORTHOGONAL_DIRECTIONS,
+                neighbor_fn=self.tile_cache.neighbor,
                 can_use_tile=can_use_tile,
                 can_use_edge=can_use_edge,
-                receiver_accepts=self.network_receiver_accepts,
+                receiver_accepts=lambda receiver, source: self.network_plan_receiver_accepts(
+                    receiver,
+                    source,
+                    allowed_core_entries,
+                ),
                 tile_cost=tile_cost,
                 max_expansions=STEINER_MAX_EXPANSIONS,
+                heuristic_fn=lambda pos: conveyor_cost * min(
+                    abs(pos.x - anchor.x) + abs(pos.y - anchor.y)
+                    for anchor in tree
+                ),
             )
 
-        plan = plan_to(primary_tree)
-        if plan is None and force_direct:
-            plan = plan_to(available_network)
+        sector_entries = self.sector_core_entry_tiles()
+        plan = plan_to(primary_tree, sector_entries)
         if plan is not None:
             approach, build_tiles, directions, anchor = plan
+            self.last_plan_starts_new_line = start_new_line
             return approach, build_tiles, directions, {}, anchor
 
+        # Edge maps can leave a sector with only one usable intake.  Once it
+        # is occupied, reserve any still-free perimeter port rather than
+        # forcing every later mine through that same bottleneck.  Existing
+        # transport remains excluded, so this is a new physical lane, not an
+        # unmeasured cross-process merge.
+        global_receivers = self.core_receiver_tiles()
+        global_entries = self.core_entry_tiles()
+        global_tree = dedicated_route_tree(global_receivers)
+        plan = plan_to(global_tree, global_entries)
+        if plan is not None:
+            approach, build_tiles, directions, anchor = plan
+            self.last_plan_starts_new_line = True
+            return approach, build_tiles, directions, {}, anchor
+
+        # If an older lane blocks an independent route, jump it before
+        # considering a merge.  The previous ordering merged immediately and
+        # produced exactly the narrow high-utilisation trunks seen in the
+        # submitted replays even though a bridge route was affordable.
         bridge_plan = self.bridge_connection_plan(
             controller,
             ore,
             network,
             primary_tree,
+            sector_entries,
         )
-        if bridge_plan is None and force_direct:
+        bridge_starts_new_line = start_new_line
+        if bridge_plan is None:
             bridge_plan = self.bridge_connection_plan(
                 controller,
                 ore,
                 network,
-                available_network,
+                global_tree,
+                global_entries,
             )
+            bridge_starts_new_line = bridge_plan is not None
+        self.last_plan_starts_new_line = bridge_starts_new_line and bridge_plan is not None
         return bridge_plan
 
     def bridge_connection_plan(
@@ -1056,6 +1287,7 @@ class BuilderBot(BaseBot):
             ore: Position,
             network: set[Position],
             anchors: set[Position],
+            allowed_core_entries: set[Position],
     ) -> tuple[
         Position,
         list[Position],
@@ -1081,7 +1313,11 @@ class BuilderBot(BaseBot):
             anchor = nodes[-1]
             build_tiles = nodes[:-1]
             source = ore if not build_tiles else build_tiles[-1]
-            if not self.network_receiver_accepts(anchor, source):
+            if not self.network_plan_receiver_accepts(
+                anchor,
+                source,
+                allowed_core_entries,
+            ):
                 continue
             if any(
                 self.is_incompatible_existing_conveyor(tile, direction)
@@ -1141,7 +1377,9 @@ class BuilderBot(BaseBot):
             expansions += 1
 
             for direction in ORTHOGONAL_DIRECTIONS:
-                next_pos = current.add(direction)
+                next_pos = self.tile_cache.neighbor(current, direction)
+                if next_pos is None:
+                    continue
                 if not usable(next_pos):
                     continue
                 new_cost = cost + conveyor_cost
@@ -1154,12 +1392,25 @@ class BuilderBot(BaseBot):
             for direction in ORTHOGONAL_DIRECTIONS:
                 dx, dy = direction.delta()
                 for distance in range(2, BRIDGE_MAX_JUMP_DISTANCE + 1):
-                    target = Position(current.x + dx * distance, current.y + dy * distance)
+                    target = self.tile_cache.offset(
+                        current,
+                        dx * distance,
+                        dy * distance,
+                    )
+                    if target is None:
+                        continue
                     if not usable(target):
                         continue
                     intermediates = [
-                        Position(current.x + dx * step, current.y + dy * step)
+                        intermediate
                         for step in range(1, distance)
+                        if (
+                            intermediate := self.tile_cache.offset(
+                                current,
+                                dx * step,
+                                dy * step,
+                            )
+                        ) is not None
                     ]
                     if not any(
                         pos in network or not self.traversable_for_connection(pos)
@@ -1187,6 +1438,7 @@ class BuilderBot(BaseBot):
                 current,
                 {approach},
                 self.traversable_for_planning,
+                self.tile_cache.neighbor,
                 movement_directions=DIRECTIONS,
                 max_expansions=CONNECTION_A_STAR_MAX_EXPANSIONS,
             )
@@ -1204,6 +1456,7 @@ class BuilderBot(BaseBot):
                 tile,
                 {bridge_target},
                 self.traversable_for_planning,
+                self.tile_cache.neighbor,
                 movement_directions=DIRECTIONS,
                 max_expansions=CONNECTION_A_STAR_MAX_EXPANSIONS,
             )
@@ -1224,6 +1477,7 @@ class BuilderBot(BaseBot):
         self.conveyor_directions = directions
         self.bridge_targets = bridge_targets
         self.connection_anchor = anchor
+        self.connection_starts_new_line = self.last_plan_starts_new_line
         self.mode = "connect"
         return True
 
@@ -1310,11 +1564,12 @@ class BuilderBot(BaseBot):
     def buildable_approaches(self, ore_pos: Position) -> list[Position]:
         """Return cardinal ore-adjacent tiles suitable for the first branch conveyor."""
         return [
-            ore_pos.add(direction)
+            approach
             for direction in ORTHOGONAL_DIRECTIONS
+            if (approach := self.tile_cache.neighbor(ore_pos, direction)) is not None
             if (
-                self.is_core_receiver_tile(ore_pos.add(direction))
-                or self.traversable_for_connection(ore_pos.add(direction))
+                self.is_core_receiver_tile(approach)
+                or self.traversable_for_connection(approach)
             )
         ]
 
@@ -1322,7 +1577,9 @@ class BuilderBot(BaseBot):
         """Measure signed progress from the core along this builder's sector direction."""
         if self.core_pos is None or self.work_direction is None:
             return 0
-        forward = self.core_pos.add(self.work_direction)
+        forward = self.tile_cache.neighbor(self.core_pos, self.work_direction)
+        if forward is None:
+            return 0
         return (
             (pos.x - self.core_pos.x) * (forward.x - self.core_pos.x)
             + (pos.y - self.core_pos.y) * (forward.y - self.core_pos.y)
@@ -1344,7 +1601,9 @@ class BuilderBot(BaseBot):
         """Return the perpendicular distance from this builder's sector axis."""
         if self.core_pos is None or self.work_direction is None:
             return 0
-        forward = self.core_pos.add(self.work_direction)
+        forward = self.tile_cache.neighbor(self.core_pos, self.work_direction)
+        if forward is None:
+            return 0
         return abs(
             (pos.x - self.core_pos.x) * (forward.y - self.core_pos.y)
             - (pos.y - self.core_pos.y) * (forward.x - self.core_pos.x)
@@ -1395,24 +1654,27 @@ class BuilderBot(BaseBot):
         """Count unknown tiles that would enter vision from ``centre``."""
         visible = 0
         for dx, dy in SCOUT_VISION_OFFSETS:
-            pos = Position(centre.x + dx, centre.y + dy)
-            if self.in_bounds(pos) and pos not in self.known_env:
+            pos = self.tile_cache.offset(centre, dx, dy)
+            if pos is not None and pos not in self.observed_tiles:
                 visible += 1
         return visible
 
     def ore_hint_progress(self, current: Position, candidate: Position) -> int:
         """Measure how much a candidate step approaches an inferred or reported ore hint."""
-        hints = set(self.inferred_ores) | set(self.reported_ores)
-        if not hints:
+        if not self.inferred_ores and not self.reported_ores:
             return 0
-        current_distance = min(
-            max(abs(current.x - hint.x), abs(current.y - hint.y))
-            for hint in hints
-        )
-        candidate_distance = min(
-            max(abs(candidate.x - hint.x), abs(candidate.y - hint.y))
-            for hint in hints
-        )
+        current_distance = 10**9
+        candidate_distance = 10**9
+        for hints in (self.inferred_ores, self.reported_ores):
+            for hint in hints:
+                current_distance = min(
+                    current_distance,
+                    max(abs(current.x - hint.x), abs(current.y - hint.y)),
+                )
+                candidate_distance = min(
+                    candidate_distance,
+                    max(abs(candidate.x - hint.x), abs(candidate.y - hint.y)),
+                )
         return max(0, current_distance - candidate_distance)
 
     def scout_frontier_pre_score(self, current: Position, candidate: Position) -> tuple[int, int]:
@@ -1450,7 +1712,9 @@ class BuilderBot(BaseBot):
     def scout_frontier_has_known_entry(self, frontier: Position) -> bool:
         """Return whether a frontier touches a known tile the builder can occupy."""
         for direction in DIRECTIONS:
-            entry = frontier.add(direction)
+            entry = self.tile_cache.neighbor(frontier, direction)
+            if entry is None:
+                continue
             if entry in self.known_env and self.traversable_for_planning(None, entry):
                 return True
         return False
@@ -1469,6 +1733,14 @@ class BuilderBot(BaseBot):
             self.work_direction_priority(pos),
             current.distance_squared(pos),
         )
+
+        repair_plan = self.choose_network_repair_plan(controller, current)
+        if repair_plan is not None:
+            self.scout_target, self.path = repair_plan
+            self.scout_target_direct = False
+            self.path_index = 0
+            self.mode = "repair"
+            return
 
         for ore in sorted(self.connection_candidates(), key=ore_sort_key):
             if not self.assign_ore_target(controller, current, ore, connecting=True):
@@ -1501,6 +1773,14 @@ class BuilderBot(BaseBot):
 
         self.scout_route_failures += 1
 
+        patrol_plan = self.choose_network_patrol_plan(controller, current)
+        if patrol_plan is not None:
+            self.scout_target, self.path = patrol_plan
+            self.scout_target_direct = False
+            self.path_index = 0
+            self.mode = "patrol"
+            return
+
         # No usable frontier was found, so take one local right-hand step and
         # let the next turn select a fresh frontier from the newly seen tiles.
         step = self.choose_right_hand_scout_step(current)
@@ -1512,6 +1792,83 @@ class BuilderBot(BaseBot):
             self.mode = "scout"
             return
         self.scout_retry_pending = True
+
+    def choose_network_patrol_plan(
+            self,
+            controller: Controller,
+            current: Position,
+    ) -> tuple[Position, list[Position]] | None:
+        """Visit the builder's least-patrolled transport after exploration."""
+        candidates = [pos for pos in self.owned_network_tiles if pos != current]
+        candidates.sort(
+            key=lambda pos: (
+                self.scout_total_visits.get(pos, 0),
+                -current.distance_squared(pos),
+                pos.x,
+                pos.y,
+            )
+        )
+        targets = set(candidates[:NETWORK_PATROL_GOAL_LIMIT])
+        if not targets:
+            return None
+        path = a_star_to_any(
+            controller,
+            current,
+            targets,
+            self.traversable_for_ore_path,
+            self.tile_cache.neighbor,
+            movement_directions=DIRECTIONS,
+            extra_step_cost_fn=lambda pos: min(self.scout_total_visits.get(pos, 0), 8),
+            max_expansions=NETWORK_PATROL_MAX_EXPANSIONS,
+        )
+        if not path:
+            return None
+        return path[-1], path
+
+    def choose_network_repair_plan(
+            self,
+            controller: Controller,
+            current: Position,
+    ) -> tuple[Position, list[Position]] | None:
+        """Route the owning builder back to a rebuildable visible break."""
+        repairable = [
+            pos
+            for pos in self.damaged_network_tiles
+            if (
+                pos in self.tile_cache.visible_tiles
+                and (
+                    self.known_buildings.get(pos) is None
+                    or self.known_buildings[pos] == (EntityType.ROAD, self.team)
+                )
+            )
+        ]
+        repairable.sort(key=lambda pos: (current.distance_squared(pos), pos.x, pos.y))
+        for damaged in repairable:
+            approaches = {
+                approach
+                for direction in DIRECTIONS
+                if (approach := self.tile_cache.neighbor(damaged, direction)) is not None
+                if (
+                    approach != damaged
+                    and self.traversable_for_ore_path(None, approach)
+                )
+            }
+            if current in approaches:
+                return current, []
+            if not approaches:
+                continue
+            path = a_star_to_any(
+                controller,
+                current,
+                approaches,
+                self.traversable_for_ore_path,
+                self.tile_cache.neighbor,
+                movement_directions=DIRECTIONS,
+                max_expansions=CONNECTION_A_STAR_MAX_EXPANSIONS,
+            )
+            if path:
+                return path[-1], path
+        return None
 
     def snake_sweep_bias(self, current: Position, candidate: Position) -> int:
         """Bias exploration toward the current lateral leg of the snake sweep."""
@@ -1527,7 +1884,10 @@ class BuilderBot(BaseBot):
 
     def scout_step_is_viable(self, pos: Position) -> bool:
         """Return whether a one-step right-hand scouting move may use ``pos``."""
-        return self.traversable_for_planning(None, pos)
+        return (
+            self.traversable_for_planning(None, pos)
+            and self.tile_cache.builder_id_at(pos) is None
+        )
 
     def scout_a_star_traversable(self, pos: Position, targets: set[Position]) -> bool:
         """Use known terrain and enter unknown space only at a frontier goal."""
@@ -1535,39 +1895,52 @@ class BuilderBot(BaseBot):
             return False
         return pos in targets or pos in self.known_env or self.is_core_receiver_tile(pos)
 
-    def choose_right_hand_scout_step(self, current: Position) -> Position | None:
-        """Choose the least-visited viable escape, including a reverse step."""
+    def choose_right_hand_scout_step(
+            self,
+            current: Position,
+            require_new_vision: bool = False,
+    ) -> Position | None:
+        """Choose the least-visited useful escape, including a reverse step."""
         if self.work_direction is None:
             return None
-        candidates = []
-        for direction in DIRECTIONS:
-            candidate = current.add(direction)
-            if not self.scout_step_is_viable(candidate):
-                continue
-            candidates.append((
-                int(self.scout_avoid_until.get(candidate, 0) > self.current_round),
-                self.scout_total_visits.get(candidate, 0),
-                self.recent_route_visits.get(candidate, 0),
-                -self.newly_visible_tiles(candidate),
-                -self.work_direction_progress(candidate),
-                direction,
-                candidate,
-            ))
-        if not candidates:
+        selected = choose_information_gain_step(
+            current=current,
+            directions=DIRECTIONS,
+            neighbor=self.tile_cache.neighbor,
+            viable=self.scout_step_is_viable,
+            vision_gain=self.newly_visible_tiles,
+            total_visits=self.scout_total_visits,
+            recent_visits=self.recent_route_visits,
+            avoided=lambda pos: self.scout_avoid_until.get(pos, 0) > self.current_round,
+            forward_progress=self.work_direction_progress,
+            sweep_bias=self.snake_sweep_bias,
+            heading=self.scout_heading,
+            require_new_vision=require_new_vision,
+        )
+        if selected is None:
             return None
-        *_, direction, candidate = min(candidates, key=lambda item: item[:-2])
+        direction, candidate = selected
         self.scout_heading = direction
         return candidate
 
     def choose_scout_plan(self, controller: Controller) -> tuple[Position, list[Position]] | None:
-        """Return a bounded A* route to a reachable, high-value frontier."""
+        """Prefer an O(vision) information-gain step, then bounded frontier A*."""
         if not self.scout_frontier and self.known_env and not self.scout_frontier_initialized:
             self.rebuild_scout_frontier()
         current = self.get_cached_position()
+        # While new territory is one move away, global A* is wasted work.  A
+        # sector-biased least-visited step gives broad snake-like coverage and
+        # keeps ordinary scouting comfortably under the 2 ms turn limit.
+        local_step = self.choose_right_hand_scout_step(
+            current,
+            require_new_vision=True,
+        )
+        if local_step is not None:
+            return local_step, [local_step]
         candidates = [
             pos for pos in self.scout_frontier
             if (
-                pos not in self.known_env
+                pos not in self.observed_tiles
                 and pos not in self.permanently_blocked
                 and pos not in self.unreachable_scout_targets
                 and self.scout_frontier_has_known_entry(pos)
@@ -1589,6 +1962,7 @@ class BuilderBot(BaseBot):
             current,
             targets,
             lambda _controller, pos: self.scout_a_star_traversable(pos, targets),
+            self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             extra_step_cost_fn=lambda pos: self.scout_path_step_cost(current, pos),
             max_expansions=SCOUT_PATH_MAX_EXPANSIONS,
@@ -1653,6 +2027,11 @@ class BuilderBot(BaseBot):
                         return
                     else:
                         self.pending_network_ores.discard(self.target_ore)
+                        if (
+                            self.connection_anchor is not None
+                            and self.is_core_receiver_tile(self.connection_anchor)
+                        ):
+                            self.dedicated_line_committed = True
                         self.unfinished_branch_tiles.clear()
                 self.clear_ore_target()
                 self.select_new_target(controller)
@@ -1673,8 +2052,6 @@ class BuilderBot(BaseBot):
             if self.is_enemy_road(next_pos):
                 if controller.can_move(direction):
                     controller.move(direction)
-                    self.stuck_rounds = 0
-                    self.last_progress_round = self.rounds_alive
                 return
             if self.ensure_tree_conveyor(controller, next_pos):
                 return
@@ -1685,8 +2062,6 @@ class BuilderBot(BaseBot):
             self.try_prepare_tile(controller, next_pos)
         if controller.can_move(direction):
             controller.move(direction)
-            self.stuck_rounds = 0
-            self.last_progress_round = self.rounds_alive
         elif not self.is_cached_tile_passable(next_pos):
             self.replan_after_blocked_step(controller, next_pos)
 
@@ -1726,15 +2101,15 @@ class BuilderBot(BaseBot):
         """Prepare and take one legal scouting step in ``direction`` if possible."""
         if direction == Direction.CENTRE:
             return False
-        next_pos = current.add(direction)
+        next_pos = self.tile_cache.neighbor(current, direction)
+        if next_pos is None:
+            return False
         if not self.is_cached_tile_passable(next_pos):
             self.try_prepare_tile(controller, next_pos)
         if not controller.can_move(direction):
             return False
         controller.move(direction)
         self.scout_heading = direction
-        self.stuck_rounds = 0
-        self.last_progress_round = self.rounds_alive
         return True
 
     def try_prepare_tile(self, controller: Controller, target: Position) -> None:
@@ -1749,7 +2124,21 @@ class BuilderBot(BaseBot):
             self.tile_cache.remember_building(target, road_id, EntityType.ROAD, self.team)
             self.last_progress_round = self.rounds_alive
             return
-        self.mark_staticly_blocked(target)
+        # can_build_road is also false while resources/actions are temporarily
+        # unavailable.  Only immutable terrain or a durable incompatible
+        # building belongs in the permanent obstacle set.
+        env = self.known_env.get(target)
+        building = self.known_buildings.get(target)
+        if (
+            env == Environment.WALL
+            or env in ORE_TYPES
+            or (
+                building is not None
+                and building[0] not in PASSABLE_BUILDINGS
+                and building[0] != EntityType.BUILDER_BOT
+            )
+        ):
+            self.mark_staticly_blocked(target)
 
     def replan_after_blocked_step(self, controller: Controller, target: Position) -> None:
         """Yield or recompute the active job when the next path tile is blocked."""
@@ -1763,6 +2152,23 @@ class BuilderBot(BaseBot):
                     self.yield_to_higher_priority_builder(controller, target)
                 return
             self.schedule_replan_after_yield()
+            return
+        env = self.known_env.get(target)
+        building = self.known_buildings.get(target)
+        cached_passable_building = (
+            building is not None
+            and building[0] in PASSABLE_BUILDINGS
+            and (building[0] != EntityType.CORE or building[1] == self.team)
+        )
+        if not is_static_step_obstacle(
+            env == Environment.WALL or env in ORE_TYPES,
+            building is not None,
+            cached_passable_building,
+        ):
+            # The step can be temporarily unaffordable or the action may have
+            # been consumed; a friendly transport can also be momentarily
+            # occupied between this bot's scan and action.  Preserve both as
+            # traversable and let the ordinary stall logic replan.
             return
         self.mark_staticly_blocked(target)
         if self.replan_active_ore_target(controller):
@@ -1794,12 +2200,12 @@ class BuilderBot(BaseBot):
         # any free neighbouring road, preferring a step away from the blocker.
         route_history = set(self.recent_route)
         fallback_positions = [
-            current.add(direction)
+            candidate
             for direction in DIRECTIONS
+            if (candidate := self.tile_cache.neighbor(current, direction)) is not None
             if (
-                current.add(direction) != blocking_pos
-                and current.add(direction) not in route_history
-                and self.in_bounds(current.add(direction))
+                candidate != blocking_pos
+                and candidate not in route_history
             )
         ]
         fallback_positions.sort(
@@ -1812,8 +2218,6 @@ class BuilderBot(BaseBot):
             if direction == Direction.CENTRE or not controller.can_move(direction):
                 continue
             controller.move(direction)
-            self.stuck_rounds = 0
-            self.last_progress_round = self.rounds_alive
             self.schedule_replan_after_yield()
             return
 
@@ -1936,8 +2340,6 @@ class BuilderBot(BaseBot):
                 for direction in DIRECTIONS:
                     if controller.can_move(direction):
                         controller.move(direction)
-                        self.stuck_rounds = 0
-                        self.last_progress_round = self.rounds_alive
                         return True
                 return False
             if not controller.can_build_bridge(target, planned_bridge_target):
@@ -1956,6 +2358,8 @@ class BuilderBot(BaseBot):
                 None,
                 planned_bridge_target,
             )
+            self.owned_network_tiles.add(target)
+            self.active_line_tiles.add(target)
             self.unfinished_branch_tiles.add(target)
             self.connected_network_cache = None
             self.last_progress_round = self.rounds_alive
@@ -1975,6 +2379,8 @@ class BuilderBot(BaseBot):
                 conveyor_direction,
                 None,
             )
+            self.owned_network_tiles.add(target)
+            self.active_line_tiles.add(target)
             self.unfinished_branch_tiles.add(target)
             self.connected_network_cache = None
             self.last_progress_round = self.rounds_alive

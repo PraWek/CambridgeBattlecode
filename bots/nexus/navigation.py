@@ -11,6 +11,7 @@ def a_star_to_any(
         start: Position,
         goals: set[Position],
         traversable_fn,
+        neighbor_fn,
         preferred_tiles: set[Position] | None = None,
         movement_directions=ORTHOGONAL_DIRECTIONS,
         extra_step_cost_fn=None,
@@ -50,7 +51,9 @@ def a_star_to_any(
         expansions += 1
 
         for direction in movement_directions:
-            next_pos = current.add(direction)
+            next_pos = neighbor_fn(current, direction)
+            if next_pos is None:
+                continue
             if not traversable_fn(controller, next_pos):
                 continue
             step_cost = 1 if next_pos in preferred_tiles else 4

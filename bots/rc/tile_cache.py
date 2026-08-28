@@ -2,7 +2,7 @@
 
 from collections import deque
 
-from cambc import Controller, Direction, EntityType, Environment, Position, Team
+from cambc import Controller, Direction, EntityType, Environment, GameError, Position, Team
 
 
 TileRecord = tuple[Environment, int | None, EntityType | None, Team | None]
@@ -25,10 +25,18 @@ _CORE_FOOTPRINT_OFFSETS = tuple(
 )
 _BASE_SYMMETRIES = ("rotational", "vertical", "horizontal")
 _DIAGONAL_SYMMETRIES = ("main_diagonal", "anti_diagonal")
+# Controller calls have a material CPU cost on crowded maps.  Seven calls leave
+# room for navigation after a partial entity scan; terrain and the own unit
+# are always completed before a role is allowed to act.
+_SCAN_API_CALL_LIMIT = 7
 # Confirming a symmetry may happen after a scout has seen hundreds of tiles.
 # Mirroring all of them in one bot turn exceeds the 2 ms limit, so drain the
-# historical cache over several later turns instead.
-_SYMMETRY_BACKFILL_TILES_PER_TURN = 24
+# historical cache over several later turns instead.  This work shares a
+# 2 ms turn with the ordinary scan and role logic, so process only one tile
+# at a time.  The historical source uses direct-observation order and a
+# cursor, avoiding one large scheduling pass at the exact turn symmetry
+# becomes known.
+_SYMMETRY_BACKFILL_TILES_PER_TURN = 1
 
 
 class TileCache:
@@ -71,19 +79,35 @@ class TileCache:
         if map_width == map_height:
             self.possible_symmetries.update(_DIAGONAL_SYMMETRIES)
         self.confirmed_symmetry: str | None = None
+        # Consumers can yield their current turn when this expensive
+        # transition happens instead of chaining another heavy planner after
+        # the first full symmetry backfill is scheduled.
+        self.symmetry_confirmed_this_turn = False
         self.observed_core_positions: dict[Team, Position] = {}
         self.inferred_core_positions: dict[Team, Position] = {}
         self.inferred_core_tiles: set[Position] = set()
         self._symmetry_backfill_pending: deque[Position] = deque()
-        self._symmetry_backfill_scheduled: set[Position] = set()
+        self._symmetry_backfill_historical_index = 0
+        self._symmetry_backfill_historical_end = 0
 
         self.observed_tiles: set[Position] = set()
+        self._observed_tile_order: list[Position] = []
         self.visible_tiles: set[Position] = set()
         self.newly_visible_tiles: set[Position] = set()
         self.newly_observed_tiles: set[Position] = set()
+        # Terrain may be physically read during a partial scan, while the
+        # entity phase still runs out of API budget before ``_update_symmetry``
+        # can compare it.  Keep such tiles as evidence until a complete scan
+        # actually consumes them; otherwise the only observation that could
+        # disprove a symmetry would be silently lost on the next turn.
+        self._pending_symmetry_tiles: set[Position] = set()
         self._last_vision_set: set[Position] = set()
-        self._scan_turn_count = 0
-        self._first_turn_deferred_tiles: set[Position] | None = None
+        # Terrain that was visible but did not fit in a previous scan budget.
+        # Keep it until the builder sees it again and can legally query it.
+        self._pending_terrain_tiles: set[Position] = set()
+        self.scan_incomplete_this_turn = False
+        self.role_cache_ready_this_turn = False
+        self.scan_api_calls_this_turn = 0
 
         # Entity metadata is immutable except for a builder's position and a
         # gunner's rotation.  Keeping it lets later scans reuse type/team and
@@ -95,20 +119,33 @@ class TileCache:
         self.visible_builder_ids: dict[Position, int] = {}
         self.marker_values: dict[int, int] = {}
         self.current_position: Position | None = None
+        # One dense vision can contain dozens of roads around a Core.  Keep a
+        # single entity-list snapshot and resume it across turns; restarting
+        # from the first ID after every seven-call budget would starve the
+        # role forever while the cache is required to be complete.
+        self._entity_scan_pending = False
+        self._entity_scan_visible_tiles: set[Position] = set()
+        self._entity_scan_queue: list[tuple[int, bool, bool]] = []
+        self._entity_scan_cursor = 0
 
     def scan_turn(
             self,
             controller: Controller,
             own_id: int,
-            split_initial_scan: bool = False,
     ) -> None:
         """Populate the cache once from this turn's batched vision queries.
 
-        A newborn builder may split its first terrain scan across two turns.
-        The first half is closest to its spawn tile, so it still learns its
-        nearby core and immediate exits; the other half is queried on its
-        next turn. Other roles retain the complete single-turn scan.
+        Every Controller read made by the cache consumes one of the bounded
+        scan calls.  When the budget is exhausted, this method stops
+        immediately; terrain not yet queried stays queued for a later turn.
+        Callers must yield when ``scan_incomplete_this_turn`` is true.
         """
+        self.symmetry_confirmed_this_turn = False
+        self.scan_incomplete_this_turn = False
+        self.role_cache_ready_this_turn = self.current_position is not None
+        self.scan_api_calls_this_turn = 0
+        if not self._take_scan_api_call():
+            return
         visible_tiles = {
             self._canonical_position(pos)
             for pos in controller.get_nearby_tiles()
@@ -123,81 +160,214 @@ class TileCache:
             # evidence.
             pos for pos in visible_tiles if pos not in self.observed_tiles
         }
-        if self._scan_turn_count == 0 and split_initial_scan:
-            origin = self._canonical_position(controller.get_position())
-            ordered_tiles = sorted(
-                missing_visible_tiles,
-                key=lambda pos: (origin.distance_squared(pos), pos.y, pos.x),
-            )
-            first_half_count = (len(ordered_tiles) + 1) // 2
-            tiles_to_scan = ordered_tiles[:first_half_count]
-            self._first_turn_deferred_tiles = set(ordered_tiles[first_half_count:])
-        elif self._scan_turn_count == 1 and self._first_turn_deferred_tiles is not None:
-            # A moved builder can no longer sense a few cells from its first
-            # disc. They stay unknown until naturally seen again; querying
-            # them here would be illegal and would defeat the bounded scan.
-            tiles_to_scan = self._first_turn_deferred_tiles & visible_tiles
-            self._first_turn_deferred_tiles = None
-        else:
-            # Environment never changes. After bootstrap, query only the
-            # newly visible / previously missed portion of vision.
-            tiles_to_scan = missing_visible_tiles
+        # A terrain tile may have been inferred through symmetry, but it must
+        # still be physically read before becoming evidence.  Give pending
+        # cells deterministic priority, without an extra get_position() call.
+        tiles_to_scan = sorted(
+            (self._pending_terrain_tiles & visible_tiles) | missing_visible_tiles,
+            key=lambda pos: (pos.y, pos.x),
+        )
+        for index, pos in enumerate(tiles_to_scan):
+            if not self._remember_environment(controller, pos):
+                self._pending_terrain_tiles.update(tiles_to_scan[index:])
+                self._finish_incomplete_scan()
+                return
+            self._pending_terrain_tiles.discard(pos)
 
-        for pos in tiles_to_scan:
-            self._remember_environment(controller, pos)
+        if (
+            self._entity_scan_pending
+            and visible_tiles != self._entity_scan_visible_tiles
+        ):
+            self._clear_entity_scan_queue()
+        if self._entity_scan_pending:
+            if not self._refresh_entity_scan_queue(controller, own_id, visible_tiles):
+                self._finish_incomplete_scan()
+                return
+        if not self._entity_scan_pending:
+            if not self._start_entity_scan(controller, own_id, visible_tiles):
+                self._finish_incomplete_scan()
+                return
 
-        # Buildings and builders are dynamic.  Reset only visible, non-wall
-        # cells before repopulating them from two batched ID lists.  A known
-        # wall can never contain either, so it receives no further work.
+        while self._entity_scan_cursor < len(self._entity_scan_queue):
+            entity_id, is_building, is_own = self._entity_scan_queue[
+                self._entity_scan_cursor
+            ]
+            if not self._scan_queued_entity(
+                    controller,
+                    entity_id,
+                    is_building,
+                    is_own,
+            ):
+                self._finish_incomplete_scan()
+                return
+            self._entity_scan_cursor += 1
+
+        own = self.entities.get(own_id)
+        if own is None:
+            self._finish_incomplete_scan()
+            return
+        self.current_position = own[0]
+        self.role_cache_ready_this_turn = True
+        self._clear_entity_scan_queue()
+        self._update_symmetry()
+        self._last_vision_set = visible_tiles
+
+    def _start_entity_scan(
+            self,
+            controller: Controller,
+            own_id: int,
+            visible_tiles: set[Position],
+    ) -> bool:
+        """Snapshot visible entity IDs and begin a resumable refresh job."""
+        # Buildings and builders are dynamic.  Clear only after terrain is
+        # complete, and repopulate from this one persisted ID snapshot.  No
+        # role may act until the queue below has finished.
         for pos in visible_tiles:
             env = self.environments.get(pos)
             if env is None or env == Environment.WALL:
                 continue
             self._set_building(pos, None, None, None)
-
-        building_ids = controller.get_nearby_buildings()
+        if not self._take_scan_api_call():
+            return False
         unit_ids = controller.get_nearby_units()
+        if not self._take_scan_api_call():
+            return False
+        building_ids = controller.get_nearby_buildings()
+
+        own_unit_ids = [entity_id for entity_id in unit_ids if entity_id == own_id]
+        other_unit_ids = [entity_id for entity_id in unit_ids if entity_id != own_id]
         self.visible_entity_ids = set()
         self.visible_entity_order = []
         self.visible_builder_ids = {}
         self.marker_values = {}
+        self._entity_scan_pending = True
+        self._entity_scan_visible_tiles = set(visible_tiles)
+        self._entity_scan_queue = [
+            *((entity_id, False, True) for entity_id in own_unit_ids),
+            *((entity_id, True, False) for entity_id in building_ids),
+            *((entity_id, False, False) for entity_id in other_unit_ids),
+        ]
+        self._entity_scan_cursor = 0
+        return True
 
-        seen_ids: set[int] = set()
-        for entity_id in building_ids:
-            seen_ids.add(entity_id)
-            pos, entity_type, team = self._entity_for_scan(controller, entity_id)
-            self._remember_visible_entity(entity_id)
-            if entity_type == EntityType.CORE:
-                self._remember_observed_core(pos, team)
-            direction = self._direction_for_scan(controller, entity_id, entity_type)
-            for tile in self._building_tiles(pos, entity_type):
-                if tile not in visible_tiles or tile not in self.environments:
-                    continue
-                self._set_building(tile, entity_id, entity_type, team)
-                if direction is not None:
-                    self.conveyor_directions[tile] = direction
+    def _refresh_entity_scan_queue(
+            self,
+            controller: Controller,
+            own_id: int,
+            visible_tiles: set[Position],
+    ) -> bool:
+        """Keep an unfinished scan valid as nearby entities appear or disappear."""
+        if not self._take_scan_api_call():
+            return False
+        unit_ids = controller.get_nearby_units()
+        if not self._take_scan_api_call():
+            return False
+        building_ids = controller.get_nearby_buildings()
+        unit_id_set = set(unit_ids)
+        building_id_set = set(building_ids)
+        current_entity_ids = unit_id_set | building_id_set
 
-        for entity_id in unit_ids:
-            if entity_id in seen_ids:
-                pos, entity_type, team = self.entities[entity_id]
-            else:
-                pos, entity_type, team = self._entity_for_scan(controller, entity_id)
-                self._direction_for_scan(controller, entity_id, entity_type)
-            self._remember_visible_entity(entity_id)
-            if entity_type == EntityType.BUILDER_BOT:
-                self.visible_builder_ids[pos] = entity_id
+        # A building can be destroyed while this multi-turn refresh is in
+        # progress.  Remove its old footprint before a role may see the
+        # completed cache.
+        for pos in visible_tiles:
+            building_id = self.building_id_at(pos)
+            if building_id is not None and building_id not in building_id_set:
+                self._set_building(pos, None, None, None)
+        self.visible_entity_ids.intersection_update(current_entity_ids)
+        self.visible_entity_order = [
+            entity_id
+            for entity_id in self.visible_entity_order
+            if entity_id in current_entity_ids
+        ]
+        self.visible_builder_ids = {
+            pos: entity_id
+            for pos, entity_id in self.visible_builder_ids.items()
+            if entity_id in unit_id_set
+        }
 
-        own = self.entities.get(own_id)
-        self.current_position = (
-            own[0]
-            if own is not None
-            else self._canonical_position(controller.get_position())
-        )
-        self._update_symmetry()
-        self._last_vision_set = visible_tiles
-        self._scan_turn_count += 1
+        processed = self._entity_scan_queue[:self._entity_scan_cursor]
+        pending = [
+            item
+            for item in self._entity_scan_queue[self._entity_scan_cursor:]
+            if item[0] in (building_id_set if item[1] else unit_id_set)
+        ]
+        queued_ids = {entity_id for entity_id, _, _ in processed + pending}
+        additions = [
+            *((entity_id, False, True)
+              for entity_id in unit_ids
+              if entity_id == own_id and entity_id not in queued_ids),
+            *((entity_id, True, False)
+              for entity_id in building_ids
+              if entity_id not in queued_ids),
+            *((entity_id, False, False)
+              for entity_id in unit_ids
+              if entity_id != own_id and entity_id not in queued_ids),
+        ]
+        self._entity_scan_queue = processed + pending + additions
+        return True
 
-    def cache_friendly_marker_values(self, controller: Controller, own_team: Team) -> None:
+    def _scan_queued_entity(
+            self,
+            controller: Controller,
+            entity_id: int,
+            is_building: bool,
+            is_own: bool,
+    ) -> bool:
+        """Refresh one queued entity, stopping before an incomplete record."""
+        try:
+            entity = self._entity_for_scan(controller, entity_id)
+        except GameError:
+            # The batched list can become stale between turns.  The next
+            # refresh will omit this ID; dropping it now preserves scan
+            # progress without ever exposing a partial cache to the role.
+            self._forget_queued_entity(entity_id, is_building)
+            return True
+        if entity is None:
+            return False
+        pos, entity_type, team = entity
+        direction = self._direction_for_scan(controller, entity_id, entity_type)
+        if self.scan_incomplete_this_turn:
+            return False
+        self._remember_visible_entity(entity_id)
+        if is_own:
+            self.current_position = pos
+            self.role_cache_ready_this_turn = True
+        if entity_type == EntityType.BUILDER_BOT:
+            self.visible_builder_ids[pos] = entity_id
+        if not is_building:
+            return True
+        if entity_type == EntityType.CORE:
+            self._remember_observed_core(pos, team)
+        for tile in self._building_tiles(pos, entity_type):
+            if tile not in self._entity_scan_visible_tiles or tile not in self.environments:
+                continue
+            self._set_building(tile, entity_id, entity_type, team)
+            if direction is not None:
+                self.conveyor_directions[tile] = direction
+        return True
+
+    def _forget_queued_entity(self, entity_id: int, is_building: bool) -> None:
+        """Remove an entity that vanished after its previous visibility snapshot."""
+        entity = self.entities.pop(entity_id, None)
+        self.entity_directions.pop(entity_id, None)
+        self.marker_values.pop(entity_id, None)
+        self.visible_entity_ids.discard(entity_id)
+        if entity is None or not is_building:
+            return
+        pos, entity_type, _ = entity
+        for tile in self._building_tiles(pos, entity_type):
+            if self.building_id_at(tile) == entity_id:
+                self._set_building(tile, None, None, None)
+
+    def _clear_entity_scan_queue(self) -> None:
+        """Forget the current entity-refresh snapshot after completion or a view change."""
+        self._entity_scan_pending = False
+        self._entity_scan_visible_tiles = set()
+        self._entity_scan_queue = []
+        self._entity_scan_cursor = 0
+
+    def cache_friendly_marker_values(self, controller: Controller, own_team: Team) -> bool:
         """Read each visible friendly marker once for consumers of the cache."""
         for entity_id in self.visible_entity_order:
             entity = self.entities.get(entity_id)
@@ -206,12 +376,15 @@ class TileCache:
             _, entity_type, team = entity
             if entity_type != EntityType.MARKER or team != own_team:
                 continue
+            if not self._take_scan_api_call():
+                return False
             try:
                 self.marker_values[entity_id] = controller.get_marker_value(entity_id)
             except Exception:
                 # A marker can disappear between the batched scan and this
                 # read because another entity acted earlier in the round.
                 continue
+        return True
 
     def environment_at(self, pos: Position) -> Environment | None:
         """Return cached immutable terrain at ``pos`` without an API call."""
@@ -327,27 +500,38 @@ class TileCache:
             self._schedule_symmetric_backfill(self.newly_observed_tiles)
             self._backfill_symmetric_cores()
             self._continue_symmetric_backfill()
+            self._pending_symmetry_tiles.clear()
             return
 
+        # A tile enters this set when its environment is read, not merely when
+        # the turn begins.  It therefore survives an incomplete scan and is
+        # compared during the first later scan that reaches this method.
         for symmetry in tuple(self.possible_symmetries):
             if (
-                not self._symmetry_matches_new_terrain(symmetry)
+                not self._symmetry_matches_pending_terrain(symmetry)
                 or not self._symmetry_matches_known_cores(symmetry)
             ):
                 self.possible_symmetries.discard(symmetry)
 
+        # Every pending tile has now been compared against every directly seen
+        # counterpart.  If a counterpart was not seen yet, its own eventual
+        # direct observation will be queued and perform that comparison then.
+        self._pending_symmetry_tiles.clear()
+
         if len(self.possible_symmetries) != 1:
             return
         self.confirmed_symmetry = next(iter(self.possible_symmetries))
+        self.symmetry_confirmed_this_turn = True
         # Infer the opposing Core immediately: it supplies a useful target
         # for scouting, while the much larger terrain mirror is deferred.
         self._backfill_symmetric_cores()
-        self._schedule_symmetric_backfill(self.observed_tiles)
+        self._symmetry_backfill_historical_index = 0
+        self._symmetry_backfill_historical_end = len(self._observed_tile_order)
         self._continue_symmetric_backfill()
 
-    def _symmetry_matches_new_terrain(self, symmetry: str) -> bool:
-        """Compare fresh terrain only with its directly observed counterpart."""
-        for pos in self.newly_observed_tiles:
+    def _symmetry_matches_pending_terrain(self, symmetry: str) -> bool:
+        """Compare unprocessed direct terrain observations with their counterparts."""
+        for pos in self._pending_symmetry_tiles:
             counterpart = self._mirror_position(pos, symmetry)
             if counterpart not in self.observed_tiles:
                 continue
@@ -377,21 +561,26 @@ class TileCache:
         return True
 
     def _schedule_symmetric_backfill(self, source_tiles: set[Position]) -> None:
-        """Queue directly seen cells to be mirrored exactly once."""
-        for pos in source_tiles:
-            if pos in self._symmetry_backfill_scheduled:
-                continue
-            self._symmetry_backfill_scheduled.add(pos)
-            self._symmetry_backfill_pending.append(pos)
+        """Queue terrain first observed after symmetry confirmation."""
+        self._symmetry_backfill_pending.extend(source_tiles)
 
     def _continue_symmetric_backfill(self) -> None:
         """Mirror one bounded terrain batch after symmetry is confirmed."""
         if self.confirmed_symmetry is None:
             return
         for _ in range(_SYMMETRY_BACKFILL_TILES_PER_TURN):
-            if not self._symmetry_backfill_pending:
+            if self._symmetry_backfill_pending:
+                pos = self._symmetry_backfill_pending.popleft()
+            elif (
+                self._symmetry_backfill_historical_index
+                < self._symmetry_backfill_historical_end
+            ):
+                pos = self._observed_tile_order[
+                    self._symmetry_backfill_historical_index
+                ]
+                self._symmetry_backfill_historical_index += 1
+            else:
                 return
-            pos = self._symmetry_backfill_pending.popleft()
             self._remember_inferred_environment(
                 self._mirror_position(pos, self.confirmed_symmetry),
                 self.environments[pos],
@@ -424,7 +613,7 @@ class TileCache:
             pos,
             None if entity_type is None or team is None else (entity_type, team),
         )
-        self.inferred_tiles.add(pos)
+        self.inferred_tiles.update((pos,))
 
     def _remember_observed_core(self, pos: Position, team: Team) -> None:
         """Record one immutable Core centre discovered by the batched scan."""
@@ -447,7 +636,7 @@ class TileCache:
                 continue
             self.tiles[tile] = (self.environments[tile], None, EntityType.CORE, team)
             self.buildings[tile] = (EntityType.CORE, team)
-            self.inferred_core_tiles.add(tile)
+            self.inferred_core_tiles.update((tile,))
 
     def _mirror_position(self, pos: Position, symmetry: str) -> Position:
         """Return a preallocated coordinate transformed by one legal symmetry."""
@@ -467,39 +656,67 @@ class TileCache:
         """Return the only opposing team in a two-team match."""
         return Team.B if team == Team.A else Team.A
 
-    def _remember_environment(self, controller: Controller, pos: Position) -> None:
+    def _take_scan_api_call(self) -> bool:
+        """Reserve one Controller call, or stop this cache turn at its budget."""
+        if self.scan_api_calls_this_turn >= _SCAN_API_CALL_LIMIT:
+            self.scan_incomplete_this_turn = True
+            return False
+        self.scan_api_calls_this_turn += 1
+        return True
+
+    def _finish_incomplete_scan(self) -> None:
+        """Record the partial vision update before yielding the bot's turn."""
+        self.scan_incomplete_this_turn = True
+        self._last_vision_set = self.visible_tiles
+
+    def _remember_environment(self, controller: Controller, pos: Position) -> bool:
         """Store one previously unseen tile's permanent environment."""
+        if not self._take_scan_api_call():
+            return False
         pos = self._canonical_position(pos)
         env = controller.get_tile_env(pos)
         self.environments[pos] = env
         self.buildings[pos] = None
         self.tiles[pos] = (env, None, None, None)
-        self.observed_tiles.add(pos)
+        self.observed_tiles.update((pos,))
+        self._observed_tile_order.append(pos)
         self.inferred_tiles.discard(pos)
         self.inferred_core_tiles.discard(pos)
-        self.newly_observed_tiles.add(pos)
+        self.newly_observed_tiles.update((pos,))
+        self._pending_symmetry_tiles.update((pos,))
+        return True
 
     def _remember_visible_entity(self, entity_id: int) -> None:
         """Record a visible entity once while preserving batched-query order."""
         if entity_id in self.visible_entity_ids:
             return
-        self.visible_entity_ids.add(entity_id)
+        self.visible_entity_ids.update((entity_id,))
         self.visible_entity_order.append(entity_id)
 
     def _entity_for_scan(
             self,
             controller: Controller,
             entity_id: int,
-    ) -> EntityRecord:
+    ) -> EntityRecord | None:
         """Return entity metadata, querying only mutable or newly seen fields."""
         known = self.entities.get(entity_id)
         if known is None:
+            if not self._take_scan_api_call():
+                return None
+            pos = self._canonical_position(controller.get_position(entity_id))
+            if not self._take_scan_api_call():
+                return None
+            entity_type = controller.get_entity_type(entity_id)
+            if not self._take_scan_api_call():
+                return None
             entity = (
-                self._canonical_position(controller.get_position(entity_id)),
-                controller.get_entity_type(entity_id),
+                pos,
+                entity_type,
                 controller.get_team(entity_id),
             )
         elif known[1] == EntityType.BUILDER_BOT:
+            if not self._take_scan_api_call():
+                return None
             entity = (
                 self._canonical_position(controller.get_position(entity_id)),
                 known[1],
@@ -524,6 +741,8 @@ class TileCache:
             and entity_id in self.entity_directions
         ):
             return self.entity_directions[entity_id]
+        if not self._take_scan_api_call():
+            return None
         direction = controller.get_direction(entity_id)
         self.entity_directions[entity_id] = direction
         return direction
@@ -538,9 +757,31 @@ class TileCache:
             if 0 <= pos.x + dx < self.map_width and 0 <= pos.y + dy < self.map_height
         )
 
+    def position_at(self, x: int, y: int) -> Position | None:
+        """Return the canonical tile at ``(x, y)``, or ``None`` off-map."""
+        if not (0 <= x < self.map_width and 0 <= y < self.map_height):
+            return None
+        return self._positions[x][y]
+
+    def canonicalize(self, pos: Position) -> Position:
+        """Convert an in-bounds external coordinate to its cached identity."""
+        canonical = self.position_at(pos.x, pos.y)
+        if canonical is None:
+            raise ValueError(f"position outside map: {pos}")
+        return canonical
+
+    def offset(self, pos: Position, dx: int, dy: int) -> Position | None:
+        """Return the canonical tile offset from ``pos``, or ``None`` off-map."""
+        return self.position_at(pos.x + dx, pos.y + dy)
+
     def _canonical_position(self, pos: Position) -> Position:
-        """Return the preallocated cache coordinate matching an in-bounds position."""
-        return self._positions[pos.x][pos.y]
+        """Backward-compatible private alias for :meth:`canonicalize`."""
+        return self.canonicalize(pos)
+
+    def neighbor(self, pos: Position, direction: Direction) -> Position | None:
+        """Return the canonical adjacent tile, or ``None`` beyond the map edge."""
+        dx, dy = direction.delta()
+        return self.offset(pos, dx, dy)
 
     def _set_building(
             self,

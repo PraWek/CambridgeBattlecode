@@ -8,8 +8,11 @@ from geometry import decode_marker
 class GunnerBot(BaseBot):
     def run(self, controller: Controller) -> None:
         """Fire at an available target or rotate toward a shared enemy marker."""
-        self._scan_turn(controller, read_markers=True)
+        if self._scan_turn(controller, read_markers=True):
+            return
         target = controller.get_gunner_target()
+        if target is not None:
+            target = self.tile_cache.canonicalize(target)
         if target is not None and controller.can_fire(target):
             controller.fire(target)
             return
@@ -32,7 +35,10 @@ class GunnerBot(BaseBot):
             if marker_value is None:
                 continue
             try:
-                kind, pos, _ = decode_marker(marker_value)
+                kind, pos, _ = decode_marker(
+                    marker_value,
+                    self.tile_cache.position_at,
+                )
             except Exception:
                 continue
             if kind == MARKER_KIND_ENEMY:

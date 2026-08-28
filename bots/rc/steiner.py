@@ -7,6 +7,7 @@ def incremental_steiner_branch(
         starts: list[Position],
         tree: set[Position],
         directions: list[Direction],
+        neighbor_fn,
         can_use_tile,
         can_use_edge,
         receiver_accepts,
@@ -50,7 +51,9 @@ def incremental_steiner_branch(
         for direction in directions:
             if not can_use_edge(current, direction):
                 continue
-            next_pos = current.add(direction)
+            next_pos = neighbor_fn(current, direction)
+            if next_pos is None:
+                continue
             edge_cost = tile_cost(current, direction)
             new_cost = cost + edge_cost
             if next_pos in tree:
