@@ -418,6 +418,58 @@ class TileCacheNavigationTests(unittest.TestCase):
         self.assertEqual(bot.supply_path, [new_tile])
         self.assertEqual(bot.supply_plan_cost, 12)
 
+    def test_supply_exploration_approaches_the_ore_entry_not_the_gunner(self) -> None:
+        """The bar-chart fallback must not walk back into a wall-following loop."""
+        bot = IntruderBot(35, 40)
+        current = bot.tile_cache.position_at(13, 14)
+        gunner = bot.tile_cache.position_at(8, 14)
+        ore = bot.tile_cache.position_at(13, 16)
+        entry = bot.tile_cache.position_at(13, 15)
+        assert all((current, gunner, ore, entry))
+        bot.gunner_site = gunner
+        bot.supply_ore = ore
+        bot.known_env.update({
+            current: Environment.EMPTY,
+            entry: Environment.EMPTY,
+            ore: Environment.ORE_TITANIUM,
+        })
+        bot.known_buildings[entry] = (EntityType.ROAD, Team.B)
+
+        moved: list[Direction] = []
+        bot.try_move_step = lambda _controller, direction, **_kwargs: moved.append(direction)
+        with patch("intruder_bot.a_star_to_any", return_value=[entry]) as search:
+            bot.explore_supply_route(None, current)
+
+        self.assertEqual(moved, [Direction.SOUTH])
+        self.assertEqual(search.call_args.args[2], {entry})
+
+    def test_supply_exploration_never_uses_wall_following_when_route_is_unknown(self) -> None:
+        """A missing partial route leaves the Intruder facing the ore, never Gunner."""
+        bot = IntruderBot(20, 20)
+        current = bot.tile_cache.position_at(10, 10)
+        gunner = bot.tile_cache.position_at(5, 10)
+        ore = bot.tile_cache.position_at(10, 12)
+        entry = bot.tile_cache.position_at(10, 11)
+        assert all((current, gunner, ore, entry))
+        bot.gunner_site = gunner
+        bot.supply_ore = ore
+        bot.known_env.update({
+            current: Environment.EMPTY,
+            entry: Environment.EMPTY,
+            ore: Environment.ORE_TITANIUM,
+        })
+        bot.get_cached_position = lambda: current
+        bot.try_move_step = lambda *_args, **_kwargs: False
+
+        with patch("intruder_bot.a_star_to_any", return_value=[]):
+            with patch.object(bot, "move_towards", wraps=bot.move_towards) as move:
+                bot.explore_supply_route(None, current)
+
+        self.assertEqual(move.call_args.args[1], entry)
+        self.assertTrue(move.call_args.kwargs["forward_sector_only"])
+        self.assertTrue(move.call_args.kwargs["require_closer"])
+        self.assertFalse(bot.wall_following)
+
 
 class CoreBootstrapTests(unittest.TestCase):
     def test_core_spawns_intruder_before_the_first_cache_scan(self) -> None:

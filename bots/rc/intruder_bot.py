@@ -78,18 +78,32 @@ class IntruderBot(BaseBot):
         self.gunner_search_destination: Position | None = None
 
         self.supply_ore: Position | None = None
+        # The only supply route is ordered from the Gunner to the selected
+        # ore entry.  The Intruder walks this exact sequence, building each
+        # transport tile before it proceeds farther from the Gunner.
         self.supply_path: list[Position] = []
-        self.supply_travel_path: list[Position] = []
-        self.supply_travel_bridges: dict[Position, Position] = {}
-        self.supply_travel_index = 0
+        # A crossing maps its Gunner-side source to its ore-side landing.
+        # The physical Bridge is built on the landing and outputs back to the
+        # source, so resources still flow from the ore to the Gunner.
+        self.supply_bridge_crossings: dict[Position, Position] = {}
         self.pending_supply_bridge: Position | None = None
         self.supply_directions: dict[Position, Direction] = {}
         self.supply_bridge_targets: dict[Position, Position] = {}
         self.supply_index = 0
+        # Bridge targets are not exposed by TileCache because only the
+        # Intruder's supply planner needs them.  Cache canonical endpoints so
+        # an already built bridge can be used as part of a new supply route.
+        self.known_bridge_targets: dict[Position, Position] = {}
+        self.known_bridge_ids: dict[Position, int] = {}
         self.unavailable_titanium: set[Position] = set()
         self.supply_plan_candidates: list[Position] | None = None
         self.supply_plan_cursor = 0
         self.deferred_supply_candidates: list[Position] = []
+        # While the complete Gunner-to-ore route is still outside vision,
+        # keep approaching one ore entry.  Re-selecting the nearest entry on
+        # every turn can bounce between two adjacent entries around a mine.
+        self.supply_exploration_entry: Position | None = None
+        self.supply_exploring_back_to_gunner = False
         # Once a supply route exists, newly scanned deposits are considered
         # incrementally.  This lets the Intruder abandon an early, distant
         # discovery for a genuinely cheaper route without repeating A* for
@@ -137,6 +151,7 @@ class IntruderBot(BaseBot):
             return
 
         self.update_enemy_knowledge()
+        self.refresh_known_bridge_targets(controller)
         if self.clear_cheap_enemy_building(controller, current):
             self.draw_goal_indicator(controller, current)
             return
@@ -1201,7 +1216,7 @@ class IntruderBot(BaseBot):
         return True
 
     def supply_gunner(self, controller: Controller, current: Position) -> None:
-        """Connect the gunner to the nearest usable titanium harvester or ore deposit."""
+        """Build one Gunner-to-ore supply route, placing transport as we advance."""
         if self.supply_ore is None:
             if not self.select_supply_plan():
                 if self.supply_plan_candidates is not None:
@@ -1211,41 +1226,24 @@ class IntruderBot(BaseBot):
                     return
                 self.search_for_titanium(controller)
                 return
-        else:
+        elif not self.supply_path:
+            # A committed route is a construction contract.  Do not replace
+            # it merely because another deposit becomes visible: doing so
+            # leaves its already placed Gunner-side conveyors as an isolated
+            # fragment and starts the next route somewhere else.
             self.reconsider_supply_plan()
 
-        if not self.ensure_supply_harvester(controller, current):
-            return
         if not self.supply_path:
             plan = self.plan_supply_route(self.supply_ore)
             if plan is None:
                 self.explore_supply_route(controller, current)
                 return
             self.store_supply_plan(self.supply_ore, plan)
-        if self.supply_index >= len(self.supply_path):
-            self.mode = "complete"
+        if not self.follow_supply_path(controller, current):
             return
-
-        tile = self.supply_path[self.supply_index]
-        if self.supply_tile_complete(tile):
-            self.supply_index += 1
+        if not self.ensure_supply_harvester(controller, current):
             return
-        if (
-            tile in self.supply_bridge_targets
-            and current != tile
-            and current.distance_squared(tile) <= GameConstants.ACTION_RADIUS_SQ
-        ):
-            if self.build_supply_tile(controller, tile):
-                self.supply_index += 1
-            return
-        if current != tile:
-            self.move_towards(controller, tile)
-            return
-        if tile in self.supply_bridge_targets:
-            self.step_off_supply_bridge(controller)
-            return
-        if self.build_supply_tile(controller, tile):
-            self.supply_index += 1
+        self.mode = "complete"
 
     def select_supply_plan(self) -> bool:
         """Select the closest usable Ti deposit without unbounded route work."""
@@ -1258,10 +1256,6 @@ class IntruderBot(BaseBot):
                     for pos, env in self.known_env.items()
                     if env == Environment.ORE_TITANIUM
                     and pos not in self.unavailable_titanium
-                    and (
-                        self.known_buildings.get(pos) is None
-                        or self.known_buildings[pos][0] == EntityType.HARVESTER
-                    )
                 ),
                 key=lambda pos: (pos.distance_squared(self.gunner_site), pos.y, pos.x),
             )
@@ -1292,13 +1286,13 @@ class IntruderBot(BaseBot):
             ore = self.deferred_supply_candidates[0]
             self.supply_ore = ore
             self.supply_path = []
-            self.supply_travel_path = []
-            self.supply_travel_bridges = {}
-            self.supply_travel_index = 0
+            self.supply_bridge_crossings = {}
             self.pending_supply_bridge = None
             self.supply_directions = {}
             self.supply_bridge_targets = {}
             self.supply_index = 0
+            self.supply_exploration_entry = None
+            self.supply_exploring_back_to_gunner = False
             self.supply_plan_candidates = None
             self.supply_plan_cursor = 0
             self.deferred_supply_candidates = []
@@ -1323,10 +1317,6 @@ class IntruderBot(BaseBot):
             for pos, env in self.known_env.items()
             if env == Environment.ORE_TITANIUM
             and pos not in self.unavailable_titanium
-            and (
-                self.known_buildings.get(pos) is None
-                or self.known_buildings[pos][0] == EntityType.HARVESTER
-            )
         }
         new_ores = known_ores - self.supply_seen_ores
         if new_ores:
@@ -1362,17 +1352,15 @@ class IntruderBot(BaseBot):
                 int,
             ],
     ) -> None:
-        """Persist a Gunner-origin A* route and reset its conveyor build cursor."""
+        """Persist one Gunner-to-ore A* route and reset its build cursor."""
         path, directions, bridge_targets, cost = plan
         self.supply_ore = ore
         self.supply_seen_ores.update((ore,))
         self.supply_plan_cost = cost
         self.supply_path = path
-        self.supply_travel_path = list(reversed(path))
-        self.supply_travel_bridges = {
-            target: source for source, target in bridge_targets.items()
+        self.supply_bridge_crossings = {
+            source: target for target, source in bridge_targets.items()
         }
-        self.supply_travel_index = 0
         self.pending_supply_bridge = None
         self.supply_directions = directions
         self.supply_bridge_targets = bridge_targets
@@ -1380,16 +1368,144 @@ class IntruderBot(BaseBot):
         self.supply_plan_candidates = None
         self.supply_plan_cursor = 0
         self.deferred_supply_candidates = []
+        self.supply_exploration_entry = None
+        self.supply_exploring_back_to_gunner = False
 
     def explore_supply_route(self, controller: Controller, current: Position) -> None:
-        """Reveal terrain between a harvested deposit and Gunner until A* can join them."""
-        if self.gunner_site is None:
+        """Extend known supply terrain toward an ore entry without wall loops.
+
+        A visible deposit is useful evidence even when the complete
+        Gunner-to-ore A* route has not entered the cache yet.  The previous
+        fallback walked back toward the Gunner and delegated its movement to
+        generic wall following.  At a wall this can produce an endless loop
+        while the deposit is already beside the Intruder.  Instead, approach
+        a known usable neighbour of the deposit, or the closest known supply
+        frontier leading to it.  A subsequent turn retries the full planner
+        and then lays the real conveyors.
+        """
+        target = self.supply_exploration_entry
+        if target is None or not self.is_supply_tile(target):
+            target = (
+                self.supply_route_frontier(current)
+                if self.supply_exploring_back_to_gunner
+                else self.supply_exploration_target(current)
+            )
+            self.supply_exploration_entry = target
+        if target is None:
             return
-        # The harvester now covers the ore tile, so trace back from its edge
-        # toward the Gunner.  Each step refreshes the local cache; the next
-        # turn retries A* and begins construction as soon as a full known
-        # conveyor route exists.
-        self.move_towards(controller, self.gunner_site)
+        if current == target:
+            # Reaching an ore entry does not mean that the Gunner-to-ore path
+            # is known.  Continue revealing terrain back toward the Gunner;
+            # otherwise a failed A* plan selects this same entry every turn
+            # and leaves the Intruder stationary beside the deposit.
+            self.supply_exploring_back_to_gunner = True
+            target = self.supply_route_frontier(current)
+            self.supply_exploration_entry = target
+            if target is None:
+                return
+
+        path = a_star_to_any(
+            None,
+            current,
+            {target},
+            lambda _controller, pos: self.is_roadable_position(pos),
+            self.tile_cache.neighbor,
+            movement_directions=DIRECTIONS,
+            max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
+        )
+        if path:
+            self.try_move_step(
+                controller,
+                current.direction_to(path[0]),
+                build_road=True,
+            )
+            return
+
+        # A partial cache may not yet contain a complete route.  Probe only
+        # steps which move closer to the ore-side target; unlike
+        # ``move_towards`` this never activates wall following or retreats to
+        # the Gunner.
+        self.move_towards(
+            controller,
+            target,
+            forward_sector_only=True,
+            require_closer=True,
+        )
+
+    def supply_route_frontier(self, current: Position) -> Position | None:
+        """Pick an unseen-map frontier which tends back toward the Gunner."""
+        if self.gunner_site is None:
+            return None
+        frontiers = [
+            pos
+            for pos in self.known_env
+            if pos != current
+            and pos not in self.visited_tiles
+            and self.is_roadable_position(pos)
+            and any(
+                neighbor is not None and neighbor not in self.known_env
+                for direction in DIRECTIONS
+                if (neighbor := self.tile_cache.neighbor(pos, direction)) is not None
+            )
+        ]
+        if not frontiers:
+            return None
+        gunner_side = [
+            pos
+            for pos in frontiers
+            if pos.distance_squared(self.gunner_site)
+            < current.distance_squared(self.gunner_site)
+        ]
+        candidates = gunner_side or frontiers
+        return min(
+            candidates,
+            key=lambda pos: (
+                current.distance_squared(pos),
+                pos.distance_squared(self.gunner_site),
+                pos.y,
+                pos.x,
+            ),
+        )
+
+    def supply_exploration_target(self, current: Position) -> Position | None:
+        """Choose the nearest known supply entry or frontier for ``supply_ore``."""
+        ore = self.supply_ore
+        if ore is None:
+            return None
+
+        entries = [
+            entry
+            for direction in ORTHOGONAL_DIRECTIONS
+            if (entry := self.tile_cache.neighbor(ore, direction)) is not None
+            and self.is_supply_tile(entry)
+        ]
+        if entries:
+            return min(
+                entries,
+                key=lambda pos: (current.distance_squared(pos), pos.y, pos.x),
+            )
+
+        frontiers = [
+            pos
+            for pos in self.known_env
+            if self.is_supply_tile(pos)
+            and any(
+                neighbor is not None and self.known_env.get(neighbor) is None
+                for direction in ORTHOGONAL_DIRECTIONS
+                if (neighbor := self.tile_cache.neighbor(pos, direction)) is not None
+            )
+        ]
+        if not frontiers:
+            return None
+        return min(
+            frontiers,
+            key=lambda pos: (
+                pos.distance_squared(ore),
+                current.distance_squared(pos),
+                pos.y,
+                pos.x,
+            ),
+        )
 
     def plan_supply_route(
             self,
@@ -1428,39 +1544,84 @@ class IntruderBot(BaseBot):
             bridge_step_cost=_SUPPLY_BRIDGE_STEP_COST,
             neighbor_fn=self.tile_cache.neighbor,
             max_expansions=_SUPPLY_BRIDGE_SEARCH_EXPANSIONS,
-            bridge_landing_fn=lambda _controller, pos: self.is_cached_tile_passable(pos),
+            bridge_landing_fn=lambda _controller, pos: self.is_supply_bridge_landing(pos),
+            existing_bridge_crossings=self.known_supply_bridge_crossings(),
         )
         if travel_plan is None:
             return None
-        travel_path, travel_bridge_targets, cost = travel_plan
-        path = list(reversed(travel_path))
+        path, new_bridge_crossings, cost = travel_plan
         bridge_targets = {
-            target: source for source, target in travel_bridge_targets.items()
+            target: source for source, target in new_bridge_crossings.items()
         }
+        known_crossings = self.known_supply_bridge_crossings()
+        for source, target in zip(path, path[1:]):
+            if known_crossings.get(source) == target:
+                bridge_targets[target] = source
         directions = {
-            tile: tile.direction_to(path[index + 1] if index + 1 < len(path) else self.gunner_site)
+            tile: tile.direction_to(
+                self.gunner_site if index == 0 else path[index - 1]
+            )
             for index, tile in enumerate(path)
             if tile not in bridge_targets
         }
         return path, directions, bridge_targets, cost
 
     def is_supply_tile(self, pos: Position) -> bool:
-        """Allow known ground that can become a conveyor, including enemy logistics.
+        """Allow a known route tile, including replaceable enemy logistics.
 
-        An enemy road or conveyor is a valid route cell: the Intruder can
-        stand on it, fire at it from that cell, then replace it with a
-        friendly conveyor.  Other foreign infrastructure remains excluded
-        because it cannot be safely converted while preserving the branch's
-        direction.
+        A known Bridge remains a route tile only when its cached endpoint can
+        be used as a supply crossing.  Roads and conveyors are deliberately
+        admitted independent of owner: while standing on a foreign transport
+        tile the Intruder can destroy it and replace it with its own conveyor.
         """
+        env = self.known_env.get(pos)
+        if env is None or env in {Environment.WALL, Environment.ORE_TITANIUM, Environment.ORE_AXIONITE}:
+            return False
+        building = self.known_buildings.get(pos)
+        return (
+            building is None
+            or building[0] in _CLEARABLE_WALKABLE_BUILDINGS
+            or (
+                building[0] == EntityType.BRIDGE
+                and pos in self.known_bridge_targets
+            )
+        )
+
+    def is_supply_bridge_landing(self, pos: Position) -> bool:
+        """Return whether a new supply Bridge may be installed on ``pos``."""
         env = self.known_env.get(pos)
         if env is None or env in {Environment.WALL, Environment.ORE_TITANIUM, Environment.ORE_AXIONITE}:
             return False
         building = self.known_buildings.get(pos)
         return building is None or building[0] in _CLEARABLE_WALKABLE_BUILDINGS
 
+    def known_supply_bridge_crossings(self) -> dict[Position, Position]:
+        """Map each existing Bridge's Gunner-side endpoint to its landing tile."""
+        return {
+            target: bridge
+            for bridge, target in self.known_bridge_targets.items()
+            if self.known_buildings.get(bridge) is not None
+            and self.known_buildings[bridge][0] == EntityType.BRIDGE
+        }
+
+    def refresh_known_bridge_targets(self, controller: Controller) -> None:
+        """Cache endpoints for visible Bridges so supply planning can reuse them."""
+        for pos in self.tile_cache.visible_tiles:
+            building = self.known_buildings.get(pos)
+            if building is None or building[0] != EntityType.BRIDGE:
+                self.known_bridge_targets.pop(pos, None)
+                self.known_bridge_ids.pop(pos, None)
+                continue
+            building_id = self.tile_cache.building_id_at(pos)
+            if building_id is None or self.known_bridge_ids.get(pos) == building_id:
+                continue
+            self.known_bridge_targets[pos] = self.tile_cache.canonicalize(
+                controller.get_bridge_target(building_id)
+            )
+            self.known_bridge_ids[pos] = building_id
+
     def ensure_supply_harvester(self, controller: Controller, current: Position) -> bool:
-        """Reuse an occupied Ti harvester or build our own before laying its branch."""
+        """Reuse an occupied Ti harvester, or build one from the route endpoint."""
         if self.supply_ore is None:
             return False
         building = self.known_buildings.get(self.supply_ore)
@@ -1473,10 +1634,6 @@ class IntruderBot(BaseBot):
             self.reset_supply_plan()
             return False
         if current.distance_squared(self.supply_ore) > GameConstants.ACTION_RADIUS_SQ:
-            if self.supply_travel_path:
-                self.follow_supply_travel_path(controller, current)
-            else:
-                self.explore_supply_route(controller, current)
             return False
         if not controller.can_build_harvester(self.supply_ore):
             return False
@@ -1487,79 +1644,117 @@ class IntruderBot(BaseBot):
             EntityType.HARVESTER,
             self.team,
         )
-        return False
+        return True
 
-    def follow_supply_travel_path(self, controller: Controller, current: Position) -> bool:
-        """Follow the saved Gunner-to-ore A* route instead of greedily chasing ore."""
-        if not self.supply_travel_path:
+    def follow_supply_path(self, controller: Controller, current: Position) -> bool:
+        """Advance exactly along the Gunner-to-ore route, building as we go.
+
+        ``True`` means every route tile is now in place and the Intruder is
+        standing on the ore-side endpoint.  Any movement, construction,
+        launcher crossing, or blocked rejoin consumes this turn and returns
+        ``False`` so the next round resumes from the same route state.
+        """
+        if not self.supply_path:
             return False
         if self.finish_pending_supply_bridge(controller, current):
-            return True
+            return False
+        self.advance_supply_index()
+        if self.supply_index >= len(self.supply_path):
+            if current == self.supply_path[-1]:
+                return True
+            self.rejoin_supply_path(controller, current, self.supply_path[-1])
+            return False
         try:
-            index = self.supply_travel_path.index(current)
+            index = self.supply_path.index(current)
         except ValueError:
-            # A launcher should use the exact endpoint below.  Keep this
-            # fallback defensive nevertheless: an unexpected displacement
-            # must rejoin only the *remaining* suffix, never walk all the way
-            # back to the Gunner-side beginning of the route.
-            remaining = set(self.supply_travel_path[self.supply_travel_index:])
-            if not remaining:
-                return False
-            approach = a_star_to_any(
-                None,
-                current,
-                remaining,
-                lambda _controller, pos: self.is_roadable_position(pos),
-                self.tile_cache.neighbor,
-                movement_directions=DIRECTIONS,
-                max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
-            )
-            if not approach:
-                return False
-            return self.move_to_supply_route_tile(
+            self.rejoin_supply_path(
                 controller,
                 current,
-                approach[0],
+                self.supply_path[self.supply_index],
             )
-        self.supply_travel_index = max(self.supply_travel_index, index)
-
-        # Build each ordinary conveyor while travelling away from the Gunner.
-        # Its direction points to the preceding travel node, i.e. back toward
-        # the Gunner.  Thus infrastructure on the Gunner side of a bridge is
-        # already complete before a Launcher crosses that wall.
-        if current in self.supply_directions and not self.supply_tile_complete(current):
-            self.build_supply_tile(controller, current)
-            return True
-        if index + 1 >= len(self.supply_travel_path):
             return False
-        next_pos = self.supply_travel_path[index + 1]
+        if index > self.supply_index:
+            # Scouting can cross a far route cell before its Gunner-side
+            # prefix exists.  Do not promote the cursor to that position: go
+            # back to the first missing tile and resume construction there.
+            self.rejoin_supply_path(
+                controller,
+                current,
+                self.supply_path[self.supply_index],
+            )
+            return False
+
         if current in self.supply_bridge_targets and not self.supply_tile_complete(current):
-            # The Launcher has just deposited us on the far bridge endpoint.
-            # A foreign road on that endpoint must be fired at while we are
-            # still standing on it: BuilderBots cannot attack an adjacent
-            # road.  Do not step off until it has been completely removed.
-            self.pending_supply_bridge = current
+            # A Builder cannot create the ore-side Bridge underneath itself.
+            # Clear a replaceable foreign transport tile first, then walk one
+            # exact route step away and create the Bridge behind it.
             if self.known_buildings.get(current) is not None:
                 self.build_supply_tile(controller, current)
-                return True
-            # A Builder cannot erect a Bridge underneath itself.  Once the
-            # landing cell is clear, step exactly one A* tile toward the ore;
-            # ``finish_pending_supply_bridge`` will create the Bridge behind
-            # us on the following turn.
-            return self.move_to_supply_route_tile(controller, current, next_pos)
-        if self.supply_travel_bridges.get(current) == next_pos:
+                return False
+            self.pending_supply_bridge = current
+            if index + 1 < len(self.supply_path):
+                self.move_to_supply_route_tile(
+                    controller,
+                    current,
+                    self.supply_path[index + 1],
+                )
+            else:
+                self.step_off_supply_bridge(controller)
+            return False
+
+        # Lay the final conveyor before moving farther from the Gunner.  Its
+        # direction points to the preceding route node, preserving ore-to-
+        # Gunner resource flow while the Intruder travels in the opposite way.
+        if current in self.supply_directions and not self.supply_tile_complete(current):
+            self.build_supply_tile(controller, current)
+            return False
+        if index + 1 >= len(self.supply_path):
+            return True
+        next_pos = self.supply_path[index + 1]
+        if self.supply_bridge_crossings.get(current) == next_pos:
             direction = current.direction_to(next_pos)
-            launched = self.start_launcher_crossing(
+            self.start_launcher_crossing(
                 controller,
                 current,
                 direction,
                 next_pos,
                 exact_landing=True,
             )
-            if launched:
-                self.supply_travel_index = index + 1
-            return launched
-        return self.move_to_supply_route_tile(controller, current, next_pos)
+            return False
+        self.move_to_supply_route_tile(controller, current, next_pos)
+        return False
+
+    def advance_supply_index(self) -> None:
+        """Keep the cursor on the first route tile not yet in final form."""
+        while (
+            self.supply_index < len(self.supply_path)
+            and self.supply_tile_complete(self.supply_path[self.supply_index])
+        ):
+            self.supply_index += 1
+
+    def rejoin_supply_path(
+            self,
+            controller: Controller,
+            current: Position,
+            target: Position,
+    ) -> None:
+        """Walk back to one required route cell without laying a later conveyor."""
+        approach = a_star_to_any(
+            None,
+            current,
+            {target},
+            lambda _controller, pos: self.is_roadable_position(pos),
+            self.tile_cache.neighbor,
+            movement_directions=DIRECTIONS,
+            max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
+        )
+        if approach:
+            self.move_to_supply_route_tile(
+                controller,
+                current,
+                approach[0],
+                construct_supply_tile=False,
+            )
 
     def finish_pending_supply_bridge(self, controller: Controller, current: Position) -> bool:
         """Build the physical Bridge immediately after crossing its A* jump.
@@ -1603,6 +1798,7 @@ class IntruderBot(BaseBot):
             controller: Controller,
             current: Position,
             target: Position,
+            construct_supply_tile: bool = True,
     ) -> bool:
         """Build a planned conveyor before entering its tile, never a temporary road.
 
@@ -1619,7 +1815,8 @@ class IntruderBot(BaseBot):
         is_planned_tile = target in self.supply_path
         building = self.known_buildings.get(target)
         if (
-            is_planned_tile
+            construct_supply_tile
+            and is_planned_tile
             and building is not None
             and building[0] in _CLEARABLE_WALKABLE_BUILDINGS
             and building[1] != self.team
@@ -1628,26 +1825,43 @@ class IntruderBot(BaseBot):
             # First enter the usable enemy logistics tile; subsequent turns
             # will remove it and replace it with our conveyor.
             return self.try_move_step(controller, direction, build_road=False)
-        if is_planned_tile and not self.supply_tile_complete(target):
+        if (
+            construct_supply_tile
+            and is_planned_tile
+            and not self.supply_tile_complete(target)
+        ):
             if not self.build_supply_tile(controller, target):
                 return False
         return self.try_move_step(
             controller,
             direction,
-            build_road=not is_planned_tile,
+            build_road=not (construct_supply_tile and is_planned_tile),
         )
 
     def supply_tile_complete(self, tile: Position) -> bool:
         """Return whether the planned friendly conveyor or bridge already occupies ``tile``."""
         building = self.known_buildings.get(tile)
-        if building is None or building[1] != self.team:
+        if building is None:
             return False
-        expected = (
-            EntityType.BRIDGE
-            if tile in self.supply_bridge_targets
-            else EntityType.CONVEYOR
+        bridge_target = self.supply_bridge_targets.get(tile)
+        if bridge_target is not None:
+            # Resources may cross team boundaries, so a pre-existing bridge
+            # with the exact ore-to-Gunner endpoint is reusable regardless of
+            # owner.  A differently aimed bridge never enters this route.
+            return (
+                building[0] == EntityType.BRIDGE
+                and self.known_bridge_targets.get(tile) == bridge_target
+            )
+        direction = self.supply_directions.get(tile)
+        if direction is None:
+            return False
+        building_id = self.tile_cache.building_id_at(tile)
+        return (
+            building[0] == EntityType.CONVEYOR
+            and building[1] == self.team
+            and building_id is not None
+            and self.tile_cache.entity_direction(building_id) == direction
         )
-        return building[0] == expected
 
     def step_off_supply_bridge(self, controller: Controller) -> bool:
         """Vacate a bridge tile so the Builder can construct that bridge next turn."""
@@ -1662,7 +1876,6 @@ class IntruderBot(BaseBot):
         building = self.known_buildings.get(tile)
         bridge_target = self.supply_bridge_targets.get(tile)
         wants_bridge = bridge_target is not None
-        expected_type = EntityType.BRIDGE if wants_bridge else EntityType.CONVEYOR
         if self.supply_tile_complete(tile):
             return True
         if building is not None:
@@ -1686,6 +1899,8 @@ class IntruderBot(BaseBot):
                 return False
             bridge_id = controller.build_bridge(tile, bridge_target)
             self.tile_cache.remember_building(tile, bridge_id, EntityType.BRIDGE, self.team)
+            self.known_bridge_targets[tile] = bridge_target
+            self.known_bridge_ids[tile] = bridge_id
             return True
         direction = self.supply_directions.get(tile)
         if direction is None:
@@ -1707,9 +1922,7 @@ class IntruderBot(BaseBot):
         """Forget an invalid route so the next turn can choose another Ti source."""
         self.supply_ore = None
         self.supply_path = []
-        self.supply_travel_path = []
-        self.supply_travel_bridges = {}
-        self.supply_travel_index = 0
+        self.supply_bridge_crossings = {}
         self.pending_supply_bridge = None
         self.supply_directions = {}
         self.supply_bridge_targets = {}
@@ -1717,19 +1930,78 @@ class IntruderBot(BaseBot):
         self.supply_plan_candidates = None
         self.supply_plan_cursor = 0
         self.deferred_supply_candidates = []
+        self.supply_exploration_entry = None
+        self.supply_exploring_back_to_gunner = False
         self.supply_seen_ores = set()
         self.supply_replan_candidates = []
         self.supply_plan_cost = None
 
     def search_for_titanium(self, controller: Controller) -> None:
-        """Explore away from the enemy core until a cached titanium source becomes visible."""
+        """Explore the Gunner's rear-side frontier until titanium becomes visible.
+
+        This is reconnaissance, not supply-line construction.  It uses a
+        bounded A* path through known terrain instead of repeatedly walking
+        in one absolute direction; a wall at the edge of the map otherwise
+        strands the Intruder after it has built a trail of roads.
+        """
         if self.gunner_direction is None:
             return
-        dx, dy = self.gunner_direction.opposite().delta()
         current = self.get_cached_position()
-        target = self.tile_cache.position_at(
-            min(self.map_width - 1, max(0, current.x + dx * self.map_width)),
-            min(self.map_height - 1, max(0, current.y + dy * self.map_height)),
+        target = self.supply_search_frontier(current)
+        if target is None:
+            return
+        path = a_star_to_any(
+            None,
+            current,
+            {target},
+            lambda _controller, pos: self.is_roadable_position(pos),
+            self.tile_cache.neighbor,
+            movement_directions=DIRECTIONS,
+            max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
         )
-        if target is not None:
-            self.move_towards(controller, target)
+        if not path:
+            return
+        self.try_move_step(
+            controller,
+            current.direction_to(path[0]),
+            build_road=True,
+        )
+
+    def supply_search_frontier(self, current: Position) -> Position | None:
+        """Choose a reachable cache frontier on the resource side of the Gunner."""
+        if self.gunner_site is None or self.gunner_direction is None:
+            return None
+        dx, dy = self.gunner_direction.opposite().delta()
+        frontiers = [
+            pos
+            for pos in self.known_env
+            if pos != current
+            and self.is_roadable_position(pos)
+            and any(
+                neighbor is not None and neighbor not in self.known_env
+                for direction in DIRECTIONS
+                if (neighbor := self.tile_cache.neighbor(pos, direction)) is not None
+            )
+        ]
+        if not frontiers:
+            return None
+
+        def resource_side(pos: Position) -> bool:
+            return (
+                (pos.x - self.gunner_site.x) * dx
+                + (pos.y - self.gunner_site.y) * dy
+            ) >= 0
+
+        candidates = [pos for pos in frontiers if resource_side(pos)] or frontiers
+        return min(
+            candidates,
+            key=lambda pos: (
+                current.distance_squared(pos),
+                -(
+                    (pos.x - self.gunner_site.x) * dx
+                    + (pos.y - self.gunner_site.y) * dy
+                ),
+                pos.y,
+                pos.x,
+            ),
+        )
