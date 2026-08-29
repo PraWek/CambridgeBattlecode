@@ -16,75 +16,27 @@ $projectRoot = $PSScriptRoot
 # Maps to run, in match order.  Edit this list to add, remove, or reorder maps.
 # Keep the .map26 extension so a missing map is reported clearly before a match starts.
 [string[]]$MapFiles = @(
-    "arena.map26",
-    "bar_chart.map26",
-    "battlebot.map26",
-    "binary_tree.map26", # loser
     "building_blocks.map26", # loser
     "butterfly.map26", # loser
-    "castle_keep.map26",
     "chemistry_class.map26",
-    "chess.map26",
-    "chrysanthemum.map26",
-    "cinnamon_roll.map26",
     "clash_arena.map26", # loser
-    "climbing_wall.map26",
-    "coffee.map26",
-    "cold.map26",
-    "corridors.map26",
-    "craters.map26", # loser
-    "cubes.map26",
     "default_large1.map26",
-    "default_large2.map26",
-    "default_medium1.map26",
-    "default_medium2.map26", # loser
     "default_small1.map26", # loser
-    "default_small2.map26",
-    "dna.map26",
-    "donut.map26",
-    "drawing_circles_is_hard.map26",
     "face.map26", # loser
     "first_sound.map26",
     "flappy_bird.map26", # loser
-    "flowers.map26", # loser
-    "galaxy.map26",
-    "gaussian.map26",
-    "git_branches.map26",
-    "hooks.map26", # loser
-    "hopscotch.map26",
     "hourglass.map26", # loser
-    "labyrinth.map26", # loser
     "landscape.map26", # loser
-    "mandelbrot.map26", # loser
-    "metropolitan_dystopia.map26", # loser
-    "minimaze.map26", # loser
-    "parchment.map26", # loser
-    "perch_point.map26", # loser
     "pixel_forest.map26", # loser
-    "pls_buy_cucats_merch.map26",
     "pong.map26", # loser
     "rush_bait.map26", # loser
     "separated.map26",
-    "settlement.map26",
-    "shish_kebab.map26", # loser
-    "shrub.map26", # loser
-    "sierpinski_evil.map26",
     "socket.map26", # loser
     "spikes.map26", # loser
     "starry_night.map26", # loser
-    "strangecurves.map26",
-    "strings.map26",
-    "tea.map26",
     "the_great_divide.map26", # loser
-    "the_powerful_egg.map26",
     "thread_of_connection.map26", # loser
-    "tiles.map26", # loser
-    "tree_of_life.map26", # loser
     "vase.map26", # loser
-    "wall.map26",
-    "wasteland_oasis.map26", # loser
-    "wasteland.map26",
-    "we_love_tetris.map26",
     "window_shopping.map26" # loser
 )
 

@@ -150,6 +150,7 @@ def a_star_from_any_with_bridges(
         neighbor_fn,
         max_expansions: int | None = None,
         bridge_landing_fn=None,
+        existing_bridge_crossings: dict[Position, Position] | None = None,
 ) -> tuple[list[Position], dict[Position, Position], int] | None:
     """Find an A* route from ``starts`` to ``goals`` with short bridge jumps.
 
@@ -159,8 +160,10 @@ def a_star_from_any_with_bridges(
     currently walkable landing cell; a Launcher cannot throw a Builder onto
     bare ground.  The returned path includes both endpoints;
     ``bridge_targets[source]`` records every jump.  The caller can use the
-    same route for walking from its first endpoint and for laying conveyors
-    back in the reverse direction.
+    same route for walking from its first endpoint and for laying conveyors.
+    ``existing_bridge_crossings`` maps a pre-existing Bridge's source endpoint
+    to its landing endpoint; those crossings are reused at zero construction
+    cost and are not returned as new ``bridge_targets``.
     """
     if not starts or not goals:
         return None
@@ -250,5 +253,27 @@ def a_star_from_any_with_bridges(
                     (new_cost + heuristic, new_cost, sequence, bridge_target),
                 )
                 sequence += 1
+
+        existing_landing = (
+            None
+            if existing_bridge_crossings is None
+            else existing_bridge_crossings.get(current)
+        )
+        if (
+            existing_landing is not None
+            and traversable_fn(controller, existing_landing)
+            and cost < g_score.get(existing_landing, LARGE_NUMBER)
+        ):
+            g_score[existing_landing] = cost
+            came_from[existing_landing] = (current, False)
+            heuristic = normal_step_cost * min(
+                abs(existing_landing.x - goal.x) + abs(existing_landing.y - goal.y)
+                for goal in goals
+            )
+            heappush(
+                queue,
+                (cost + heuristic, cost, sequence, existing_landing),
+            )
+            sequence += 1
 
     return None
