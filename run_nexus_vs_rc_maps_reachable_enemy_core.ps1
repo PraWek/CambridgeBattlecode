@@ -7,7 +7,14 @@ param(
     # Each match needs its own replay so a later game cannot overwrite it.
     [string]$ReplayDir = "replays/nexus-vs-rc",
 
-    [int]$Seed = 1
+    [int]$Seed = 1,
+
+    # Maximum number of matches that may run at once.
+    [ValidateRange(1, 64)]
+    [int]$ThrottleLimit = 4,
+
+    # CSV containing completed match results. Relative paths use the project root.
+    [string]$ResultsCsv = "replays/nexus-vs-rc/nexus-vs-rc-results.csv"
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,29 +23,29 @@ $projectRoot = $PSScriptRoot
 # Maps to run, in match order.  Edit this list to add, remove, or reorder maps.
 # Keep the .map26 extension so a missing map is reported clearly before a match starts.
 [string[]]$MapFiles = @(
-    "building_blocks.map26", # loser
-    "butterfly.map26", # loser
     "chemistry_class.map26",
-    "clash_arena.map26", # loser
     "default_large1.map26",
-    "default_small1.map26", # loser
-    "face.map26", # loser
-    "first_sound.map26",
-    "flappy_bird.map26", # loser
-    "hourglass.map26", # loser
-    "landscape.map26", # loser
-    "pixel_forest.map26", # loser
-    "pong.map26", # loser
-    "rush_bait.map26", # loser
+    "default_small1.map26",
+    "face.map26",
+    "first_sound.map26"
+    "flappy_bird.map26",
+    "hourglass.map26",
+    "landscape.map26",
+    "pixel_forest.map26",
+    "pong.map26",
+    "rush_bait.map26",
     "separated.map26",
-    "socket.map26", # loser
-    "spikes.map26", # loser
-    "starry_night.map26", # loser
-    "the_great_divide.map26", # loser
-    "thread_of_connection.map26", # loser
-    "vase.map26", # loser
-    "window_shopping.map26" # loser
-)
+    "socket.map26",
+    "spikes.map26",
+    "starry_night.map26",
+    "the_great_divide.map26",
+    "thread_of_connection.map26",
+    "vase.map26",
+    "window_shopping.map26",
+    # Keep this sentinel: it lets the preceding map retain its comma when it
+    # becomes the final active entry after maps below it are commented out.
+    $null
+) | Where-Object { $null -ne $_ }
 
 function Resolve-ProjectPath([string]$Path) {
     if ([System.IO.Path]::IsPathRooted($Path)) {
@@ -73,6 +80,7 @@ function Find-Cambc {
 
 $mapsPath = Resolve-ProjectPath $MapsDir
 $replaysPath = Resolve-ProjectPath $ReplayDir
+$resultsCsvPath = Resolve-ProjectPath $ResultsCsv
 
 if (-not (Test-Path -LiteralPath $mapsPath -PathType Container)) {
     throw "Maps directory does not exist: $mapsPath"
@@ -95,52 +103,211 @@ if ($maps.Count -eq 0) {
 
 $cambc = Find-Cambc
 New-Item -ItemType Directory -Path $replaysPath -Force | Out-Null
+New-Item -ItemType Directory -Path (Split-Path -Parent $resultsCsvPath) -Force | Out-Null
 
-$rcLosses = [System.Collections.Generic.List[object]]::new()
-$incompleteMaps = [System.Collections.Generic.List[string]]::new()
+$matchJobScript = {
+    param(
+        [int]$Index,
+        [int]$Total,
+        [string]$ProjectRoot,
+        [string]$Cambc,
+        [string]$MapName,
+        [string]$MapPath,
+        [string]$ReplayName,
+        [string]$ReplayPath,
+        [int]$Seed
+    )
 
-Push-Location $projectRoot
-try {
-    for ($index = 0; $index -lt $maps.Count; $index++) {
-        $map = $maps[$index]
-        $replayName = "{0}_seed{1}.replay26" -f $map.BaseName, $Seed
-        $replayPath = Join-Path $replaysPath $replayName
-
-        Write-Host ("`n[{0}/{1}] nexus vs rc on {2}" -f ($index + 1), $maps.Count, $map.Name)
+    try {
+        # Bot names used by cambc are resolved relative to the project root.
+        Set-Location -LiteralPath $ProjectRoot
 
         # Match the production per-turn CPU limit instead of running without TLE.
-        $matchOutput = & $cambc run nexus rc $map.FullName --replay $replayPath --seed $Seed --tle 2 2>&1
+        $matchOutput = @(& $Cambc run nexus rc $MapPath --replay $ReplayPath --seed $Seed --tle 2 2>&1)
         $exitCode = $LASTEXITCODE
-        $matchOutput | ForEach-Object { Write-Host $_ }
-
         $summary = $matchOutput | Out-String
         $winnerMatch = [regex]::Match($summary, "(?im)^\s*Winner:\s*(?<winner>[^\s(]+)")
+        $winner = if ($winnerMatch.Success) { $winnerMatch.Groups["winner"].Value } else { $null }
 
-        if ($exitCode -ne 0 -or -not $winnerMatch.Success) {
-            $incompleteMaps.Add($map.Name)
-            Write-Warning "Could not determine the winner for $($map.Name). Replay (if created): $replayPath"
-            continue
+        [PSCustomObject]@{
+            Index      = $Index
+            Total      = $Total
+            Map        = $MapName
+            Replay     = $ReplayName
+            ReplayPath = $ReplayPath
+            ExitCode   = $exitCode
+            Winner     = $winner
+            Completed  = ($exitCode -eq 0 -and $winnerMatch.Success)
+            Output     = $summary
+            Error      = $null
+        }
+    }
+    catch {
+        [PSCustomObject]@{
+            Index      = $Index
+            Total      = $Total
+            Map        = $MapName
+            Replay     = $ReplayName
+            ReplayPath = $ReplayPath
+            ExitCode   = $null
+            Winner     = $null
+            Completed  = $false
+            Output     = ""
+            Error      = $_.Exception.Message
+        }
+    }
+}
+
+function Receive-MatchJobResult {
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.Job]$Job
+    )
+
+    try {
+        $jobResults = @(Receive-Job -Job $Job -ErrorAction Stop)
+        if ($jobResults.Count -ne 1) {
+            throw "Expected one result from match job '$($Job.Name)', got $($jobResults.Count)."
         }
 
-        $winner = $winnerMatch.Groups["winner"].Value
-        if ($winner -ieq "rc") {
-            Write-Host "RC won."
-            continue
+        return $jobResults[0]
+    }
+    catch {
+        return [PSCustomObject]@{
+            Index      = $Job.MatchIndex
+            Total      = $Job.MatchTotal
+            Map        = $Job.MapName
+            Replay     = $Job.ReplayName
+            ReplayPath = $Job.ReplayPath
+            ExitCode   = $null
+            Winner     = $null
+            Completed  = $false
+            Output     = ""
+            Error      = $_.Exception.Message
+        }
+    }
+    finally {
+        Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Complete-MatchJob {
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.Job]$Job,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$CompletedMatches,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$RcLosses,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[string]]$IncompleteMaps
+    )
+
+    $matchResult = Receive-MatchJobResult $Job
+    Write-Host ("`n[{0}/{1}] nexus vs rc on {2}" -f $matchResult.Index, $matchResult.Total, $matchResult.Map)
+    if ($matchResult.Output) {
+        Write-Host $matchResult.Output.TrimEnd()
+    }
+
+    if (-not $matchResult.Completed) {
+        $IncompleteMaps.Add($matchResult.Map)
+        $errorDetails = if ($matchResult.Error) { ": $($matchResult.Error)" } else { "" }
+        Write-Warning "Could not determine the winner for $($matchResult.Map). Replay (if created): $($matchResult.ReplayPath)$errorDetails"
+        return
+    }
+
+    $result = if ($matchResult.Winner -ieq "rc") { "RC won" } else { "RC lost" }
+    $completedMatch = [PSCustomObject]@{
+        Index  = $matchResult.Index
+        Map    = $matchResult.Map
+        Replay = $matchResult.Replay
+        Winner = $matchResult.Winner
+        Result = $result
+    }
+    $CompletedMatches.Add($completedMatch)
+
+    if ($matchResult.Winner -ieq "rc") {
+        Write-Host "RC won."
+        return
+    }
+
+    $RcLosses.Add([PSCustomObject]@{
+        Map    = $matchResult.Map
+        Replay = $matchResult.ReplayPath
+    })
+    Write-Host "RC lost. Replay: $($matchResult.ReplayPath)" -ForegroundColor Red
+}
+
+$rcLosses = [System.Collections.Generic.List[object]]::new()
+$completedMatches = [System.Collections.Generic.List[object]]::new()
+$incompleteMaps = [System.Collections.Generic.List[string]]::new()
+$runningJobs = @()
+
+try {
+    $nextIndex = 0
+    while ($nextIndex -lt $maps.Count -or $runningJobs.Count -gt 0) {
+        while ($nextIndex -lt $maps.Count -and $runningJobs.Count -lt $ThrottleLimit) {
+            $map = $maps[$nextIndex]
+            $matchIndex = $nextIndex + 1
+            $replayName = "{0}_seed{1}.replay26" -f $map.BaseName, $Seed
+            $replayPath = Join-Path $replaysPath $replayName
+
+            $job = Start-Job -Name ("nexus-vs-rc-{0}" -f $matchIndex) -ScriptBlock $matchJobScript -ArgumentList @(
+                $matchIndex,
+                $maps.Count,
+                $projectRoot,
+                $cambc,
+                $map.Name,
+                $map.FullName,
+                $replayName,
+                $replayPath,
+                $Seed
+            )
+            $job | Add-Member -NotePropertyName MatchIndex -NotePropertyValue $matchIndex
+            $job | Add-Member -NotePropertyName MatchTotal -NotePropertyValue $maps.Count
+            $job | Add-Member -NotePropertyName MapName -NotePropertyValue $map.Name
+            $job | Add-Member -NotePropertyName ReplayName -NotePropertyValue $replayName
+            $job | Add-Member -NotePropertyName ReplayPath -NotePropertyValue $replayPath
+            $runningJobs += $job
+            Write-Host ("Started [{0}/{1}] nexus vs rc on {2}" -f $matchIndex, $maps.Count, $map.Name)
+            $nextIndex++
         }
 
-        # A completed game always has one winner.  Anything other than rc is
-        # therefore an unsuccessful game for rc; print an absolute replay path.
-        $absoluteReplayPath = [System.IO.Path]::GetFullPath($replayPath)
-        $rcLosses.Add([PSCustomObject]@{
-            Map    = $map.Name
-            Replay = $absoluteReplayPath
-        })
-        Write-Host "RC lost. Replay: $absoluteReplayPath" -ForegroundColor Red
+        if ($runningJobs.Count -gt 0) {
+            $finishedJob = Wait-Job -Job $runningJobs -Any
+            Complete-MatchJob $finishedJob $completedMatches $rcLosses $incompleteMaps
+            $runningJobs = @($runningJobs | Where-Object { $_.Id -ne $finishedJob.Id })
+        }
     }
 }
 finally {
-    Pop-Location
+    foreach ($job in $runningJobs) {
+        if ($job.State -eq "Running") {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+        }
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
 }
+
+$csvRows = @(
+    $completedMatches |
+        Sort-Object Index |
+        Select-Object Map, Replay, Winner, Result
+)
+if ($csvRows.Count -gt 0) {
+    $csvRows | Export-Csv -LiteralPath $resultsCsvPath -NoTypeInformation -Encoding UTF8
+}
+else {
+    # Still leave a valid CSV with its schema when every match is incomplete.
+    '"Map","Replay","Winner","Result"' | Set-Content -LiteralPath $resultsCsvPath -Encoding UTF8
+}
+Write-Host ("`nРезультаты {0} завершённых матчей сохранены в: {1}" -f $completedMatches.Count, $resultsCsvPath)
 
 Write-Host "`n=== Сводка ==="
 if ($rcLosses.Count -eq 0) {
