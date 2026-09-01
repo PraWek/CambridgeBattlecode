@@ -1,3 +1,4 @@
+from collections import deque
 from heapq import heappop, heappush
 
 from cambc import Controller, Position
@@ -70,3 +71,63 @@ def a_star_to_any(
             heappush(queue, (new_cost + heuristic, new_cost, next_pos))
 
     return []
+
+
+def breadth_first_sweep_path(
+        start: Position,
+        traversable_fn,
+        neighbor_fn,
+        visit_counts: dict[Position, int],
+        movement_directions=ORTHOGONAL_DIRECTIONS,
+        max_expansions: int | None = None,
+) -> list[Position]:
+    """Route to a far, least-visited tile in the known connected component.
+
+    Patrol has no single semantic goal, so repeatedly running bounded A* at a
+    handful of distant candidates is the wrong shape: hitting the bound does
+    not prove those candidates unreachable.  One BFS discovers only genuinely
+    connected tiles and selects a stable sweep endpoint from that set.
+    """
+    queue = deque([start])
+    came_from = {start: start}
+    distance = {start: 0}
+    best: Position | None = None
+    best_rank: tuple[int, int, int, int] | None = None
+    expansions = 0
+
+    while queue:
+        if max_expansions is not None and expansions >= max_expansions:
+            break
+        current = queue.popleft()
+        expansions += 1
+        if current != start:
+            rank = (
+                -distance[current],
+                visit_counts.get(current, 0),
+                current.x,
+                current.y,
+            )
+            if best_rank is None or rank < best_rank:
+                best = current
+                best_rank = rank
+        for direction in movement_directions:
+            next_pos = neighbor_fn(current, direction)
+            if (
+                next_pos is None
+                or next_pos in came_from
+                or not traversable_fn(next_pos)
+            ):
+                continue
+            came_from[next_pos] = current
+            distance[next_pos] = distance[current] + 1
+            queue.append(next_pos)
+
+    if best is None:
+        return []
+    path = []
+    current = best
+    while current != start:
+        path.append(current)
+        current = came_from[current]
+    path.reverse()
+    return path

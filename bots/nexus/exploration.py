@@ -15,6 +15,20 @@ def _turn_distance(direction: Direction, heading: Direction | None) -> int:
     return min(clockwise, 8 - clockwise)
 
 
+def target_approach_progress(
+        origin: Position,
+        target: Position,
+        candidate: Position,
+) -> int:
+    """Measure progress beyond the origin toward a strategic map target."""
+    origin_distance = max(abs(origin.x - target.x), abs(origin.y - target.y))
+    candidate_distance = max(
+        abs(candidate.x - target.x),
+        abs(candidate.y - target.y),
+    )
+    return origin_distance - candidate_distance
+
+
 def choose_information_gain_step(
         current: Position,
         directions: Iterable[Direction],
@@ -86,3 +100,30 @@ def should_recycle_stalled_builder(
     useful work.
     """
     return stuck_rounds >= threshold and rounds_without_progress >= threshold
+
+
+def should_recycle_exhausted_scout(
+        rounds_without_discovery: int,
+        stuck_rounds: int,
+        route_failures: int,
+        cycle_count: int,
+        discovery_threshold: int,
+        stuck_threshold: int,
+        route_failure_threshold: int,
+        cycle_threshold: int,
+        has_pending_repairs: bool,
+) -> bool:
+    """Recycle a scout that only revisits known terrain for a long time.
+
+    Remembering an allied conveyor is not useful work by itself.  The old
+    guard kept every scout alive after it had seen its first transport, which
+    let two-tile patrol loops run until turn 2000.  A real outstanding repair
+    still keeps the builder alive.
+    """
+    if has_pending_repairs or rounds_without_discovery < discovery_threshold:
+        return False
+    return (
+        stuck_rounds >= stuck_threshold
+        or route_failures >= route_failure_threshold
+        or cycle_count >= cycle_threshold
+    )

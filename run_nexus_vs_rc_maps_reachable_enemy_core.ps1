@@ -29,12 +29,8 @@ $projectRoot = $PSScriptRoot
     "face.map26",
     "first_sound.map26"
     "flappy_bird.map26",
-    "hourglass.map26",
     "landscape.map26",
     "pixel_forest.map26",
-    "pong.map26",
-    "rush_bait.map26",
-    "separated.map26",
     "socket.map26",
     "spikes.map26",
     "starry_night.map26",
@@ -314,9 +310,9 @@ if ($rcLosses.Count -eq 0) {
     Write-Host "RC не проиграл ни на одной завершённой карте."
 }
 else {
-    Write-Host "RC проиграл на следующих картах:"
-    $rcLosses | ForEach-Object {
-        Write-Host ("- {0}: {1}" -f $_.Map, $_.Replay) -ForegroundColor Red
+    Write-Host "Команды для просмотра проигранных матчей:"
+    $rcLosses | Sort-Object Map | ForEach-Object {
+        Write-Host ("cambc watch {0}" -f $_.Replay) -ForegroundColor Red
     }
 }
 

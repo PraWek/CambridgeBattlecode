@@ -2,6 +2,7 @@ from cambc import Controller, Direction, EntityType, Environment, GameConstants,
 
 from base import BaseBot
 from constants import (
+    AXIONITE_PIPELINE_ENABLED,
     AXIONITE_TITANIUM_THRESHOLD,
     BUILDER_DIRECTION_CODES,
     BUILDER_WORK_DIRECTIONS,
@@ -10,14 +11,13 @@ from constants import (
     MARKER_KIND_SECTOR_ORE_AX,
     MARKER_KIND_SECTOR_ORE_TI,
     MARKER_KIND_SPAWN_DIRECTION,
-    MARKER_KIND_SPAWN_ORE_AX,
-    MARKER_KIND_SPAWN_ORE_TI,
     MAX_ADDITIONAL_BUILDER_SPAWNS,
     MAX_ECONOMY_BUILDERS,
     ORE_TYPES,
 )
 from economy import desired_builder_count
 from geometry import encode_marker
+from orders import spawn_needs_handoff
 
 
 class CoreBot(BaseBot):
@@ -43,11 +43,25 @@ class CoreBot(BaseBot):
         self.sector_marker_pads: dict[Direction, Position] = {}
         self.sector_marker_values: dict[Direction, int | None] = {}
         self.spawn_order_pad: Position | None = None
-        self.spawn_order_target: Position | None = None
+        self.spawn_order_active = False
         self.marker_sync_cursor = 0
 
     def run(self, controller: Controller) -> None:
         """Observe the map, update sector orders, and maintain the economy fleet."""
+        # The first four cardinal spawn tiles encode their sectors directly.
+        # They do not need the full vision cache or a marker handoff, so start
+        # the economy while the comparatively expensive initial scan proceeds
+        # on later turns.
+        if len(self.initial_spawned_directions) < len(BUILDER_WORK_DIRECTIONS):
+            if self.entity_id is None:
+                self.entity_id = controller.get_id()
+            if self.core_pos is None:
+                self.core_pos = self.tile_cache.canonicalize(
+                    controller.get_position(self.entity_id),
+                )
+                self.current_position = self.core_pos
+            if self.try_spawn_missing_builder(controller):
+                return
         if self._scan_turn(controller):
             return
         self.observe_tiles()
@@ -131,7 +145,10 @@ class CoreBot(BaseBot):
         for pos, env in self.known_env.items():
             if env not in ORE_TYPES or self.is_harvester_on_tile(pos):
                 continue
-            if env == Environment.ORE_AXIONITE and titanium <= AXIONITE_TITANIUM_THRESHOLD:
+            if env == Environment.ORE_AXIONITE and (
+                not AXIONITE_PIPELINE_ENABLED
+                or titanium <= AXIONITE_TITANIUM_THRESHOLD
+            ):
                 continue
             candidates[self.sector_for(pos)].append((pos, env))
 
@@ -223,17 +240,16 @@ class CoreBot(BaseBot):
             for spawn_pos in positions:
                 if not controller.can_spawn(spawn_pos):
                     continue
-                # The handoff marker is independent from spawning.  It makes a
-                # fallback core tile safe: the new bot still receives the
-                # original sector rather than deriving it from that tile.
-                wrote_order = self.write_spawn_order(controller, direction, spawn_pos)
-                # Never let a newborn consume a stale handoff order.  If the
-                # dedicated pad is unavailable, wait for it rather than spawn
-                # a builder with another sector's command.
-                if self.spawn_order_pad is not None and not wrote_order:
+                needs_handoff = spawn_needs_handoff(spawn_pos, preferred)
+                # Only a fallback tile is ambiguous.  Cardinal spawns derive
+                # their sector from their position and must not pay a marker
+                # action or leave a temporary building beside the Core.
+                if needs_handoff and not self.write_spawn_order(
+                    controller,
+                    direction,
+                    spawn_pos,
+                ):
                     continue
-                if self.spawn_order_pad is None:
-                    self.sync_sector_marker(controller, direction)
                 controller.spawn_builder(spawn_pos)
                 if len(self.initial_spawned_directions) < len(BUILDER_WORK_DIRECTIONS):
                     self.initial_spawned_directions.add(direction)
@@ -251,24 +267,14 @@ class CoreBot(BaseBot):
             direction: Direction,
             spawn_pos: Position,
     ) -> bool:
-        """Write a newborn builder's direction and optional ore target to a marker."""
+        """Write the sector only when a fallback spawn tile is ambiguous."""
         if self.spawn_order_pad is None:
             return False
-        target = self.sector_targets.get(direction)
-        if target is None:
-            value = encode_marker(
-                MARKER_KIND_SPAWN_DIRECTION,
-                spawn_pos,
-                BUILDER_DIRECTION_CODES[direction],
-            )
-        else:
-            ore_pos, env = target
-            kind = (
-                MARKER_KIND_SPAWN_ORE_TI
-                if env == Environment.ORE_TITANIUM
-                else MARKER_KIND_SPAWN_ORE_AX
-            )
-            value = encode_marker(kind, ore_pos, BUILDER_DIRECTION_CODES[direction])
+        value = encode_marker(
+            MARKER_KIND_SPAWN_DIRECTION,
+            spawn_pos,
+            BUILDER_DIRECTION_CODES[direction],
+        )
         if not controller.can_place_marker(self.spawn_order_pad):
             return False
         marker_id = controller.place_marker(self.spawn_order_pad, value)
@@ -279,14 +285,12 @@ class CoreBot(BaseBot):
             self.team,
             marker_value=value,
         )
-        self.spawn_order_target = None if target is None else target[0]
+        self.spawn_order_active = True
         return True
 
     def clear_completed_spawn_order(self, controller: Controller) -> None:
-        """Remove a temporary spawn order once its assigned ore is harvested."""
-        if self.spawn_order_pad is None or self.spawn_order_target is None:
-            return
-        if not self.is_harvester_on_tile(self.spawn_order_target):
+        """Remove the temporary fallback handoff after the newborn has read it."""
+        if self.spawn_order_pad is None or not self.spawn_order_active:
             return
         building_id = self.tile_cache.building_id_at(self.spawn_order_pad)
         building = self.tile_cache.building_at(self.spawn_order_pad)
@@ -294,7 +298,7 @@ class CoreBot(BaseBot):
             if building[1] == self.team and controller.can_destroy(self.spawn_order_pad):
                 controller.destroy(self.spawn_order_pad)
                 self.tile_cache.forget_building(self.spawn_order_pad)
-        self.spawn_order_target = None
+        self.spawn_order_active = False
 
     def desired_sector_marker_value(self, direction: Direction) -> int | None:
         """Encode the current ore order for one sector, if it has one."""

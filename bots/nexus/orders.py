@@ -3,6 +3,11 @@ from collections.abc import Iterable, Mapping
 from cambc import Direction, Position
 
 
+def spawn_needs_handoff(spawn: Position, preferred: Position) -> bool:
+    """Return whether the spawn tile cannot encode its sector by itself."""
+    return spawn != preferred
+
+
 def spawn_order_for(
         records: Iterable[tuple[int, Position, int]],
         current: Position,
