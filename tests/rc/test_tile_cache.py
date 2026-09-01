@@ -254,6 +254,116 @@ class TileCacheNavigationTests(unittest.TestCase):
 
             search.assert_not_called()
 
+    def test_intruder_records_each_successful_wall_bypass_branch(self) -> None:
+        """A successful left/right obstacle bypass becomes a backtracking point."""
+        bot = IntruderBot(8, 8)
+        current = bot.tile_cache.position_at(3, 3)
+        target = bot.tile_cache.position_at(6, 6)
+        assert current is not None
+        assert target is not None
+        bot.get_cached_position = lambda: current
+        bot.continue_exploration_wall_following = lambda *_args: True
+
+        self.assertTrue(
+            bot.start_exploration_wall_following(
+                None,
+                target,
+                side="left",
+                avoid_visited=True,
+            ),
+        )
+
+        self.assertEqual(bot.exploration_branch_stack, [(current, "left")])
+
+    def test_intruder_plans_a_star_to_the_newest_left_branch(self) -> None:
+        """A dead end returns to the last unexplored wall-bypass alternative."""
+        bot = IntruderBot(10, 10)
+        current = bot.tile_cache.position_at(7, 7)
+        branch = bot.tile_cache.position_at(4, 4)
+        route_step = bot.tile_cache.position_at(6, 6)
+        assert current is not None
+        assert branch is not None
+        assert route_step is not None
+        bot.exploration_branch_stack = [(branch, "left")]
+
+        with patch("intruder_bot.a_star_to_any", return_value=[route_step, branch]) as search:
+            bot.begin_return_from_exploration_dead_end(current)
+
+        self.assertIs(bot.return_branch_target, branch)
+        self.assertEqual(bot.return_path, [route_step, branch])
+        self.assertEqual(search.call_args.args[2], {branch})
+
+    def test_intruder_resumes_a_returned_branch_on_its_right_side(self) -> None:
+        """Returning to a left branch retries the same obstacle from the right."""
+        bot = IntruderBot(10, 10)
+        branch = bot.tile_cache.position_at(4, 4)
+        target = bot.tile_cache.position_at(7, 7)
+        assert branch is not None
+        assert target is not None
+        bot.destination = target
+        bot.exploration_branch_stack = [(branch, "left")]
+        bot.start_exploration_wall_following = lambda *_args, **_kwargs: True
+
+        self.assertTrue(bot.resume_exploration_branch(None, branch))
+
+        self.assertEqual(bot.exploration_branch_stack, [(branch, "right")])
+
+    def test_intruder_discards_a_right_branch_with_no_right_side_exit(self) -> None:
+        """An unrelated unvisited neighbour must not stall a failed right bypass."""
+        bot = IntruderBot(20, 20)
+        parent = bot.tile_cache.position_at(8, 8)
+        branch = bot.tile_cache.position_at(13, 3)
+        target = bot.tile_cache.position_at(1, 6)
+        southwest = bot.tile_cache.position_at(12, 4)
+        south = bot.tile_cache.position_at(13, 4)
+        southeast = bot.tile_cache.position_at(14, 4)
+        unrelated_northeast = bot.tile_cache.position_at(14, 2)
+        route_step = bot.tile_cache.position_at(12, 3)
+        assert all((
+            parent,
+            branch,
+            target,
+            southwest,
+            south,
+            southeast,
+            unrelated_northeast,
+            route_step,
+        ))
+        bot.destination = target
+        bot.exploration_branch_stack = [(parent, "left"), (branch, "left")]
+        bot.visited_tiles.add(southeast)
+        bot.known_env.update({
+            southwest: Environment.WALL,
+            south: Environment.ORE_TITANIUM,
+            southeast: Environment.EMPTY,
+            unrelated_northeast: Environment.EMPTY,
+        })
+        bot.start_exploration_wall_following = lambda *_args, **_kwargs: False
+
+        with patch("intruder_bot.a_star_to_any", return_value=[route_step, parent]) as search:
+            self.assertFalse(bot.resume_exploration_branch(None, branch))
+
+        self.assertEqual(bot.exploration_branch_stack, [(parent, "left")])
+        self.assertIs(bot.return_branch_target, parent)
+        self.assertEqual(search.call_args.args[2], {parent})
+
+    def test_intruder_pops_exhausted_right_branch_before_returning_to_parent(self) -> None:
+        """A failed second side backtracks to the penultimate branch point."""
+        bot = IntruderBot(12, 12)
+        current = bot.tile_cache.position_at(10, 10)
+        parent = bot.tile_cache.position_at(4, 4)
+        child = bot.tile_cache.position_at(7, 7)
+        route_step = bot.tile_cache.position_at(9, 9)
+        assert all((current, parent, child, route_step))
+        bot.exploration_branch_stack = [(parent, "left"), (child, "right")]
+
+        with patch("intruder_bot.a_star_to_any", return_value=[route_step, parent]) as search:
+            bot.begin_return_from_exploration_dead_end(current)
+
+        self.assertEqual(bot.exploration_branch_stack, [(parent, "left")])
+        self.assertIs(bot.return_branch_target, parent)
+        self.assertEqual(search.call_args.args[2], {parent})
+
     def test_intruder_selects_nearest_core_edge_and_direct_firing_ray(self) -> None:
         """The first valid shot is checked beside the Intruder, not globally ranked."""
         bot = IntruderBot(20, 20)

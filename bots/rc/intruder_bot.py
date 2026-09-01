@@ -61,8 +61,15 @@ class IntruderBot(BaseBot):
         self.last_position: Position | None = None
         self.previous_position: Position | None = None
         # Exploration never revisits a tile.  The only exception is the
-        # explicit A* return route to the friendly Core after a dead end.
+        # explicit A* route back to a wall-bypass branch point, or eventually
+        # to the friendly Core after every branch has been exhausted.
         self.visited_tiles: set[Position] = set()
+        # Each entry is the point at which a wall bypass began and the side
+        # already explored from it.  A dead end on the left returns here to
+        # explore the right; a dead end on the right pops the entry.
+        self.exploration_branch_stack: list[tuple[Position, str]] = []
+        self.return_branch_target: Position | None = None
+        self.resuming_exploration_branch = False
         self.returning_to_core = False
         self.return_path: list[Position] = []
         self.waiting_launcher_origin: Position | None = None
@@ -158,6 +165,16 @@ class IntruderBot(BaseBot):
         if self.wait_for_launcher(controller, current):
             self.draw_goal_indicator(controller, current)
             return
+        if self.return_branch_target is not None:
+            self.mode = "return_to_exploration_branch"
+            self.return_to_exploration_branch(controller, current)
+            self.draw_goal_indicator(controller, current)
+            return
+        if self.resuming_exploration_branch:
+            self.mode = "resume_exploration_branch"
+            self.resume_exploration_branch(controller, current)
+            self.draw_goal_indicator(controller, current)
+            return
         if self.returning_to_core:
             self.mode = "return_to_core"
             self.return_to_core(controller, current)
@@ -182,7 +199,9 @@ class IntruderBot(BaseBot):
 
     def draw_goal_indicator(self, controller: Controller, current: Position) -> None:
         """Draw a red replay line from this intruder to its current destination."""
-        if self.returning_to_core:
+        if self.return_branch_target is not None:
+            target = self.return_branch_target
+        elif self.returning_to_core:
             target = self.core_pos
         elif self.gunner_id is not None and self.supply_ore is not None:
             target = self.supply_ore
@@ -240,6 +259,61 @@ class IntruderBot(BaseBot):
             if building is None:
                 return True
             building_type, building_team = building
+            if building_type in PASSABLE_BUILDINGS and (
+                building_type != EntityType.CORE or building_team == self.team
+            ):
+                return True
+        return False
+
+    def has_unvisited_exploration_wall_exit(
+            self,
+            current: Position,
+            target: Position | None,
+            side: str,
+    ) -> bool:
+        """Check only the cells that the selected wall bypass can actually try.
+
+        This intentionally keeps the same treatment of unknown cells, builders,
+        and action cooldown as ``has_unvisited_exploration_exit``: those are
+        transient and should cause a retry.  Unlike that broad check, however,
+        it cannot keep a right-side bypass alive because of an unrelated cell
+        on the left side of the branch point.
+        """
+        if target is None:
+            return False
+        desired = current.direction_to(target)
+        if desired == Direction.CENTRE:
+            return False
+        heading = (
+            desired.rotate_right().rotate_right()
+            if side == "left"
+            else desired.rotate_left().rotate_left()
+        )
+        directions = (
+            self.left_wall_directions(heading)
+            if side == "left"
+            else self.right_wall_directions(heading)
+        )
+        for direction in directions:
+            candidate = self.tile_cache.neighbor(current, direction)
+            if candidate is None or candidate in self.visited_tiles:
+                continue
+            environment = self.known_env.get(candidate)
+            if environment in {
+                Environment.WALL,
+                Environment.ORE_TITANIUM,
+                Environment.ORE_AXIONITE,
+            }:
+                continue
+            building = self.known_buildings.get(candidate)
+            if building is None:
+                return True
+            building_type, building_team = building
+            if (
+                building_type == EntityType.MARKER
+                and building_team == self.team
+            ):
+                return True
             if building_type in PASSABLE_BUILDINGS and (
                 building_type != EntityType.CORE or building_team == self.team
             ):
@@ -324,7 +398,7 @@ class IntruderBot(BaseBot):
         ):
             return True
         if not self.has_unvisited_exploration_exit(current):
-            self.begin_return_to_core(current)
+            self.begin_return_from_exploration_dead_end(current)
         return False
 
     def advance_towards_revisitable_target(
@@ -371,6 +445,121 @@ class IntruderBot(BaseBot):
         self.returning_to_core = True
         self.return_path = path
         self.heading = None
+
+    def begin_return_from_exploration_dead_end(self, current: Position) -> None:
+        """Return by A* to the newest left-side branch, then eventually to Core.
+
+        A branch whose right side has already failed is complete, so discard it
+        before looking for the next parent.  The first remaining left-side
+        branch receives the return route; arriving there retries the right
+        side.  This is depth-first exploration without allowing ordinary
+        forward movement to revisit historical tiles.
+        """
+        self.return_branch_target = None
+        self.resuming_exploration_branch = False
+        self.stop_exploration_wall_following()
+        while self.exploration_branch_stack:
+            branch_pos, attempted_side = self.exploration_branch_stack[-1]
+            if attempted_side == "right":
+                self.exploration_branch_stack.pop()
+                continue
+            if current == branch_pos:
+                self.resuming_exploration_branch = True
+                return
+            path = a_star_to_any(
+                None,
+                current,
+                {branch_pos},
+                lambda _controller, pos: self.return_path_traversable(pos),
+                self.tile_cache.neighbor,
+                movement_directions=DIRECTIONS,
+                max_expansions=_RETURN_TO_CORE_A_STAR_MAX_EXPANSIONS,
+            )
+            if path:
+                self.return_branch_target = branch_pos
+                self.return_path = path
+                self.heading = None
+                return
+            # The branch cannot be reached through the known terrain, so it
+            # cannot be used as a backtracking point.  Try its parent instead.
+            self.exploration_branch_stack.pop()
+        self.begin_return_to_core(current)
+
+    def return_to_exploration_branch(
+            self,
+            controller: Controller,
+            current: Position,
+    ) -> None:
+        """Follow the saved A* route to a branch point, allowing revisits."""
+        target = self.return_branch_target
+        if target is None:
+            return
+        if current == target:
+            self.return_branch_target = None
+            self.return_path = []
+            self.resuming_exploration_branch = True
+            self.resume_exploration_branch(controller, current)
+            return
+        while self.return_path and current == self.return_path[0]:
+            self.return_path.pop(0)
+        if not self.return_path:
+            self.return_branch_target = None
+            self.begin_return_from_exploration_dead_end(current)
+            return
+        next_pos = self.return_path[0]
+        direction = current.direction_to(next_pos)
+        if current.distance_squared(next_pos) > 2 or direction == Direction.CENTRE:
+            self.return_branch_target = None
+            self.begin_return_from_exploration_dead_end(current)
+            return
+        if self.try_move_step(controller, direction, avoid_visited=False):
+            self.return_path.pop(0)
+            self.heading = direction
+            return
+        # A moving builder or fresh obstacle can invalidate a cached segment.
+        self.return_branch_target = None
+        self.begin_return_from_exploration_dead_end(current)
+
+    def resume_exploration_branch(
+            self,
+            controller: Controller,
+            current: Position,
+    ) -> bool:
+        """At a left-side branch, explore its untried right-side bypass."""
+        self.resuming_exploration_branch = False
+        if not self.exploration_branch_stack:
+            self.begin_return_to_core(current)
+            return False
+        branch_pos, attempted_side = self.exploration_branch_stack[-1]
+        if current != branch_pos:
+            self.begin_return_from_exploration_dead_end(current)
+            return False
+        if attempted_side != "left":
+            self.exploration_branch_stack.pop()
+            self.begin_return_from_exploration_dead_end(current)
+            return False
+        if self.start_exploration_wall_following(
+                controller,
+                self.destination,
+                side="right",
+                avoid_visited=True,
+                record_branch=False,
+        ):
+            self.exploration_branch_stack[-1] = (branch_pos, "right")
+            return True
+        if self.has_unvisited_exploration_wall_exit(
+                current,
+                self.destination,
+                "right",
+        ):
+            # A cell of this exact right-side bypass may be temporarily blocked
+            # by a BuilderBot or an action cooldown.  Retain the branch and
+            # retry it rather than discarding the untried side.
+            self.resuming_exploration_branch = True
+            return False
+        self.exploration_branch_stack.pop()
+        self.begin_return_from_exploration_dead_end(current)
+        return False
 
     def return_path_traversable(self, pos: Position) -> bool:
         """Allow A* to use known walkable ground while retracing a route to Core."""
@@ -438,18 +627,14 @@ class IntruderBot(BaseBot):
                 self.tile_cache.entity_type(entity_id) == EntityType.CORE
                 and self.tile_cache.entity_team(entity_id) != self.team
             ):
-                self.destination = self.tile_cache.entity_position(entity_id)
-                self.destination_is_confirmed_core = True
-                self.wall_following = False
-                self.stop_exploration_wall_following()
+                self.set_confirmed_enemy_destination(
+                    self.tile_cache.entity_position(entity_id),
+                )
                 return
 
         inferred_core = self.tile_cache.enemy_core_position(self.team)
         if inferred_core is not None:
-            self.destination = inferred_core
-            self.destination_is_confirmed_core = True
-            self.wall_following = False
-            self.stop_exploration_wall_following()
+            self.set_confirmed_enemy_destination(inferred_core)
             return
 
         if self.destination is None:
@@ -459,6 +644,26 @@ class IntruderBot(BaseBot):
                 self.core_pos,
                 "rotational",
             )
+
+    def set_confirmed_enemy_destination(self, destination: Position) -> None:
+        """Update the Core goal without discarding a stable wall-follow state."""
+        destination_changed = self.destination != destination
+        newly_confirmed = not self.destination_is_confirmed_core
+        if destination_changed:
+            self.clear_exploration_branch_state()
+        self.destination = destination
+        self.destination_is_confirmed_core = True
+        if destination_changed or newly_confirmed:
+            self.wall_following = False
+            self.stop_exploration_wall_following()
+
+    def clear_exploration_branch_state(self) -> None:
+        """Discard branch state that belongs to an obsolete exploration goal."""
+        self.exploration_branch_stack = []
+        self.resuming_exploration_branch = False
+        if self.return_branch_target is not None:
+            self.return_branch_target = None
+            self.return_path = []
 
     def wait_for_launcher(self, controller: Controller, current: Position) -> bool:
         """Stay adjacent to a new launcher until it has one turn to throw this bot."""
@@ -588,6 +793,7 @@ class IntruderBot(BaseBot):
             target: Position | None,
             side: str,
             avoid_visited: bool,
+            record_branch: bool = True,
     ) -> bool:
         """Choose a wall side and make the first unvisited bypass step."""
         if target is None:
@@ -605,6 +811,8 @@ class IntruderBot(BaseBot):
         )
         self.wall_following = True
         if self.continue_exploration_wall_following(controller, avoid_visited):
+            if record_branch:
+                self.exploration_branch_stack.append((current, side))
             return True
         self.stop_exploration_wall_following()
         return False
