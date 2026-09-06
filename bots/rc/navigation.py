@@ -1,9 +1,50 @@
+from dataclasses import dataclass, field
 from heapq import heappop, heappush
+from typing import Any
 
 from cambc import Controller, Direction, Position
 
 from constants import LARGE_NUMBER, ORTHOGONAL_DIRECTIONS
 from geometry import chebyshev
+
+
+@dataclass
+class AStarSearchState:
+    """Frontier retained when a bounded A* search needs another turn.
+
+    A state belongs to one logical query at a time.  The navigation functions
+    reset it if their start or target set changes, and leave it populated only
+    after reaching ``max_expansions``.  Callers can therefore distinguish a
+    pending search from a proven missing route through :attr:`pending`.
+    """
+
+    query: tuple[Any, ...] | None = None
+    queue: list[Any] = field(default_factory=list)
+    came_from: dict[Position, Any] = field(default_factory=dict)
+    g_score: dict[Position, int] = field(default_factory=dict)
+    sequence: int = 0
+    pending: bool = False
+
+    def begin(self, query: tuple[Any, ...]) -> bool:
+        """Prepare ``query`` and return whether it needs initialisation."""
+        if self.query == query:
+            return False
+        self.query = query
+        self.queue.clear()
+        self.came_from.clear()
+        self.g_score.clear()
+        self.sequence = 0
+        self.pending = False
+        return True
+
+    def finish(self) -> None:
+        """Discard a completed search so a future query starts fresh."""
+        self.query = None
+        self.queue.clear()
+        self.came_from.clear()
+        self.g_score.clear()
+        self.sequence = 0
+        self.pending = False
 
 
 def a_star_to_any(
@@ -16,38 +57,53 @@ def a_star_to_any(
         movement_directions=ORTHOGONAL_DIRECTIONS,
         extra_step_cost_fn=None,
         max_expansions: int | None = None,
+        state: AStarSearchState | None = None,
 ) -> list[Position]:
     """Find a lowest-cost A* path from ``start`` to any traversable goal tile.
 
-    ``max_expansions`` bounds a search whose target is not reachable through
-    the currently known map.  On exhaustion the function returns an empty
-    path, just as it does when no route exists, so the caller can defer the
-    job and continue scouting.
+    ``max_expansions`` limits work performed in this call.  When ``state`` is
+    supplied, a limited search retains its frontier and resumes on the next
+    call; ``state.pending`` distinguishes that case from a missing route.
     """
-    if start in goals:
+    search_state = state or AStarSearchState()
+    if not goals or start in goals:
+        search_state.finish()
         return []
 
-    queue = [(0, 0, start)]
-    came_from = {start: start}
-    g_score = {start: 0}
     if preferred_tiles is None:
         preferred_tiles = set()
+    query = (
+        "to_any",
+        start,
+        frozenset(goals),
+        frozenset(preferred_tiles),
+        tuple(movement_directions),
+    )
+    if search_state.begin(query):
+        search_state.queue.append((0, 0, start))
+        search_state.came_from[start] = start
+        search_state.g_score[start] = 0
     minimum_step_cost = 1 if preferred_tiles else 4
     expansions = 0
 
-    while queue:
-        _, cost, current = heappop(queue)
+    while search_state.queue:
+        _, cost, current = search_state.queue[0]
+        if cost != search_state.g_score[current]:
+            heappop(search_state.queue)
+            continue
         if current in goals:
+            heappop(search_state.queue)
             path = []
             while current != start:
                 path.append(current)
-                current = came_from[current]
+                current = search_state.came_from[current]
             path.reverse()
+            search_state.finish()
             return path
-        if cost != g_score[current]:
-            continue
         if max_expansions is not None and expansions >= max_expansions:
+            search_state.pending = True
             return []
+        heappop(search_state.queue)
         expansions += 1
 
         for direction in movement_directions:
@@ -60,15 +116,19 @@ def a_star_to_any(
             if extra_step_cost_fn is not None:
                 step_cost += extra_step_cost_fn(next_pos)
             new_cost = cost + step_cost
-            if new_cost >= g_score.get(next_pos, LARGE_NUMBER):
+            if new_cost >= search_state.g_score.get(next_pos, LARGE_NUMBER):
                 continue
-            g_score[next_pos] = new_cost
-            came_from[next_pos] = current
+            search_state.g_score[next_pos] = new_cost
+            search_state.came_from[next_pos] = current
             heuristic = minimum_step_cost * min(
                 chebyshev(next_pos, goal) for goal in goals
             )
-            heappush(queue, (new_cost + heuristic, new_cost, next_pos))
+            heappush(
+                search_state.queue,
+                (new_cost + heuristic, new_cost, next_pos),
+            )
 
+    search_state.finish()
     return []
 
 
@@ -80,6 +140,7 @@ def a_star_from_any(
         neighbor_fn,
         movement_directions=ORTHOGONAL_DIRECTIONS,
         max_expansions: int | None = None,
+        state: AStarSearchState | None = None,
 ) -> list[Position]:
     """Find a shortest A* path from any start tile to any goal tile.
 
@@ -89,34 +150,47 @@ def a_star_from_any(
     the multi-source frontier lets nearby starts compete in a single bounded
     search instead of running one search for each possible source.
     """
+    search_state = state or AStarSearchState()
     if not starts or not goals:
+        search_state.finish()
         return []
 
-    queue: list[tuple[int, int, int, Position]] = []
-    came_from: dict[Position, Position | None] = {}
-    g_score: dict[Position, int] = {}
-    sequence = 0
-    for start in sorted(starts, key=lambda pos: (pos.y, pos.x)):
-        came_from[start] = None
-        g_score[start] = 0
-        heuristic = min(chebyshev(start, goal) for goal in goals)
-        heappush(queue, (heuristic, 0, sequence, start))
-        sequence += 1
+    query = (
+        "from_any",
+        frozenset(starts),
+        frozenset(goals),
+        tuple(movement_directions),
+    )
+    if search_state.begin(query):
+        for start in sorted(starts, key=lambda pos: (pos.y, pos.x)):
+            search_state.came_from[start] = None
+            search_state.g_score[start] = 0
+            heuristic = min(chebyshev(start, goal) for goal in goals)
+            heappush(
+                search_state.queue,
+                (heuristic, 0, search_state.sequence, start),
+            )
+            search_state.sequence += 1
 
     expansions = 0
-    while queue:
-        _, cost, _, current = heappop(queue)
-        if cost != g_score[current]:
+    while search_state.queue:
+        _, cost, _, current = search_state.queue[0]
+        if cost != search_state.g_score[current]:
+            heappop(search_state.queue)
             continue
         if current in goals:
+            heappop(search_state.queue)
             path: list[Position] = []
             while current is not None:
                 path.append(current)
-                current = came_from[current]
+                current = search_state.came_from[current]
             path.reverse()
+            search_state.finish()
             return path
         if max_expansions is not None and expansions >= max_expansions:
+            search_state.pending = True
             return []
+        heappop(search_state.queue)
         expansions += 1
 
         for direction in movement_directions:
@@ -126,17 +200,23 @@ def a_star_from_any(
             if not traversable_fn(controller, next_pos):
                 continue
             new_cost = cost + 1
-            if new_cost >= g_score.get(next_pos, LARGE_NUMBER):
+            if new_cost >= search_state.g_score.get(next_pos, LARGE_NUMBER):
                 continue
-            g_score[next_pos] = new_cost
-            came_from[next_pos] = current
+            search_state.g_score[next_pos] = new_cost
+            search_state.came_from[next_pos] = current
             heuristic = min(chebyshev(next_pos, goal) for goal in goals)
             heappush(
-                queue,
-                (new_cost + heuristic, new_cost, sequence, next_pos),
+                search_state.queue,
+                (
+                    new_cost + heuristic,
+                    new_cost,
+                    search_state.sequence,
+                    next_pos,
+                ),
             )
-            sequence += 1
+            search_state.sequence += 1
 
+    search_state.finish()
     return []
 
 
@@ -151,6 +231,7 @@ def a_star_from_any_with_bridges(
         max_expansions: int | None = None,
         bridge_landing_fn=None,
         existing_bridge_crossings: dict[Position, Position] | None = None,
+        state: AStarSearchState | None = None,
 ) -> tuple[list[Position], dict[Position, Position], int] | None:
     """Find an A* route from ``starts`` to ``goals`` with short bridge jumps.
 
@@ -165,40 +246,68 @@ def a_star_from_any_with_bridges(
     to its landing endpoint; those crossings are reused at zero construction
     cost and are not returned as new ``bridge_targets``.
     """
+    search_state = state or AStarSearchState()
     if not starts or not goals:
+        search_state.finish()
         return None
 
-    queue: list[tuple[int, int, int, Position]] = []
-    came_from: dict[Position, tuple[Position, bool]] = {}
-    g_score: dict[Position, int] = {}
-    sequence = 0
-    for start in sorted(starts, key=lambda pos: (pos.y, pos.x)):
-        g_score[start] = 0
-        heuristic = normal_step_cost * min(
-            abs(start.x - goal.x) + abs(start.y - goal.y)
-            for goal in goals
-        )
-        heappush(queue, (heuristic, 0, sequence, start))
-        sequence += 1
+    crossings = (
+        ()
+        if existing_bridge_crossings is None
+        else tuple(sorted(
+            existing_bridge_crossings.items(),
+            key=lambda item: (
+                item[0].y,
+                item[0].x,
+                item[1].y,
+                item[1].x,
+            ),
+        ))
+    )
+    query = (
+        "from_any_with_bridges",
+        frozenset(starts),
+        frozenset(goals),
+        normal_step_cost,
+        bridge_step_cost,
+        crossings,
+    )
+    if search_state.begin(query):
+        for start in sorted(starts, key=lambda pos: (pos.y, pos.x)):
+            search_state.g_score[start] = 0
+            heuristic = normal_step_cost * min(
+                abs(start.x - goal.x) + abs(start.y - goal.y)
+                for goal in goals
+            )
+            heappush(
+                search_state.queue,
+                (heuristic, 0, search_state.sequence, start),
+            )
+            search_state.sequence += 1
 
     expansions = 0
-    while queue:
-        _, cost, _, current = heappop(queue)
-        if cost != g_score[current]:
+    while search_state.queue:
+        _, cost, _, current = search_state.queue[0]
+        if cost != search_state.g_score[current]:
+            heappop(search_state.queue)
             continue
         if current in goals:
+            heappop(search_state.queue)
             path = [current]
             bridge_targets: dict[Position, Position] = {}
-            while current in came_from:
-                previous, is_bridge = came_from[current]
+            while current in search_state.came_from:
+                previous, is_bridge = search_state.came_from[current]
                 if is_bridge:
                     bridge_targets[previous] = current
                 path.append(previous)
                 current = previous
             path.reverse()
+            search_state.finish()
             return path, bridge_targets, cost
         if max_expansions is not None and expansions >= max_expansions:
+            search_state.pending = True
             return None
+        heappop(search_state.queue)
         expansions += 1
 
         for direction in ORTHOGONAL_DIRECTIONS:
@@ -207,15 +316,23 @@ def a_star_from_any_with_bridges(
                 continue
             if traversable_fn(controller, next_pos):
                 new_cost = cost + normal_step_cost
-                if new_cost < g_score.get(next_pos, LARGE_NUMBER):
-                    g_score[next_pos] = new_cost
-                    came_from[next_pos] = (current, False)
+                if new_cost < search_state.g_score.get(next_pos, LARGE_NUMBER):
+                    search_state.g_score[next_pos] = new_cost
+                    search_state.came_from[next_pos] = (current, False)
                     heuristic = normal_step_cost * min(
                         abs(next_pos.x - goal.x) + abs(next_pos.y - goal.y)
                         for goal in goals
                     )
-                    heappush(queue, (new_cost + heuristic, new_cost, sequence, next_pos))
-                    sequence += 1
+                    heappush(
+                        search_state.queue,
+                        (
+                            new_cost + heuristic,
+                            new_cost,
+                            search_state.sequence,
+                            next_pos,
+                        ),
+                    )
+                    search_state.sequence += 1
 
             for distance in (2, 3):
                 bridge_positions: list[Position] = []
@@ -240,19 +357,27 @@ def a_star_from_any_with_bridges(
                 ):
                     continue
                 new_cost = cost + bridge_step_cost
-                if new_cost >= g_score.get(bridge_target, LARGE_NUMBER):
+                if new_cost >= search_state.g_score.get(
+                    bridge_target,
+                    LARGE_NUMBER,
+                ):
                     continue
-                g_score[bridge_target] = new_cost
-                came_from[bridge_target] = (current, True)
+                search_state.g_score[bridge_target] = new_cost
+                search_state.came_from[bridge_target] = (current, True)
                 heuristic = normal_step_cost * min(
                     abs(bridge_target.x - goal.x) + abs(bridge_target.y - goal.y)
                     for goal in goals
                 )
                 heappush(
-                    queue,
-                    (new_cost + heuristic, new_cost, sequence, bridge_target),
+                    search_state.queue,
+                    (
+                        new_cost + heuristic,
+                        new_cost,
+                        search_state.sequence,
+                        bridge_target,
+                    ),
                 )
-                sequence += 1
+                search_state.sequence += 1
 
         existing_landing = (
             None
@@ -262,18 +387,19 @@ def a_star_from_any_with_bridges(
         if (
             existing_landing is not None
             and traversable_fn(controller, existing_landing)
-            and cost < g_score.get(existing_landing, LARGE_NUMBER)
+            and cost < search_state.g_score.get(existing_landing, LARGE_NUMBER)
         ):
-            g_score[existing_landing] = cost
-            came_from[existing_landing] = (current, False)
+            search_state.g_score[existing_landing] = cost
+            search_state.came_from[existing_landing] = (current, False)
             heuristic = normal_step_cost * min(
                 abs(existing_landing.x - goal.x) + abs(existing_landing.y - goal.y)
                 for goal in goals
             )
             heappush(
-                queue,
-                (cost + heuristic, cost, sequence, existing_landing),
+                search_state.queue,
+                (cost + heuristic, cost, search_state.sequence, existing_landing),
             )
-            sequence += 1
+            search_state.sequence += 1
 
+    search_state.finish()
     return None
