@@ -111,6 +111,12 @@ class IntruderBot(BaseBot):
         # every turn can bounce between two adjacent entries around a mine.
         self.supply_exploration_entry: Position | None = None
         self.supply_exploring_back_to_gunner = False
+        # Before a Ti deposit is visible, scouting chooses a reachable map
+        # frontier.  A bounded A* can prove that a nearby frontier is cut off
+        # by known terrain; retain that result so the next turn tries another
+        # frontier rather than repeating the same failed search forever.
+        self.failed_supply_search_frontiers: set[Position] = set()
+        self.supply_search_target: Position | None = None
         # Once a supply route exists, newly scanned deposits are considered
         # incrementally.  This lets the Intruder abandon an early, distant
         # discovery for a genuinely cheaper route without repeating A* for
@@ -203,8 +209,11 @@ class IntruderBot(BaseBot):
             target = self.return_branch_target
         elif self.returning_to_core:
             target = self.core_pos
-        elif self.gunner_id is not None and self.supply_ore is not None:
-            target = self.supply_ore
+        elif self.gunner_id is not None:
+            # Until a Ti deposit has entered the cache, ``destination`` still
+            # names the enemy Core.  Showing it here made a stationary supply
+            # scout look as though it was trying to walk back into the Core.
+            target = self.supply_ore or self.supply_search_target or self.gunner_site
         else:
             target = self.destination
         if target is not None:
@@ -410,6 +419,7 @@ class IntruderBot(BaseBot):
         if target is None:
             return False
         current = self.get_cached_position()
+        search_state = self.a_star_state("revisitable_target")
         path = a_star_to_any(
             None,
             current,
@@ -418,7 +428,10 @@ class IntruderBot(BaseBot):
             self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
+            state=search_state,
         )
+        if search_state.pending:
+            return False
         if path and self.try_move_step(
                 controller,
                 current.direction_to(path[0]),
@@ -431,6 +444,7 @@ class IntruderBot(BaseBot):
         """Plan a known-terrain A* route back to the friendly Core after a dead end."""
         if self.core_pos is None or current == self.core_pos:
             return
+        search_state = self.a_star_state("return_to_core")
         path = a_star_to_any(
             None,
             current,
@@ -439,7 +453,10 @@ class IntruderBot(BaseBot):
             self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             max_expansions=_RETURN_TO_CORE_A_STAR_MAX_EXPANSIONS,
+            state=search_state,
         )
+        if search_state.pending:
+            return
         if not path:
             return
         self.returning_to_core = True
@@ -466,6 +483,7 @@ class IntruderBot(BaseBot):
             if current == branch_pos:
                 self.resuming_exploration_branch = True
                 return
+            search_state = self.a_star_state("return_to_branch")
             path = a_star_to_any(
                 None,
                 current,
@@ -474,7 +492,10 @@ class IntruderBot(BaseBot):
                 self.tile_cache.neighbor,
                 movement_directions=DIRECTIONS,
                 max_expansions=_RETURN_TO_CORE_A_STAR_MAX_EXPANSIONS,
+                state=search_state,
             )
+            if search_state.pending:
+                return
             if path:
                 self.return_branch_target = branch_pos
                 self.return_path = path
@@ -1440,10 +1461,14 @@ class IntruderBot(BaseBot):
             # leaves its already placed Gunner-side conveyors as an isolated
             # fragment and starts the next route somewhere else.
             self.reconsider_supply_plan()
+            if self.a_star_state("supply_route").pending:
+                return
 
         if not self.supply_path:
             plan = self.plan_supply_route(self.supply_ore)
             if plan is None:
+                if self.a_star_state("supply_route").pending:
+                    return
                 self.explore_supply_route(controller, current)
                 return
             self.store_supply_plan(self.supply_ore, plan)
@@ -1483,6 +1508,11 @@ class IntruderBot(BaseBot):
             if plan is not None:
                 self.store_supply_plan(ore, plan)
                 return True
+            if self.a_star_state("supply_route").pending:
+                # Keep this candidate at the head of the queue so the next
+                # turn continues its retained A* frontier.
+                self.supply_plan_cursor -= 1
+                return False
             self.deferred_supply_candidates.append(ore)
 
         if self.supply_plan_cursor < len(self.supply_plan_candidates):
@@ -1543,6 +1573,8 @@ class IntruderBot(BaseBot):
         ore = self.supply_replan_candidates.pop(0)
         plan = self.plan_supply_route(ore)
         if plan is None:
+            if self.a_star_state("supply_route").pending:
+                self.supply_replan_candidates.insert(0, ore)
             return False
         if self.supply_plan_cost is not None and plan[3] >= self.supply_plan_cost:
             return False
@@ -1578,6 +1610,7 @@ class IntruderBot(BaseBot):
         self.deferred_supply_candidates = []
         self.supply_exploration_entry = None
         self.supply_exploring_back_to_gunner = False
+        self.supply_search_target = None
 
     def explore_supply_route(self, controller: Controller, current: Position) -> None:
         """Extend known supply terrain toward an ore entry without wall loops.
@@ -1612,6 +1645,7 @@ class IntruderBot(BaseBot):
             if target is None:
                 return
 
+        search_state = self.a_star_state("supply_exploration")
         path = a_star_to_any(
             None,
             current,
@@ -1620,7 +1654,10 @@ class IntruderBot(BaseBot):
             self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
+            state=search_state,
         )
+        if search_state.pending:
+            return
         if path:
             self.try_move_step(
                 controller,
@@ -1726,6 +1763,7 @@ class IntruderBot(BaseBot):
     ] | None:
         """Build a bridge-aware A* route from a Gunner input to an ore neighbour."""
         if self.gunner_site is None or self.gunner_direction is None:
+            self.clear_a_star_state("supply_route")
             return None
         ore_entries = {
             entry
@@ -1741,8 +1779,10 @@ class IntruderBot(BaseBot):
             and self.is_supply_tile(entry)
         }
         if not ore_entries or not gunner_entries:
+            self.clear_a_star_state("supply_route")
             return None
 
+        search_state = self.a_star_state("supply_route")
         travel_plan = a_star_from_any_with_bridges(
             None,
             gunner_entries,
@@ -1754,6 +1794,7 @@ class IntruderBot(BaseBot):
             max_expansions=_SUPPLY_BRIDGE_SEARCH_EXPANSIONS,
             bridge_landing_fn=lambda _controller, pos: self.is_supply_bridge_landing(pos),
             existing_bridge_crossings=self.known_supply_bridge_crossings(),
+            state=search_state,
         )
         if travel_plan is None:
             return None
@@ -1947,6 +1988,7 @@ class IntruderBot(BaseBot):
             target: Position,
     ) -> None:
         """Walk back to one required route cell without laying a later conveyor."""
+        search_state = self.a_star_state("supply_rejoin")
         approach = a_star_to_any(
             None,
             current,
@@ -1955,7 +1997,10 @@ class IntruderBot(BaseBot):
             self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
+            state=search_state,
         )
+        if search_state.pending:
+            return
         if approach:
             self.move_to_supply_route_tile(
                 controller,
@@ -1988,6 +2033,7 @@ class IntruderBot(BaseBot):
         # This branch is only a safety net for an external displacement.  It
         # returns to the bridge endpoint rather than falling back to the
         # Gunner-side route prefix.
+        search_state = self.a_star_state("pending_supply_bridge")
         approach = a_star_to_any(
             None,
             current,
@@ -1996,7 +2042,10 @@ class IntruderBot(BaseBot):
             self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
+            state=search_state,
         )
+        if search_state.pending:
+            return True
         if approach:
             self.move_to_supply_route_tile(controller, current, approach[0])
         return True
@@ -2128,6 +2177,14 @@ class IntruderBot(BaseBot):
 
     def reset_supply_plan(self) -> None:
         """Forget an invalid route so the next turn can choose another Ti source."""
+        for name in (
+                "supply_route",
+                "supply_exploration",
+                "supply_rejoin",
+                "pending_supply_bridge",
+                "titanium_search",
+        ):
+            self.clear_a_star_state(name)
         self.supply_ore = None
         self.supply_path = []
         self.supply_bridge_crossings = {}
@@ -2140,6 +2197,8 @@ class IntruderBot(BaseBot):
         self.deferred_supply_candidates = []
         self.supply_exploration_entry = None
         self.supply_exploring_back_to_gunner = False
+        self.failed_supply_search_frontiers = set()
+        self.supply_search_target = None
         self.supply_seen_ores = set()
         self.supply_replan_candidates = []
         self.supply_plan_cost = None
@@ -2156,8 +2215,10 @@ class IntruderBot(BaseBot):
             return
         current = self.get_cached_position()
         target = self.supply_search_frontier(current)
+        self.supply_search_target = target
         if target is None:
             return
+        search_state = self.a_star_state("titanium_search")
         path = a_star_to_any(
             None,
             current,
@@ -2166,17 +2227,27 @@ class IntruderBot(BaseBot):
             self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             max_expansions=_SUPPLY_SEARCH_EXPANSIONS,
+            state=search_state,
         )
-        if not path:
+        if search_state.pending:
             return
-        self.try_move_step(
+        if not path:
+            # This frontier may be visible across a wall or behind a solid
+            # building.  A* has already spent its bounded attempt proving no
+            # known route, so allow the next turn to consider another one.
+            self.failed_supply_search_frontiers.update((target,))
+            return
+        if self.try_move_step(
             controller,
             current.direction_to(path[0]),
             build_road=True,
-        )
+        ):
+            # A successful scout move changes the visible frontier ring, so
+            # earlier failed routes may now have a way around their obstacle.
+            self.failed_supply_search_frontiers = set()
 
     def supply_search_frontier(self, current: Position) -> Position | None:
-        """Choose a reachable cache frontier on the resource side of the Gunner."""
+        """Choose the next untried cache frontier on the Gunner's resource side."""
         if self.gunner_site is None or self.gunner_direction is None:
             return None
         dx, dy = self.gunner_direction.opposite().delta()
@@ -2184,6 +2255,7 @@ class IntruderBot(BaseBot):
             pos
             for pos in self.known_env
             if pos != current
+            and pos not in self.failed_supply_search_frontiers
             and self.is_roadable_position(pos)
             and any(
                 neighbor is not None and neighbor not in self.known_env

@@ -273,6 +273,9 @@ def minimum_cost_flow_augmentation(
         anchor_cost_fn=None,
         edge_usable_fn=None,
         minimum_conveyor_cost: int = 0,
+        bridge_offsets=None,
+        bridge_obstacle_fn=None,
+        bridge_anchor_accepts_fn=None,
 ) -> tuple[list[Position], dict[Position, Position], int] | None:
     """Find the cheapest one-unit augmentation into residual transport.
 
@@ -291,9 +294,11 @@ def minimum_cost_flow_augmentation(
         anchor_cost_fn = lambda _anchor: 0
     if edge_usable_fn is None:
         edge_usable_fn = lambda _pos, _direction: True
+    if bridge_anchor_accepts_fn is None:
+        bridge_anchor_accepts_fn = anchor_accepts_source_fn
     cost_per_tile = min(
         minimum_conveyor_cost if custom_costs else conveyor_cost,
-        max(1, bridge_cost // max(1, max_jump_distance)),
+        max(1, bridge_cost // max(1, max_jump_distance if bridge_offsets is None else max(abs(dx) + abs(dy) for dx, dy in bridge_offsets))),
     )
 
     def heuristic(pos: Position) -> int:
@@ -364,17 +369,21 @@ def minimum_cost_flow_augmentation(
                 ),
             )
 
-        for direction in directions:
-            dx, dy = direction.delta()
-            for distance in range(2, max_jump_distance + 1):
-                target = offset_fn(current, dx * distance, dy * distance)
+        jumps = (
+            [(dx, dy, None, None) for dx, dy in bridge_offsets]
+            if bridge_offsets is not None else
+            [(direction.delta()[0] * distance, direction.delta()[1] * distance, direction, distance)
+             for direction in directions for distance in range(2, max_jump_distance + 1)]
+        )
+        for dx, dy, direction, distance in jumps:
+                target = offset_fn(current, dx, dy)
                 if (
                     target is None
                     or not usable_fn(target)
-                    or not bridge_crosses_block_fn(current, direction, distance)
+                    or not (bridge_obstacle_fn(current, target) if bridge_obstacle_fn is not None else bridge_crosses_block_fn(current, direction, distance))
                     or (
                         target in anchors
-                        and not anchor_accepts_source_fn(target, current)
+                        and not bridge_anchor_accepts_fn(target, current)
                     )
                 ):
                     continue

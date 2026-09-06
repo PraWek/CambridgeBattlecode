@@ -3,6 +3,7 @@ from collections import deque
 from cambc import Controller, Direction, EntityType, Environment, GameConstants, Position
 
 from base import BaseBot
+from construction_access import ConstructionAccess
 from constants import (
     AXIONITE_PIPELINE_ENABLED,
     AXIONITE_TITANIUM_THRESHOLD,
@@ -94,6 +95,10 @@ SCOUT_VISION_OFFSETS = tuple(
     for dy in range(-_VISION_RADIUS, _VISION_RADIUS + 1)
     if dx * dx + dy * dy <= GameConstants.BUILDER_BOT_VISION_RADIUS_SQ
 )
+TRANSPORT_BRIDGE_OFFSETS = tuple(
+    (dx, dy) for dx in range(-3, 4) for dy in range(-3, 4)
+    if 1 < dx * dx + dy * dy <= GameConstants.BRIDGE_TARGET_RADIUS_SQ
+)
 
 
 class BuilderBot(BaseBot):
@@ -114,6 +119,7 @@ class BuilderBot(BaseBot):
         self.known_bridge_targets: dict[Position, Position] = {}
         self.known_bridge_ids: dict[Position, int] = {}
         self.connected_network_cache: set[Position] | None = None
+        self.construction_access = ConstructionAccess()
         self.network_flow_cache_network: set[Position] | None = None
         self.network_flow_cache_harvesters: frozenset[Position] = frozenset()
         self.network_flow_cache_value = 0
@@ -839,11 +845,7 @@ class BuilderBot(BaseBot):
 
     def defer_ore_for_survey(self, ore: Position) -> None:
         """Temporarily resume exploration until a fully known branch exists."""
-        self.deferred_ores_until[ore] = self.current_round + 12
-        self.ore_retry_observed_count = max(
-            self.ore_retry_observed_count,
-            len(self.observed_tiles) + ORE_SURVEY_NEW_TILES_REQUIRED,
-        )
+        self.deferred_ores_until[ore] = self.current_round + CONNECTION_DEFER_MAX_ROUNDS
 
     def defer_connection_for_survey(self, ore: Position) -> None:
         """Suspend an impossible branch until exploration reveals a new route."""
@@ -1284,7 +1286,7 @@ class BuilderBot(BaseBot):
             # process's active line has a complete source/reservation count;
             # a globally observed allied trunk can hide harvesters discovered
             # by another scout and must not advertise fake residual capacity.
-            residual_tree.intersection_update(self.active_line_tiles)
+            residual_tree.intersection_update(self.owned_network_tiles)
         else:
             # Lost and foreign mines receive a physically separate line.  A
             # replacement builder cannot reconstruct the dead owner's flow
@@ -1365,7 +1367,7 @@ class BuilderBot(BaseBot):
             anchor = nodes[-1]
             build_tiles = nodes[:-1]
             source = ore if not build_tiles else build_tiles[-1]
-            valid = self.network_plan_receiver_accepts(
+            valid = (self.is_core_receiver_tile(anchor) and source in bridge_targets) or self.network_plan_receiver_accepts(
                 anchor,
                 source,
                 allowed_core_entries,
@@ -1424,7 +1426,7 @@ class BuilderBot(BaseBot):
 
         def virtual_accepts(receiver: Position, source: Position) -> bool:
             if self.is_core_receiver_tile(receiver):
-                return source in allowed_core_entries
+                return True
             if receiver in bridge_targets:
                 return True
             direction = directions.get(receiver)
@@ -1475,9 +1477,27 @@ class BuilderBot(BaseBot):
         int,
     ] | None:
         """Run min-cost augmentation over conveyors, bridges, and residual edges."""
+        blocked = {
+            pos for pos, building in self.known_buildings.items()
+            if building is not None and (
+                building[0] not in PASSABLE_BUILDINGS
+                or (building[0] == EntityType.CORE and building[1] != self.team)
+            )
+        }
+        reachable = self.construction_access.reachable(
+            self.current_position or self.core_pos,
+            self.known_env,
+            blocked,
+            self.tile_cache.neighbor,
+            DIRECTIONS,
+        )
 
         def usable(pos: Position) -> bool:
-            return pos in anchors or (pos not in network and self.traversable_for_connection(pos))
+            return pos in anchors or (
+                pos in reachable
+                and pos not in network
+                and self.traversable_for_connection(pos)
+            )
 
         def confirmed_bridge_obstacle(pos: Position) -> bool:
             env = self.known_env.get(pos)
@@ -1488,12 +1508,10 @@ class BuilderBot(BaseBot):
             if env == Environment.WALL or env in ORE_TYPES:
                 return True
             if pos in network:
-                # Crossing our own lane is justified only when that lane is
-                # physically full; otherwise detour or merge without paying
-                # for a bridge over ordinary open ground.
-                return (
-                    self.transport_lane_is_saturated(pos, network_loads)
-                )
+                # A lane excluded from this builder's residual anchors is a
+                # physical crossing obstacle even if its observed load is low.
+                # Crossing it preserves independent intake capacity.
+                return pos not in anchors
             building = self.known_buildings.get(pos)
             if building is None:
                 return False
@@ -1521,6 +1539,19 @@ class BuilderBot(BaseBot):
                 confirmed_bridge_obstacle(pos)
                 for step in range(1, distance)
                 if (pos := self.tile_cache.offset(current, dx * step, dy * step)) is not None
+            )
+
+        def bridge_obstacle(source: Position, target: Position) -> bool:
+            # A bridge into Core can reach its entire footprint, including
+            # diagonal ports beyond the conveyor-only intake perimeter.
+            if self.is_core_receiver_tile(target):
+                return True
+            dx, dy = target.x - source.x, target.y - source.y
+            steps = max(abs(dx), abs(dy))
+            return any(
+                confirmed_bridge_obstacle(middle)
+                for step in range(1, steps)
+                if (middle := self.tile_cache.offset(source, round(dx * step / steps), round(dy * step / steps))) is not None
             )
 
         def conveyor_cost_at(pos: Position, direction: Direction) -> int:
@@ -1577,6 +1608,12 @@ class BuilderBot(BaseBot):
             anchor_cost_fn=lambda anchor: network_loads.get(anchor, 0),
             edge_usable_fn=edge_is_usable,
             minimum_conveyor_cost=conveyor_cost,
+            bridge_offsets=TRANSPORT_BRIDGE_OFFSETS,
+            bridge_obstacle_fn=bridge_obstacle,
+            bridge_anchor_accepts_fn=lambda receiver, source: (
+                self.is_core_receiver_tile(receiver)
+                or self.network_receiver_accepts(receiver, source)
+            ),
         )
         if result is None:
             return None

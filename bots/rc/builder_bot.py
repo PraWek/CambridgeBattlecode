@@ -498,6 +498,7 @@ class BuilderBot(BaseBot):
         approaches = self.ore_action_approaches(ore)
         if not approaches:
             return False
+        search_state = self.a_star_state("ore_path")
         path = a_star_to_any(
             controller,
             current,
@@ -506,7 +507,10 @@ class BuilderBot(BaseBot):
             self.tile_cache.neighbor,
             movement_directions=DIRECTIONS,
             max_expansions=ORE_PATH_A_STAR_MAX_EXPANSIONS,
+            state=search_state,
         )
+        if search_state.pending:
+            return False
         if not path and current not in approaches:
             return False
         self.target_ore = ore
@@ -559,6 +563,12 @@ class BuilderBot(BaseBot):
         connecting = self.target_is_connection
         if self.assign_ore_target(controller, self.get_cached_position(), ore, connecting):
             return True
+        if (
+            self.a_star_pending("ore_path")
+            or self.a_star_pending("connection_approach")
+            or self.a_star_pending("connection_bridge_detour")
+        ):
+            return False
         if connecting:
             self.pending_network_ores.update((ore,))
             # Do not abandon an already harvested ore if a just-observed
@@ -951,6 +961,7 @@ class BuilderBot(BaseBot):
         approach, build_tiles, directions, bridge_targets, anchor = plan
         path_to_approach: list[Position] = []
         if build_tiles:
+            approach_state = self.a_star_state("connection_approach")
             path_to_approach = a_star_to_any(
                 controller,
                 current,
@@ -959,7 +970,10 @@ class BuilderBot(BaseBot):
                 self.tile_cache.neighbor,
                 movement_directions=DIRECTIONS,
                 max_expansions=CONNECTION_A_STAR_MAX_EXPANSIONS,
+                state=approach_state,
             )
+            if approach_state.pending:
+                return False
             if not path_to_approach and current != approach:
                 return False
         path = list(path_to_approach)
@@ -969,6 +983,7 @@ class BuilderBot(BaseBot):
             bridge_target = bridge_targets.get(tile)
             if bridge_target is None or bridge_target == anchor:
                 continue
+            detour_state = self.a_star_state("connection_bridge_detour")
             detour = a_star_to_any(
                 controller,
                 tile,
@@ -977,7 +992,10 @@ class BuilderBot(BaseBot):
                 self.tile_cache.neighbor,
                 movement_directions=DIRECTIONS,
                 max_expansions=CONNECTION_A_STAR_MAX_EXPANSIONS,
+                state=detour_state,
             )
+            if detour_state.pending:
+                return False
             if not detour:
                 return False
             path.extend(detour)
@@ -1227,6 +1245,11 @@ class BuilderBot(BaseBot):
 
         for ore in sorted(self.connection_candidates(), key=ore_sort_key):
             if not self.assign_ore_target(controller, current, ore, connecting=True):
+                if (
+                    self.a_star_pending("connection_approach")
+                    or self.a_star_pending("connection_bridge_detour")
+                ):
+                    return
                 continue
             if was_idle:
                 self.stuck_rounds = 0
@@ -1237,6 +1260,8 @@ class BuilderBot(BaseBot):
             if self.is_harvester_on_tile(ore) or ore in self.skipped_ores:
                 continue
             if not self.assign_ore_target(controller, current, ore, connecting=False):
+                if self.a_star_pending("ore_path"):
+                    return
                 # The known map does not yet contain a route.  Do not repeat
                 # the same bounded A* search every turn; reveal more terrain
                 # first, then reconsider this deposit.
@@ -1256,6 +1281,8 @@ class BuilderBot(BaseBot):
             if was_idle:
                 self.stuck_rounds = 0
                 self.last_progress_round = self.rounds_alive
+            return
+        if self.a_star_pending("scout_path"):
             return
 
         # No usable frontier was found, so take one local right-hand step and
@@ -1398,6 +1425,7 @@ class BuilderBot(BaseBot):
         candidates.sort(key=lambda pos: self.scout_frontier_score(current, pos), reverse=True)
         for index in range(0, len(candidates), 4):
             targets = set(candidates[index:index + 4])
+            search_state = self.a_star_state("scout_path")
             path = a_star_to_any(
                 controller,
                 current,
@@ -1407,7 +1435,10 @@ class BuilderBot(BaseBot):
                 movement_directions=DIRECTIONS,
                 extra_step_cost_fn=lambda pos: self.scout_path_step_cost(current, pos),
                 max_expansions=SCOUT_PATH_MAX_EXPANSIONS,
+                state=search_state,
             )
+            if search_state.pending:
+                return None
             if path:
                 return path[-1], path
             if current in targets:

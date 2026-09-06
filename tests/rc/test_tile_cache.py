@@ -17,7 +17,12 @@ if str(RC_BOT_DIRECTORY) not in sys.path:
 from base import BaseBot
 from core_bot import CoreBot
 from intruder_bot import IntruderBot
-from navigation import a_star_to_any
+from navigation import (
+    AStarSearchState,
+    a_star_from_any,
+    a_star_from_any_with_bridges,
+    a_star_to_any,
+)
 from tile_cache import TileCache
 
 
@@ -236,6 +241,99 @@ class TileCacheNavigationTests(unittest.TestCase):
         self.assertEqual(path, [cache._positions[1][0], goal])
         self.assertIs(path[0], cache._positions[1][0])
         self.assertIs(path[1], goal)
+
+    def test_limited_a_star_searches_resume_from_the_saved_frontier(self) -> None:
+        """A bounded search reaches its route over successive turns, not retries."""
+        cache = TileCache(7, 1)
+        route = [cache._positions[x][0] for x in range(7)]
+        state = AStarSearchState()
+
+        path = a_star_to_any(
+            None,
+            route[0],
+            {route[-1]},
+            lambda _controller, pos: pos in route,
+            cache.neighbor,
+            max_expansions=2,
+            state=state,
+        )
+
+        self.assertEqual(path, [])
+        self.assertTrue(state.pending)
+        self.assertIn(route[2], state.g_score)
+
+        for _ in range(4):
+            path = a_star_to_any(
+                None,
+                route[0],
+                {route[-1]},
+                lambda _controller, pos: pos in route,
+                cache.neighbor,
+                max_expansions=2,
+                state=state,
+            )
+            if path:
+                break
+            self.assertTrue(state.pending)
+
+        self.assertEqual(path, route[1:])
+        self.assertFalse(state.pending)
+
+    def test_limited_multi_source_a_star_resumes_from_saved_frontier(self) -> None:
+        """The conveyor-oriented multi-source variant is resumable too."""
+        cache = TileCache(5, 1)
+        route = [cache._positions[x][0] for x in range(5)]
+        state = AStarSearchState()
+
+        path: list[Position] = []
+        for _ in range(5):
+            path = a_star_from_any(
+                None,
+                {route[0]},
+                {route[-1]},
+                lambda _controller, pos: pos in route,
+                cache.neighbor,
+                max_expansions=1,
+                state=state,
+            )
+            if path:
+                break
+            self.assertTrue(state.pending)
+
+        self.assertEqual(path, route)
+        self.assertFalse(state.pending)
+
+    def test_limited_bridge_a_star_resumes_from_saved_frontier(self) -> None:
+        """Bridge-route planning retains both normal and bridge predecessor data."""
+        cache = TileCache(5, 1)
+        route = [cache._positions[x][0] for x in range(5)]
+        walkable = {route[0], route[3], route[4]}
+        state = AStarSearchState()
+
+        plan = None
+        for _ in range(4):
+            plan = a_star_from_any_with_bridges(
+                None,
+                {route[0]},
+                {route[4]},
+                lambda _controller, pos: pos in walkable,
+                normal_step_cost=4,
+                bridge_step_cost=7,
+                neighbor_fn=cache.neighbor,
+                max_expansions=1,
+                bridge_landing_fn=lambda _controller, pos: pos in walkable,
+                state=state,
+            )
+            if plan is not None:
+                break
+            self.assertTrue(state.pending)
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan[0], [route[0], route[3], route[4]])
+        self.assertEqual(plan[1], {route[0]: route[3]})
+        self.assertEqual(plan[2], 11)
+        self.assertFalse(state.pending)
 
     def test_intruder_exploration_does_not_use_a_star(self) -> None:
         """Exploration stays local even when the opposing Core is confirmed."""
@@ -579,6 +677,43 @@ class TileCacheNavigationTests(unittest.TestCase):
         self.assertTrue(move.call_args.kwargs["forward_sector_only"])
         self.assertTrue(move.call_args.kwargs["require_closer"])
         self.assertFalse(bot.wall_following)
+
+    def test_titanium_search_skips_a_frontier_without_a_known_route(self) -> None:
+        """An isolated nearby frontier must not stall all later Ti scouting."""
+        bot = IntruderBot(20, 20)
+        current = bot.tile_cache.position_at(10, 10)
+        gunner = bot.tile_cache.position_at(10, 7)
+        blocked_frontier = bot.tile_cache.position_at(11, 10)
+        reachable_frontier = bot.tile_cache.position_at(12, 10)
+        assert all((current, gunner, blocked_frontier, reachable_frontier))
+        bot.gunner_site = gunner
+        bot.gunner_direction = Direction.NORTH
+        bot.current_position = current
+        bot.known_env.update({
+            current: Environment.EMPTY,
+            gunner: Environment.EMPTY,
+            blocked_frontier: Environment.EMPTY,
+            reachable_frontier: Environment.EMPTY,
+        })
+
+        searched: list[Position] = []
+        moved: list[Direction] = []
+
+        def route_to_frontier(_controller, _start, goals, *_args, **_kwargs):
+            target = next(iter(goals))
+            searched.append(target)
+            return [] if target is blocked_frontier else [target]
+
+        bot.try_move_step = lambda _controller, direction, **_kwargs: (
+            moved.append(direction) or True
+        )
+        with patch("intruder_bot.a_star_to_any", side_effect=route_to_frontier):
+            bot.search_for_titanium(None)
+            bot.search_for_titanium(None)
+
+        self.assertEqual(searched, [blocked_frontier, reachable_frontier])
+        self.assertEqual(moved, [Direction.EAST])
+        self.assertEqual(bot.supply_search_target, reachable_frontier)
 
 
 class CoreBootstrapTests(unittest.TestCase):

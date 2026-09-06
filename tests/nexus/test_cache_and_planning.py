@@ -6,7 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from cambc import Direction, EntityType, Position, Team
+from cambc import Direction, EntityType, Environment, Position, Team
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +25,7 @@ exploration = load_module("nexus_exploration_test", "exploration.py")
 economy = load_module("nexus_economy_test", "economy.py")
 network_planner = load_module("nexus_network_planner_test", "network_planner.py")
 network_memory = load_module("nexus_network_memory_test", "network_memory.py")
+construction_access = load_module("nexus_construction_access_test", "construction_access.py")
 sys.path.insert(0, str(NEXUS))
 try:
     navigation = load_module("nexus_navigation_test", "navigation.py")
@@ -301,6 +302,31 @@ class NexusExplorationTests(unittest.TestCase):
 
 
 class NexusCapacityTests(unittest.TestCase):
+    def test_construction_component_excludes_sealed_bridge_landing(self):
+        cache = TileCache(5, 3)
+        env = {cache.position_at(x, y): Environment.EMPTY for x in range(5) for y in range(3)}
+        for y in range(3):
+            env[cache.position_at(2, y)] = Environment.WALL
+        start, sealed = cache.position_at(1, 1), cache.position_at(3, 1)
+        access = construction_access.ConstructionAccess()
+        directions = [d for d in Direction if d != Direction.CENTRE]
+        reachable = access.reachable(start, env, set(), cache.neighbor, directions)
+        self.assertNotIn(sealed, reachable)
+        self.assertIs(reachable, access.reachable(start, env, set(), cache.neighbor, directions))
+        self.assertIn(sealed, access.reachable(sealed, env, set(), cache.neighbor, directions))
+
+    def test_bridge_can_feed_diagonal_core_port(self):
+        cache = TileCache(4, 4)
+        start, core = cache.position_at(0, 0), cache.position_at(2, 2)
+        result = network_planner.minimum_cost_flow_augmentation(
+            [start], {core}, [Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST],
+            cache.neighbor, cache.offset, lambda pos: pos in {start, core},
+            lambda *_: False, lambda *_: False, 3, 20, 3, 20,
+            bridge_offsets=[(2, 2)], bridge_obstacle_fn=lambda *_: True,
+            bridge_anchor_accepts_fn=lambda *_: True,
+        )
+        self.assertEqual(result, ([start, core], {start: core}, 20))
+
     def test_recovered_mine_can_merge_only_into_a_line_with_downstream_capacity(self) -> None:
         cache = TileCache(5, 2)
         upper = [cache.position_at(x, 0) for x in range(1, 5)]
@@ -518,6 +544,7 @@ class NexusCapacityTests(unittest.TestCase):
         generic_modules = (
             "base",
             "constants",
+            "construction_access",
             "exploration",
             "geometry",
             "navigation",
@@ -574,6 +601,13 @@ class NexusCapacityTests(unittest.TestCase):
                 bot.core_entry_tiles(),
             )
         )
+        failed = bot.tile_cache.position_at(0, 0)
+        bot.current_round = 100
+        bot.defer_ore_for_survey(failed)
+        self.assertEqual(bot.ore_retry_observed_count, 0)
+        self.assertTrue(bot.ore_is_deferred(failed))
+        bot.current_round = 200
+        self.assertFalse(bot.ore_is_deferred(failed))
 
     def test_bridge_execution_returns_to_sources_after_building_landing(self) -> None:
         cache = TileCache(5, 2)

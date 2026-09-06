@@ -1,6 +1,7 @@
 from cambc import Controller, EntityType, Environment, Position, Team
 
 from constants import PASSABLE_BUILDINGS
+from navigation import AStarSearchState
 from tile_cache import TileCache
 
 
@@ -14,6 +15,7 @@ class BaseBot:
         self.entity_id: int | None = None
         self.team: Team | None = None
         self.current_position: Position | None = None
+        self._a_star_states: dict[str, AStarSearchState] = {}
 
         self.max_cpu_cost = 0
         self.rolling_avg_cpu_cost = 0
@@ -54,6 +56,25 @@ class BaseBot:
         if self.current_position is None:
             raise RuntimeError("tile cache was not scanned before reading position")
         return self.current_position
+
+    def a_star_state(self, name: str) -> AStarSearchState:
+        """Return the persistent frontier for one logical pathfinding task."""
+        state = self._a_star_states.get(name)
+        if state is None:
+            state = AStarSearchState()
+            self._a_star_states[name] = state
+        return state
+
+    def clear_a_star_state(self, name: str) -> None:
+        """Forget a pending search whose higher-level plan was abandoned."""
+        state = self._a_star_states.get(name)
+        if state is not None:
+            state.finish()
+
+    def a_star_pending(self, name: str) -> bool:
+        """Return whether this logical pathfinding task must resume next turn."""
+        state = self._a_star_states.get(name)
+        return state is not None and state.pending
 
     def is_cached_tile_passable(self, pos: Position) -> bool:
         """Return whether the latest cached tile state permits a builder step."""
