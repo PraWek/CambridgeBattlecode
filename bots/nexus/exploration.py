@@ -1,17 +1,46 @@
 from collections.abc import Callable, Iterable
+from collections import deque
 
 from cambc import Direction, Position
 
 
+_HEADING_INDEX = {direction: index for index, direction in enumerate((
+    Direction.NORTH, Direction.NORTHEAST, Direction.EAST, Direction.SOUTHEAST,
+    Direction.SOUTH, Direction.SOUTHWEST, Direction.WEST, Direction.NORTHWEST,
+))}
+
+
+def frontier_search_steps(start, targets, neighbor, traversable, directions):
+    """Search every reachable frontier, resuming after each small BFS slice."""
+    queue = deque([start])
+    parents = {start: None}
+    expansions = 0
+    while queue:
+        if expansions % 16 == 0:
+            yield
+        current = queue.popleft()
+        if current in targets:
+            path = []
+            while current != start:
+                path.append(current)
+                current = parents[current]
+            path.reverse()
+            return path
+        expansions += 1
+        for direction in directions:
+            candidate = neighbor(current, direction)
+            if candidate is None or candidate in parents or not traversable(candidate):
+                continue
+            parents[candidate] = current
+            queue.append(candidate)
+    return []
+
+
 def _turn_distance(direction: Direction, heading: Direction | None) -> int:
     """Return the smaller number of 45-degree turns from ``heading``."""
-    if heading is None:
+    if heading not in _HEADING_INDEX or direction not in _HEADING_INDEX:
         return 0
-    probe = heading
-    clockwise = 0
-    while probe != direction and clockwise < 8:
-        probe = probe.rotate_right()
-        clockwise += 1
+    clockwise = (_HEADING_INDEX[direction] - _HEADING_INDEX[heading]) % 8
     return min(clockwise, 8 - clockwise)
 
 
@@ -50,6 +79,7 @@ def choose_information_gain_step(
     direction whenever two equivalent cells swap dictionary order.
     """
     ranked: list[tuple[tuple[int, ...], Direction, Position]] = []
+    current_progress = forward_progress(current)
     for order, direction in enumerate(directions):
         candidate = neighbor(current, direction)
         if candidate is None or not viable(candidate):
@@ -57,7 +87,6 @@ def choose_information_gain_step(
         gain = vision_gain(candidate)
         if require_new_vision and gain == 0:
             continue
-        current_progress = forward_progress(current)
         candidate_progress = forward_progress(candidate)
         rank = (
             int(avoided(candidate)),

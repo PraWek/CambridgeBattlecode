@@ -425,9 +425,15 @@ def analyze(path: Path) -> dict:
     placement_turns: list[dict[str, list[int]]] = [defaultdict(list), defaultdict(list)]
     placement_tiles: list[Counter[tuple[str, tuple[int, int]]]] = [Counter(), Counter()]
     coverage: list[set[tuple[int, int]]] = [set(), set()]
+    destroyed = [Counter(), Counter()]
+    unit_teams = {core['id']: core['team'] for core in cores}
+    cpu = [[], []]
+    timeouts = [0, 0]
+    first_delivery = [None, None]
+    timeline = [[], []]
     players = [
-        {"titanium": 500, "titanium_collected": 0},
-        {"titanium": 500, "titanium_collected": 0},
+        {"titanium": 500, "titanium_collected": 0, "axionite": 0, "axionite_collected": 0},
+        {"titanium": 500, "titanium_collected": 0, "axionite": 0, "axionite_collected": 0},
     ]
 
     for core in cores:
@@ -443,6 +449,7 @@ def analyze(path: Path) -> dict:
                     message(update, 1)[1][-1][1]  # PlaceEntity.entity
                 )
                 entities[placed_entity.entity_id] = placed_entity
+                unit_teams[placed_entity.entity_id] = placed_entity.team
                 placed[placed_entity.team][placed_entity.kind] += 1
                 placement_turns[placed_entity.team][placed_entity.kind].append(turn_number)
                 placement_tiles[placed_entity.team][(
@@ -465,7 +472,9 @@ def analyze(path: Path) -> dict:
                     entity.position = position(movement, 2)
             elif 3 in update:
                 removed = integer(message(update, 3), 1)
-                entities.pop(removed, None)
+                removed_entity = entities.pop(removed, None)
+                if removed_entity is not None:
+                    destroyed[removed_entity.team][removed_entity.kind] += 1
             elif 6 in update:
                 values = message(message(update, 6), 1)
                 for team, player_field in enumerate((1, 2)):
@@ -474,9 +483,18 @@ def analyze(path: Path) -> dict:
                         players[team] = {
                             "titanium": integer(player, 1),
                             "titanium_collected": integer(player, 4),
+                            "axionite": integer(player, 2),
+                            "axionite_collected": integer(player, 5),
                         }
+                        if first_delivery[team] is None and integer(player, 4) > 0:
+                            first_delivery[team] = turn_number
             elif 9 in update:
                 output = message(update, 9)
+                team = unit_teams.get(integer(output, 1))
+                if team is not None:
+                    if integer(output, 3) > 0:
+                        cpu[team].append(integer(output, 3))
+                    timeouts[team] += bool(integer(output, 4))
                 stats = builders.get(integer(output, 1))
                 if stats is not None and integer(output, 4):
                     stats.tle += 1
@@ -493,6 +511,17 @@ def analyze(path: Path) -> dict:
                 width,
                 height,
             ))
+        if turn_number % 100 == 0 or turn_number == len(turns):
+            alive = [Counter(), Counter()]
+            for entity in entities.values():
+                alive[entity.team][entity.kind] += 1
+            for team in (0, 1):
+                timeline[team].append({
+                    'round': turn_number, **players[team],
+                    'builders': alive[team]['builder'],
+                    'harvesters': alive[team]['harvester'],
+                    'tle': timeouts[team],
+                })
 
     result = {
         "file": str(path.resolve()),
@@ -504,6 +533,9 @@ def analyze(path: Path) -> dict:
             "wall_tiles": sum(value == 1 for row in environments for value in row),
         },
         "teams": [],
+        "winner": integer(replay, 4) if 6 in replay else None,
+        "win_condition": next((value.decode('utf8', errors='replace')
+                               for wire, value in replay.get(6, ()) if wire == 2), None),
     }
     for team in (0, 1):
         core = next(item for item in cores if item["team"] == team)
@@ -516,6 +548,13 @@ def analyze(path: Path) -> dict:
             "team": team,
             "titanium": players[team]["titanium"],
             "titanium_collected": players[team]["titanium_collected"],
+            "axionite": players[team]["axionite"],
+            "axionite_collected": players[team]["axionite_collected"],
+            "first_titanium_delivery": first_delivery[team],
+            "tle": timeouts[team],
+            "cpu_us_p95": sorted(cpu[team])[int((len(cpu[team]) - 1) * .95)] if cpu[team] else None,
+            "destroyed": dict(destroyed[team]),
+            "timeline": timeline[team],
             "coverage": len(coverage[team]),
             "coverage_percent": round(100 * len(coverage[team]) / (width * height), 1),
             "reachable_coverage": len(reachable_vision),

@@ -45,6 +45,31 @@ core_bot_module = load_core_module()
 
 
 class NexusCoreBootstrapTests(unittest.TestCase):
+    def test_empty_fleet_recovers_after_replacement_cap_with_backoff(self):
+        class Controller:
+            round = 1000
+            units = 1
+            spawned = []
+            def get_unit_count(self): return self.units
+            def get_current_round(self): return self.round
+            def can_spawn(self, pos): return True
+            def spawn_builder(self, pos): self.spawned.append(pos)
+
+        c = Controller()
+        bot = core_bot_module.CoreBot(11, 11)
+        bot.core_pos = bot.tile_cache.position_at(5, 5)
+        bot.initial_spawned_directions.update(core_bot_module.BUILDER_WORK_DIRECTIONS)
+        bot.replacement_builders_spawned = core_bot_module.MAX_ADDITIONAL_BUILDER_SPAWNS
+        self.assertTrue(bot.try_spawn_missing_builder(c))
+        c.round += 1
+        self.assertFalse(bot.try_spawn_missing_builder(c))
+        c.round += 128
+        c.units = 2
+        self.assertFalse(bot.try_spawn_missing_builder(c))
+        c.units = 1
+        self.assertTrue(bot.try_spawn_missing_builder(c))
+        self.assertEqual(len(c.spawned), 2)
+
     def test_first_cardinal_builder_spawns_before_full_cache_scan(self) -> None:
         class Controller:
             spawned: list[Position] = []

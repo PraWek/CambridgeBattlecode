@@ -256,7 +256,17 @@ def transport_max_flow(
     return len(assignment), loads, served_harvesters
 
 
-def minimum_cost_flow_augmentation(
+def minimum_cost_flow_augmentation(*args, **kwargs):
+    """Synchronous entry point for offline checks and small callers."""
+    job = flow_augmentation_steps(*args, **kwargs)
+    while True:
+        try:
+            next(job)
+        except StopIteration as result:
+            return result.value
+
+
+def flow_augmentation_steps(
         starts: list[Position],
         anchors: set[Position],
         directions: list[Direction],
@@ -296,16 +306,28 @@ def minimum_cost_flow_augmentation(
         edge_usable_fn = lambda _pos, _direction: True
     if bridge_anchor_accepts_fn is None:
         bridge_anchor_accepts_fn = anchor_accepts_source_fn
+    jump_span = max_jump_distance if bridge_offsets is None else max(
+        (abs(dx) + abs(dy) for dx, dy in bridge_offsets), default=1,
+    )
     cost_per_tile = min(
         minimum_conveyor_cost if custom_costs else conveyor_cost,
-        max(1, bridge_cost // max(1, max_jump_distance if bridge_offsets is None else max(abs(dx) + abs(dy) for dx, dy in bridge_offsets))),
+        max(1, bridge_cost // max(1, jump_span)),
     )
+    jumps = (
+        [(dx, dy, None, None) for dx, dy in bridge_offsets]
+        if bridge_offsets is not None else
+        [(direction.delta()[0] * distance, direction.delta()[1] * distance, direction, distance)
+         for direction in directions for distance in range(2, max_jump_distance + 1)]
+    )
+    estimates = {}
 
     def heuristic(pos: Position) -> int:
-        return cost_per_tile * min(
-            abs(pos.x - anchor.x) + abs(pos.y - anchor.y)
-            for anchor in anchors
-        )
+        if pos not in estimates:
+            estimates[pos] = cost_per_tile * min(
+                abs(pos.x - anchor.x) + abs(pos.y - anchor.y)
+                for anchor in anchors
+            )
+        return estimates[pos]
 
     queue: list[tuple[int, int, int, int, int, Position]] = []
     costs: dict[Position, int] = {}
@@ -320,6 +342,8 @@ def minimum_cost_flow_augmentation(
 
     expansions = 0
     while queue:
+        if expansions % 2 == 0:
+            yield
         _, _, cost, _, _, current = heappop(queue)
         if cost != costs.get(current):
             continue
@@ -369,39 +393,33 @@ def minimum_cost_flow_augmentation(
                 ),
             )
 
-        jumps = (
-            [(dx, dy, None, None) for dx, dy in bridge_offsets]
-            if bridge_offsets is not None else
-            [(direction.delta()[0] * distance, direction.delta()[1] * distance, direction, distance)
-             for direction in directions for distance in range(2, max_jump_distance + 1)]
-        )
         for dx, dy, direction, distance in jumps:
-                target = offset_fn(current, dx, dy)
-                if (
-                    target is None
-                    or not usable_fn(target)
-                    or not (bridge_obstacle_fn(current, target) if bridge_obstacle_fn is not None else bridge_crosses_block_fn(current, direction, distance))
-                    or (
-                        target in anchors
-                        and not bridge_anchor_accepts_fn(target, current)
-                    )
-                ):
-                    continue
-                new_cost = cost + bridge_cost
-                if target in anchors:
-                    new_cost += anchor_cost_fn(target)
-                if new_cost >= costs.get(target, 10**9):
-                    continue
-                costs[target] = new_cost
-                came_from[target] = (current, True)
-                remaining = heuristic(target)
-                heappush(
-                    queue,
-                    (
-                        new_cost + remaining, remaining, new_cost,
-                        target.x, target.y, target,
-                    ),
+            target = offset_fn(current, dx, dy)
+            if (
+                target is None
+                or not usable_fn(target)
+                or not (bridge_obstacle_fn(current, target) if bridge_obstacle_fn is not None else bridge_crosses_block_fn(current, direction, distance))
+                or (
+                    target in anchors
+                    and not bridge_anchor_accepts_fn(target, current)
                 )
+            ):
+                continue
+            new_cost = cost + bridge_cost
+            if target in anchors:
+                new_cost += anchor_cost_fn(target)
+            if new_cost >= costs.get(target, 10**9):
+                continue
+            costs[target] = new_cost
+            came_from[target] = (current, True)
+            remaining = heuristic(target)
+            heappush(
+                queue,
+                (
+                    new_cost + remaining, remaining, new_cost,
+                    target.x, target.y, target,
+                ),
+            )
     return None
 
 

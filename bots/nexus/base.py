@@ -14,6 +14,7 @@ class BaseBot:
         self.entity_id: int | None = None
         self.team: Team | None = None
         self.current_position: Position | None = None
+        self._unprocessed_observations: set[Position] = set()
 
         self.max_cpu_cost = 0
         self.rolling_avg_cpu_cost = 0
@@ -27,6 +28,7 @@ class BaseBot:
         if self.entity_id is None:
             self.entity_id = controller.get_id()
         self.tile_cache.scan_turn(controller, self.entity_id)
+        self._unprocessed_observations.update(self.tile_cache.newly_observed_tiles)
         if self.tile_cache.scan_incomplete_this_turn:
             return True
         self.current_position = self.tile_cache.current_position
@@ -39,7 +41,13 @@ class BaseBot:
                 return True
             if not self.tile_cache.cache_friendly_marker_values(controller, self.team):
                 return True
-        return self.tile_cache.symmetry_confirmed_this_turn
+        if self.tile_cache.symmetry_confirmed_this_turn:
+            return True
+        # A full scan can take several turns. Deliver all terrain discoveries
+        # to the role, including cells read during earlier partial scans.
+        self.tile_cache.newly_observed_tiles = self._unprocessed_observations
+        self._unprocessed_observations = set()
+        return False
 
     def get_cached_position(self) -> Position:
         """Return this entity's start-of-turn position without an API call."""

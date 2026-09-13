@@ -25,6 +25,7 @@ _CORE_FOOTPRINT_OFFSETS = tuple(
 )
 _BASE_SYMMETRIES = ("rotational", "vertical", "horizontal")
 _DIAGONAL_SYMMETRIES = ("main_diagonal", "anti_diagonal")
+_DIRECTION_DELTAS = {direction: direction.delta() for direction in Direction}
 # Controller calls have a material CPU cost on crowded maps.  Seven calls leave
 # room for navigation after a partial entity scan; terrain and the own unit
 # are always completed before a role is allowed to act.
@@ -784,7 +785,7 @@ class TileCache:
 
     def neighbor(self, pos: Position, direction: Direction) -> Position | None:
         """Return the canonical adjacent tile, or ``None`` beyond the map edge."""
-        dx, dy = direction.delta()
+        dx, dy = _DIRECTION_DELTAS[direction]
         return self.offset(pos, dx, dy)
 
     def _set_building(

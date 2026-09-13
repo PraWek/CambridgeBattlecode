@@ -39,6 +39,7 @@ class CoreBot(BaseBot):
         self.initial_spawned_directions: set[Direction] = set()
         self.replacement_direction_index = 0
         self.replacement_builders_spawned = 0
+        self.last_builder_spawn_round = -128
         self.sector_targets: dict[Direction, tuple[Position, Environment]] = {}
         self.sector_marker_pads: dict[Direction, Position] = {}
         self.sector_marker_values: dict[Direction, int | None] = {}
@@ -216,7 +217,10 @@ class CoreBot(BaseBot):
             ]
         else:
             if self.replacement_builders_spawned >= MAX_ADDITIONAL_BUILDER_SPAWNS:
-                return False
+                # The normal cap limits recycling, but must not leave the core
+                # without any worker for the rest of the match.
+                if living_builders or controller.get_current_round() - self.last_builder_spawn_round < 128:
+                    return False
             direction = BUILDER_WORK_DIRECTIONS[
                 self.replacement_direction_index % len(BUILDER_WORK_DIRECTIONS)
             ]
@@ -251,6 +255,7 @@ class CoreBot(BaseBot):
                 ):
                     continue
                 controller.spawn_builder(spawn_pos)
+                self.last_builder_spawn_round = controller.get_current_round()
                 if len(self.initial_spawned_directions) < len(BUILDER_WORK_DIRECTIONS):
                     self.initial_spawned_directions.add(direction)
                 else:

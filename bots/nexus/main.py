@@ -21,8 +21,6 @@ class Player:
         """Create the bot implementation corresponding to this entity's type."""
         if self.initialized:
             return
-        self.initialized = True
-
         entity_type: EntityType = c.get_entity_type()
         if entity_type == EntityType.CORE:
             self.bot = CoreBot(c.get_map_width(), c.get_map_height())
@@ -30,3 +28,6 @@ class Player:
             self.bot = BuilderBot(c.get_map_width(), c.get_map_height())
         elif entity_type == EntityType.GUNNER:
             self.bot = GunnerBot(c.get_map_width(), c.get_map_height())
+        # Construction can itself be interrupted by the engine's CPU limit.
+        # Retry next turn until a complete role object has been assigned.
+        self.initialized = True

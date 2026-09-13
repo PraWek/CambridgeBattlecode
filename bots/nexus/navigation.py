@@ -7,7 +7,20 @@ from constants import LARGE_NUMBER, ORTHOGONAL_DIRECTIONS
 from geometry import chebyshev
 
 
-def a_star_to_any(
+def _finish(search):
+    while True:
+        try:
+            next(search)
+        except StopIteration as result:
+            return result.value
+
+
+def a_star_to_any(*args, **kwargs) -> list[Position]:
+    """Synchronous adapter for offline callers."""
+    return _finish(a_star_steps(*args, **kwargs))
+
+
+def a_star_steps(
         controller: Controller,
         start: Position,
         goals: set[Position],
@@ -37,6 +50,8 @@ def a_star_to_any(
     expansions = 0
 
     while queue:
+        if expansions % 8 == 0:
+            yield
         _, cost, current = heappop(queue)
         if current in goals:
             path = []
@@ -73,7 +88,11 @@ def a_star_to_any(
     return []
 
 
-def breadth_first_sweep_path(
+def breadth_first_sweep_path(*args, **kwargs) -> list[Position]:
+    return _finish(sweep_steps(*args, **kwargs))
+
+
+def sweep_steps(
         start: Position,
         traversable_fn,
         neighbor_fn,
@@ -96,6 +115,8 @@ def breadth_first_sweep_path(
     expansions = 0
 
     while queue:
+        if expansions % 16 == 0:
+            yield
         if max_expansions is not None and expansions >= max_expansions:
             break
         current = queue.popleft()
