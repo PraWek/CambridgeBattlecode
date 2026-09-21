@@ -100,6 +100,9 @@ class PlanningSliceTests(unittest.TestCase):
             def get_entity_type(self): return EntityType.BUILDER_BOT
             def get_map_width(self): return 50
             def get_map_height(self): return 50
+            def get_position(self): return TileCache(1, 1).position_at(0, 0)
+            def get_team(self): return Team.A
+            def get_nearby_buildings(self): return []
 
         role = object()
         with patch.object(player_module, 'BuilderBot', side_effect=[RuntimeError('interrupted'), role]):

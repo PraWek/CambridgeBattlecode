@@ -1,7 +1,7 @@
-Cambridge Battlecode
+# Cambridge Battlecode Documentation
 
-Documentation for the Cambridge Battlecode programming competition.
-Cambridge Battlecode Cambridge Battlecode is a programming competition where you write Python bots that compete in a turn-based strategy game. Your bots control autonomous mining fleets on Titan — harvesting resources, building infrastructure, and destroying the enemy core. For competition details, dates, prizes, and eligibility, visit the main website.
+Documentation for the Cambridge Battlecode programming competition.  
+Cambridge Battlecode is a programming competition where you write Python bots that compete in a turn-based strategy game. Your bots control autonomous mining fleets on Titan — harvesting resources, building infrastructure, and destroying the enemy core. For competition details, dates, prizes, and eligibility, visit the main website.
 
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.battlecode.cam/llms.txt
