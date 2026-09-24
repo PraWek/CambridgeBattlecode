@@ -3,6 +3,7 @@
 from cambc import Controller, Direction, EntityType, Environment, GameConstants, Position
 
 from combat_base import CombatBot
+from assault import try_siege
 from constants import (
     DIRECTIONS,
     LAUNCH_WAIT_ROUNDS,
@@ -152,6 +153,8 @@ class IntruderBot(CombatBot):
             return
 
         self.update_enemy_knowledge()
+        if try_siege(self, controller, current):
+            return
         self.refresh_known_bridge_targets(controller)
         if self.clear_cheap_enemy_building(controller, current):
             self.draw_goal_indicator(controller, current)

@@ -77,6 +77,7 @@ from exploration import (
 )
 from navigation import a_star_steps, sweep_steps
 from network_memory import NetworkMemory
+from defense import defend_economy, ore_feeds_enemy
 from network_planner import (
     dedicated_route_tree,
     flow_augmentation_steps,
@@ -332,6 +333,8 @@ class BuilderBot(BaseBot):
             and controller.get_global_resources()[0] > AXIONITE_TITANIUM_THRESHOLD
         )
         self.cleanup_abandoned_network(controller, current)
+        if defend_economy(self, controller, current):
+            return
         if self.try_repair_nearby_network(controller, current):
             return
         if (
@@ -394,8 +397,7 @@ class BuilderBot(BaseBot):
                     self.clear_ore_target()
                     self.select_new_target(controller)
                     return
-                harvester_id = controller.build_harvester(self.target_ore)
-                self.record_harvester_built(self.target_ore, harvester_id)
+                # Activate the mine only after its route and output guards.
                 return
 
             self.harvester_fail_count += 1
@@ -711,6 +713,8 @@ class BuilderBot(BaseBot):
 
     def is_ore_eligible(self, ore: Position) -> bool:
         """Return whether this ore type is currently allowed to be mined."""
+        if ore_feeds_enemy(self, ore):
+            return False
         resource = self.resource_at(ore)
         return resource == Environment.ORE_TITANIUM or (
             resource == Environment.ORE_AXIONITE and self.titanium_unlocked
@@ -775,8 +779,7 @@ class BuilderBot(BaseBot):
                 if ore == self.target_ore:
                     self.clear_ore_target()
                 continue
-            harvester_id = controller.build_harvester(ore)
-            self.record_harvester_built(ore, harvester_id)
+            # follow_path_and_build activates the mine at the completed source.
             return True
         return False
 
@@ -2406,6 +2409,8 @@ class BuilderBot(BaseBot):
             elif self.target_ore is not None:
                 if self.target_is_connection:
                     if not self.is_harvester_on_tile(self.target_ore):
+                        if self.prepare_mine_outputs(controller, current, self.target_ore):
+                            return
                         if self.harvester_is_connected(self.target_ore) and controller.can_build_harvester(self.target_ore):
                             entity_id = controller.build_harvester(self.target_ore)
                             self.record_harvester_built(self.target_ore, entity_id)
@@ -2460,6 +2465,43 @@ class BuilderBot(BaseBot):
             controller.move(direction)
         elif not self.is_cached_tile_passable(next_pos):
             self.replan_after_blocked_step(controller, next_pos)
+
+    def prepare_mine_outputs(self, controller, current, ore):
+        """Seal unused outputs before a mine can supply an enemy parasite."""
+        if ore_feeds_enemy(self, ore):
+            self.defer_ore_for_survey(ore)
+            self.clear_ore_target()
+            return True
+        for direction in ORTHOGONAL_DIRECTIONS:
+            guard = self.tile_cache.neighbor(ore, direction)
+            if guard is None or guard in self.conveyor_path_tiles:
+                continue
+            if self.tile_cache.environment_at(guard) != Environment.EMPTY:
+                continue
+            building = self.known_buildings.get(guard)
+            if building is not None and building != (EntityType.ROAD, self.team):
+                continue
+            if current != guard and current.distance_squared(guard) <= 2:
+                if building is not None and controller.can_destroy(guard):
+                    controller.destroy(guard)
+                    self.tile_cache.forget_building(guard)
+                if controller.can_build_barrier(guard):
+                    entity_id = controller.build_barrier(guard)
+                    self.tile_cache.remember_building(guard, entity_id, EntityType.BARRIER, self.team)
+                    self.last_progress_round = self.rounds_alive
+                return True
+            goals = {p for d in DIRECTIONS if (p := self.tile_cache.neighbor(guard, d)) is not None
+                     and self.traversable_for_planning(None, p)}
+            path = self.connection_walk(current, goals) if goals else []
+            if path:
+                self.try_move_scout_step(controller, current, current.direction_to(path[0]))
+                return True
+        if current.distance_squared(ore) > 2:
+            path = self.connection_walk(current, set(self.ore_action_approaches(ore)))
+            if path:
+                self.try_move_scout_step(controller, current, current.direction_to(path[0]))
+                return True
+        return False
 
     def bridge_build_is_deferred(self, pos: Position) -> bool:
         """Leave planned transport inactive until its downstream path is live."""

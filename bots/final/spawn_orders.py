@@ -1,10 +1,11 @@
 """Newborn role handoff shared by combat and economic builders."""
 
-from cambc import EntityType
+from cambc import Direction, EntityType
 
 from constants import (
     BUILDER_CODE_DIRECTIONS, MARKER_KIND_SPAWN_DIRECTION,
     MARKER_KIND_SPAWN_INTRUDER,
+    MARKER_KIND_SPAWN_DEFENDER,
 )
 from geometry import decode_marker_coordinates
 
@@ -24,6 +25,8 @@ def read_spawn_assignment(controller):
             continue
         if kind == MARKER_KIND_SPAWN_INTRUDER:
             return True, None
+        if kind == MARKER_KIND_SPAWN_DEFENDER:
+            return False, Direction.CENTRE
         if kind == MARKER_KIND_SPAWN_DIRECTION:
             direction = BUILDER_CODE_DIRECTIONS.get(payload)
     return False, direction

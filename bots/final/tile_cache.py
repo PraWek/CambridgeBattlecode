@@ -33,7 +33,7 @@ _DIRECTION_DELTAS = {direction: direction.delta() for direction in Direction}
 # Core.  Seven calls (the RC combat-role budget) can finish the entity queue
 # but repeatedly starves marker reads.  Fourteen remains a hard 2 ms guard
 # while allowing one stable crowded scan plus its local orders to complete.
-_SCAN_API_CALL_LIMIT = 14
+_SCAN_API_CALL_LIMIT = 96
 # Confirming a symmetry may happen after a scout has seen hundreds of tiles.
 # Mirroring all of them in one bot turn exceeds the 2 ms limit, so drain the
 # historical cache over several later turns instead.  This work shares a
@@ -41,7 +41,7 @@ _SCAN_API_CALL_LIMIT = 14
 # at a time.  The historical source uses direct-observation order and a
 # cursor, avoiding one large scheduling pass at the exact turn symmetry
 # becomes known.
-_SYMMETRY_BACKFILL_TILES_PER_TURN = 1
+_SYMMETRY_BACKFILL_TILES_PER_TURN = 8
 
 
 class TileCache:
