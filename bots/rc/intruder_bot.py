@@ -86,8 +86,8 @@ class IntruderBot(BaseBot):
 
         self.supply_ore: Position | None = None
         # The only supply route is ordered from the Gunner to the selected
-        # ore entry.  The Intruder walks this exact sequence, building each
-        # transport tile before it proceeds farther from the Gunner.
+        # ore entry.  Construction can traverse it in either direction, but
+        # every transport tile always outputs toward the Gunner.
         self.supply_path: list[Position] = []
         # A crossing maps its Gunner-side source to its ore-side landing.
         # The physical Bridge is built on the landing and outputs back to the
@@ -97,6 +97,7 @@ class IntruderBot(BaseBot):
         self.supply_directions: dict[Position, Direction] = {}
         self.supply_bridge_targets: dict[Position, Position] = {}
         self.supply_index = 0
+        self.supply_build_step: int | None = None
         # Bridge targets are not exposed by TileCache because only the
         # Intruder's supply planner needs them.  Cache canonical endpoints so
         # an already built bridge can be used as part of a new supply route.
@@ -1445,7 +1446,7 @@ class IntruderBot(BaseBot):
         return True
 
     def supply_gunner(self, controller: Controller, current: Position) -> None:
-        """Build one Gunner-to-ore supply route, placing transport as we advance."""
+        """Connect the selected ore and Gunner from the nearer construction end."""
         if self.supply_ore is None:
             if not self.select_supply_plan():
                 if self.supply_plan_candidates is not None:
@@ -1529,6 +1530,7 @@ class IntruderBot(BaseBot):
             self.supply_directions = {}
             self.supply_bridge_targets = {}
             self.supply_index = 0
+            self.supply_build_step = None
             self.supply_exploration_entry = None
             self.supply_exploring_back_to_gunner = False
             self.supply_plan_candidates = None
@@ -1605,6 +1607,7 @@ class IntruderBot(BaseBot):
         self.supply_directions = directions
         self.supply_bridge_targets = bridge_targets
         self.supply_index = 0
+        self.supply_build_step = None
         self.supply_plan_candidates = None
         self.supply_plan_cursor = 0
         self.deferred_supply_candidates = []
@@ -1896,20 +1899,35 @@ class IntruderBot(BaseBot):
         return True
 
     def follow_supply_path(self, controller: Controller, current: Position) -> bool:
-        """Advance exactly along the Gunner-to-ore route, building as we go.
+        """Build the saved route from the nearer end, preserving resource flow.
 
-        ``True`` means every route tile is now in place and the Intruder is
-        standing on the ore-side endpoint.  Any movement, construction,
-        launcher crossing, or blocked rejoin consumes this turn and returns
-        ``False`` so the next round resumes from the same route state.
+        Choose the construction direction once, then retain it across turns
+        and rejoins.  ``True`` means the line is complete and its harvester
+        either exists or can be built from the current position.
         """
         if not self.supply_path:
             return False
+        if self.supply_build_step is None:
+            self.choose_supply_build_direction(current)
+        if self.supply_build_step == -1 and self.supply_ore is not None:
+            building = self.known_buildings.get(self.supply_ore)
+            if building is None or building[0] != EntityType.HARVESTER:
+                # Build the mine before leaving the ore end; otherwise a
+                # reverse build would require a second trip along the line.
+                if current.distance_squared(self.supply_ore) > GameConstants.ACTION_RADIUS_SQ:
+                    self.rejoin_supply_path(controller, current, self.supply_path[-1])
+                    return False
+                if not self.ensure_supply_harvester(controller, current):
+                    return False
         if self.finish_pending_supply_bridge(controller, current):
             return False
         self.advance_supply_index()
-        if self.supply_index >= len(self.supply_path):
-            if current == self.supply_path[-1]:
+        if not 0 <= self.supply_index < len(self.supply_path):
+            building = self.known_buildings.get(self.supply_ore)
+            if (
+                building is not None and building[0] == EntityType.HARVESTER
+                or current == self.supply_path[-1]
+            ):
                 return True
             self.rejoin_supply_path(controller, current, self.supply_path[-1])
             return False
@@ -1922,10 +1940,9 @@ class IntruderBot(BaseBot):
                 self.supply_path[self.supply_index],
             )
             return False
-        if index > self.supply_index:
-            # Scouting can cross a far route cell before its Gunner-side
-            # prefix exists.  Do not promote the cursor to that position: go
-            # back to the first missing tile and resume construction there.
+        if (index - self.supply_index) * self.supply_build_step > 0:
+            # Rejoin the first unfinished tile in the selected construction
+            # direction, even after scouting or an external displacement.
             self.rejoin_supply_path(
                 controller,
                 current,
@@ -1951,16 +1968,25 @@ class IntruderBot(BaseBot):
                 self.step_off_supply_bridge(controller)
             return False
 
-        # Lay the final conveyor before moving farther from the Gunner.  Its
-        # direction points to the preceding route node, preserving ore-to-
-        # Gunner resource flow while the Intruder travels in the opposite way.
+        # Construction order never changes a conveyor's output direction:
+        # it always points to the preceding Gunner-side route node.
         if current in self.supply_directions and not self.supply_tile_complete(current):
             self.build_supply_tile(controller, current)
             return False
-        if index + 1 >= len(self.supply_path):
+        next_index = index + self.supply_build_step
+        if not 0 <= next_index < len(self.supply_path):
             return True
-        next_pos = self.supply_path[index + 1]
-        if self.supply_bridge_crossings.get(current) == next_pos:
+        next_pos = self.supply_path[next_index]
+        if (
+            self.supply_bridge_crossings.get(current) == next_pos
+            or self.supply_bridge_targets.get(current) == next_pos
+        ):
+            if not self.is_cached_tile_passable(next_pos):
+                # In a reverse build the Gunner-side landing may still be
+                # bare.  A Launcher needs a walkable destination; approach
+                # this endpoint by land instead when it has no building yet.
+                self.rejoin_supply_path(controller, current, next_pos)
+                return False
             direction = current.direction_to(next_pos)
             self.start_launcher_crossing(
                 controller,
@@ -1973,13 +1999,31 @@ class IntruderBot(BaseBot):
         self.move_to_supply_route_tile(controller, current, next_pos)
         return False
 
+    def choose_supply_build_direction(self, current: Position) -> None:
+        """Start at the nearer of the connected line's end and the ore."""
+        self.supply_build_step = 1
+        self.supply_index = 0
+        self.advance_supply_index()
+        connected_end = (
+            self.supply_path[self.supply_index - 1]
+            if self.supply_index > 0
+            else self.gunner_site or self.supply_path[0]
+        )
+        if (
+            self.supply_ore is not None
+            and current.distance_squared(self.supply_ore)
+            < current.distance_squared(connected_end)
+        ):
+            self.supply_build_step = -1
+            self.supply_index = len(self.supply_path) - 1
+
     def advance_supply_index(self) -> None:
-        """Keep the cursor on the first route tile not yet in final form."""
+        """Skip finished tiles in the selected construction direction."""
         while (
-            self.supply_index < len(self.supply_path)
+            0 <= self.supply_index < len(self.supply_path)
             and self.supply_tile_complete(self.supply_path[self.supply_index])
         ):
-            self.supply_index += 1
+            self.supply_index += self.supply_build_step or 1
 
     def rejoin_supply_path(
             self,
@@ -1987,7 +2031,7 @@ class IntruderBot(BaseBot):
             current: Position,
             target: Position,
     ) -> None:
-        """Walk back to one required route cell without laying a later conveyor."""
+        """Reach the selected construction end before continuing its conveyors."""
         search_state = self.a_star_state("supply_rejoin")
         approach = a_star_to_any(
             None,
@@ -2192,6 +2236,7 @@ class IntruderBot(BaseBot):
         self.supply_directions = {}
         self.supply_bridge_targets = {}
         self.supply_index = 0
+        self.supply_build_step = None
         self.supply_plan_candidates = None
         self.supply_plan_cursor = 0
         self.deferred_supply_candidates = []
