@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -10,7 +11,8 @@ from cambc import Direction, EntityType, Environment, Position, Team
 
 
 ROOT = Path(__file__).resolve().parents[2]
-NEXUS = ROOT / "bots" / "nexus"
+# Run the same economy contracts against bots that inherit this planner.
+NEXUS = ROOT / "bots" / os.environ.get("CAMBC_TEST_BOT", "nexus")
 
 
 def load_module(alias: str, filename: str):

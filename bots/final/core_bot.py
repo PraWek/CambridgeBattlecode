@@ -13,9 +13,13 @@ from constants import (
     MARKER_KIND_SPAWN_DIRECTION,
     MAX_ADDITIONAL_BUILDER_SPAWNS,
     MAX_ECONOMY_BUILDERS,
+    MARKER_KIND_SPAWN_INTRUDER,
+    MAX_INTRUDER_SPAWNS,
+    INTRUDER_REPLACEMENT_INTERVAL,
     ORE_TYPES,
 )
 from economy import desired_builder_count
+from fleet import unit_is_alive
 from geometry import encode_marker
 from orders import spawn_needs_handoff
 
@@ -45,10 +49,32 @@ class CoreBot(BaseBot):
         self.sector_marker_values: dict[Direction, int | None] = {}
         self.spawn_order_pad: Position | None = None
         self.spawn_order_active = False
+        self.spawn_order_round: int | None = None
+        self.spawn_order_position: Position | None = None
         self.marker_sync_cursor = 0
+        self.economy_builder_ids: list[int] = []
+        self.fleet_check_cursor = 0
+        self.intruder_id: int | None = None
+        self.intruders_spawned = 0
+        self.intruder_spawn_round: int | None = None
+        self.intruder_order_pad: Position | None = None
+        self.intruder_order_active = False
+        self.intruder_spawn_pos: Position | None = None
 
     def run(self, controller: Controller) -> None:
         """Observe the map, update sector orders, and maintain the economy fleet."""
+        if self.entity_id is None:
+            self.entity_id = controller.get_id()
+            self.team = controller.get_team()
+        if self.core_pos is None:
+            self.core_pos = self.tile_cache.canonicalize(controller.get_position(self.entity_id))
+            self.current_position = self.core_pos
+        self.refresh_fleet(controller)
+        self.clear_intruder_spawn_order(controller)
+        self.clear_completed_spawn_order(controller)
+        # RC's early intruder leaves before the four Nexus sector workers.
+        if not self.intruders_spawned and self.try_spawn_intruder(controller):
+            return
         # The first four cardinal spawn tiles encode their sectors directly.
         # They do not need the full vision cache or a marker handoff, so start
         # the economy while the comparatively expensive initial scan proceeds
@@ -76,10 +102,39 @@ class CoreBot(BaseBot):
         self.refresh_sector_targets(controller)
         spawned = self.try_spawn_missing_builder(controller)
         if not spawned:
+            spawned = self.try_spawn_intruder(controller)
+        if not spawned:
             self.clear_completed_spawn_order(controller)
             # Orders can change after a nearby harvester is built.  One marker
             # write per round is a game rule, so update the board round-robin.
             self.sync_one_changed_sector_marker(controller)
+
+    def refresh_fleet(self, controller: Controller) -> None:
+        """Check one spawned unit per turn, keeping API work bounded."""
+        roster = list(self.economy_builder_ids)
+        if self.intruder_id is not None:
+            roster.append(self.intruder_id)
+        if not roster:
+            return
+        entity_id = roster[self.fleet_check_cursor % len(roster)]
+        self.fleet_check_cursor += 1
+        if unit_is_alive(controller, entity_id):
+            return
+        if entity_id == self.intruder_id:
+            self.intruder_id = None
+        else:
+            self.economy_builder_ids.remove(entity_id)
+
+    def clear_intruder_spawn_order(self, controller: Controller) -> None:
+        """Retire the role handoff before another newborn can use its tile."""
+        if not self.intruder_order_active:
+            return
+        if controller.get_current_round() <= self.intruder_spawn_round + 1:
+            return
+        if controller.can_destroy(self.intruder_order_pad):
+            controller.destroy(self.intruder_order_pad)
+            self.tile_cache.forget_building(self.intruder_order_pad)
+            self.intruder_order_active = False
 
     def observe_tiles(self) -> None:
         """Refresh the core's local terrain and building observations."""
@@ -115,7 +170,7 @@ class CoreBot(BaseBot):
         pads: list[Position] = []
         for dx, dy in offsets:
             pos = self.tile_cache.offset(self.core_pos, dx, dy)
-            if pos is None or not controller.can_place_marker(pos):
+            if pos is None or pos == self.intruder_order_pad or not controller.can_place_marker(pos):
                 continue
             pads.append(pos)
             if len(pads) == len(BUILDER_WORK_DIRECTIONS) + 1:
@@ -195,10 +250,9 @@ class CoreBot(BaseBot):
         """Spawn one missing directional builder, with a safe fallback tile."""
         if self.core_pos is None or controller.get_unit_count() >= GameConstants.MAX_TEAM_UNITS:
             return False
-        # This bot's core creates only builder bots.  Entity IDs outside the
-        # core's vision cannot be queried reliably, while get_unit_count() is
-        # global, so subtracting the core gives the authoritative live fleet.
-        living_builders = max(0, controller.get_unit_count() - 1)
+        # Turrets and intruders must never occupy the economy's worker quota.
+        # The roster is checked incrementally even after workers leave vision.
+        living_builders = len(self.economy_builder_ids)
         desired_builders = desired_builder_count(
             controller.get_current_round(),
             len(BUILDER_WORK_DIRECTIONS),
@@ -242,6 +296,10 @@ class CoreBot(BaseBot):
             if self.spawn_order_pad is not None:
                 positions.extend(pos for pos in fallback_positions if pos != preferred)
             for spawn_pos in positions:
+                if self.intruder_order_active and spawn_pos == self.intruder_spawn_pos:
+                    continue
+                if self.spawn_order_active and spawn_pos == self.spawn_order_position:
+                    continue
                 if not controller.can_spawn(spawn_pos):
                     continue
                 needs_handoff = spawn_needs_handoff(spawn_pos, preferred)
@@ -254,7 +312,8 @@ class CoreBot(BaseBot):
                     spawn_pos,
                 ):
                     continue
-                controller.spawn_builder(spawn_pos)
+                builder_id = controller.spawn_builder(spawn_pos)
+                self.economy_builder_ids.append(builder_id)
                 self.last_builder_spawn_round = controller.get_current_round()
                 if len(self.initial_spawned_directions) < len(BUILDER_WORK_DIRECTIONS):
                     self.initial_spawned_directions.add(direction)
@@ -291,19 +350,20 @@ class CoreBot(BaseBot):
             marker_value=value,
         )
         self.spawn_order_active = True
+        self.spawn_order_round = controller.get_current_round()
+        self.spawn_order_position = spawn_pos
         return True
 
     def clear_completed_spawn_order(self, controller: Controller) -> None:
         """Remove the temporary fallback handoff after the newborn has read it."""
         if self.spawn_order_pad is None or not self.spawn_order_active:
             return
-        building_id = self.tile_cache.building_id_at(self.spawn_order_pad)
-        building = self.tile_cache.building_at(self.spawn_order_pad)
-        if building_id is not None and building is not None and building[0] == EntityType.MARKER:
-            if building[1] == self.team and controller.can_destroy(self.spawn_order_pad):
-                controller.destroy(self.spawn_order_pad)
-                self.tile_cache.forget_building(self.spawn_order_pad)
-        self.spawn_order_active = False
+        if controller.get_current_round() <= self.spawn_order_round + 1:
+            return
+        if controller.can_destroy(self.spawn_order_pad):
+            controller.destroy(self.spawn_order_pad)
+            self.tile_cache.forget_building(self.spawn_order_pad)
+            self.spawn_order_active = False
 
     def desired_sector_marker_value(self, direction: Direction) -> int | None:
         """Encode the current ore order for one sector, if it has one."""
@@ -364,3 +424,91 @@ class CoreBot(BaseBot):
                 marker_value=desired,
             )
             self.sector_marker_values[direction] = desired
+
+
+    def find_first_intruder_order_pad(self, controller: Controller) -> Position | None:
+        """Pick one usable marker pad without scanning terrain or entities."""
+        if self.core_pos is None:
+            return None
+        for dx, dy in (
+            (-2, -2), (2, -2), (2, 2), (-2, 2),
+            (-2, 0), (0, -2), (2, 0), (0, 2),
+        ):
+            pad = self.tile_cache.offset(self.core_pos, dx, dy)
+            if pad == self.spawn_order_pad or pad in self.sector_marker_pads.values():
+                continue
+            if pad is not None and controller.can_place_marker(pad):
+                return pad
+        return None
+
+    def try_spawn_intruder(self, controller: Controller) -> bool:
+        """Spawn the first non-Core unit as an infiltrator with an identifying marker."""
+        if (
+            self.core_pos is None
+            or self.intruder_id is not None
+            or self.intruders_spawned >= MAX_INTRUDER_SPAWNS
+            or controller.get_unit_count() >= GameConstants.MAX_TEAM_UNITS
+        ):
+            return False
+
+        if self.intruders_spawned:
+            if controller.get_current_round() - self.intruder_spawn_round < INTRUDER_REPLACEMENT_INTERVAL:
+                return False
+            titanium, _ = controller.get_global_resources()
+            reserve = controller.get_harvester_cost()[0] + 8 * controller.get_conveyor_cost()[0]
+            if titanium < controller.get_builder_bot_cost()[0] + reserve:
+                return False
+        if self.intruder_order_pad is None:
+            self.intruder_order_pad = self.find_first_intruder_order_pad(controller)
+        if self.intruder_order_pad is None:
+            return False
+        target = self.tile_cache.position_at(
+            self.map_width - 1 - self.core_pos.x,
+            self.map_height - 1 - self.core_pos.y,
+        )
+        if target is None:
+            return False
+        preferred_direction = self.core_pos.direction_to(target)
+        fallback_positions = [
+            pos
+            for dx, dy in (
+                (0, 0), (1, -1), (1, 1), (-1, 1), (-1, -1),
+                (0, -1), (1, 0), (0, 1), (-1, 0),
+            )
+            if (pos := self.tile_cache.offset(self.core_pos, dx, dy)) is not None
+        ]
+        preferred = self.tile_cache.neighbor(self.core_pos, preferred_direction)
+        positions = (
+            [] if preferred is None else [preferred]
+        ) + [pos for pos in fallback_positions if pos != preferred]
+        for spawn_pos in positions:
+            if not controller.can_spawn(spawn_pos):
+                continue
+            if not self.write_intruder_spawn_order(controller, spawn_pos):
+                return False
+            self.intruder_id = controller.spawn_builder(spawn_pos)
+            self.intruders_spawned += 1
+            self.intruder_order_active = True
+            self.intruder_spawn_pos = spawn_pos
+            self.intruder_spawn_round = controller.get_current_round()
+            return True
+        return False
+
+    def write_intruder_spawn_order(self, controller: Controller, spawn_pos: Position) -> bool:
+        """Mark ``spawn_pos`` so its newborn BuilderBot selects IntruderBot logic."""
+        if self.intruder_order_pad is None or not controller.can_place_marker(self.intruder_order_pad):
+            return False
+        value = encode_marker(MARKER_KIND_SPAWN_INTRUDER, spawn_pos)
+        marker_id = controller.place_marker(self.intruder_order_pad, value)
+        # The forced first-turn spawn deliberately happens before terrain has
+        # entered the cache.  The marker will be indexed by the later normal
+        # scan; do not fabricate an environment just to cache it now.
+        if self.tile_cache.environment_at(self.intruder_order_pad) is not None:
+            self.tile_cache.remember_building(
+                self.intruder_order_pad,
+                marker_id,
+                EntityType.MARKER,
+                self.team,
+                marker_value=value,
+            )
+        return True

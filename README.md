@@ -10,8 +10,11 @@ pip install -r requirements.txt
 ```
 Run
 ```
-cambc run nexus rc --watch
+cambc run final rc --watch
 ```
+
+`final` combines Nexus exploration and economy with RC combat.
+See [the bot notes](bots/final/README.md) for behavior and checks.
 
 ## Game rules
 
