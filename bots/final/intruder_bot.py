@@ -3,7 +3,6 @@
 from cambc import Controller, Direction, EntityType, Environment, GameConstants, Position
 
 from combat_base import CombatBot
-from assault import try_siege
 from constants import (
     DIRECTIONS,
     LAUNCH_WAIT_ROUNDS,
@@ -14,6 +13,7 @@ from constants import (
 from geometry import encode_marker
 from spawn_orders import read_spawn_assignment
 from combat_navigation import a_star_from_any_with_bridges, a_star_to_any
+from assault import try_siege
 
 
 _CLEARABLE_WALKABLE_BUILDINGS = {EntityType.ROAD, EntityType.CONVEYOR}
@@ -153,13 +153,14 @@ class IntruderBot(CombatBot):
             return
 
         self.update_enemy_knowledge()
-        if try_siege(self, controller, current):
-            return
         self.refresh_known_bridge_targets(controller)
         if self.clear_cheap_enemy_building(controller, current):
             self.draw_goal_indicator(controller, current)
             return
         if self.wait_for_launcher(controller, current):
+            self.draw_goal_indicator(controller, current)
+            return
+        if try_siege(self, controller, current):
             self.draw_goal_indicator(controller, current)
             return
         if self.return_branch_target is not None:
@@ -192,6 +193,31 @@ class IntruderBot(CombatBot):
         if not self.destination_is_confirmed_core:
             self.advance_towards_unvisited_target(controller, self.destination)
             return
+        # A geometrically good gunner with no known ammunition source is a
+        # sunk cost. Survey the far side of the core before committing it.
+        ores = [p for p, env in self.known_env.items()
+                if env == Environment.ORE_TITANIUM
+                and p.distance_squared(self.destination) <= 85
+                and p not in self.tile_cache.visible_tiles
+                and self.is_available_supply_ore(p)]
+        if ores:
+            ore = min(ores, key=lambda p: current.distance_squared(p))
+            approach = self.construction_approach(ore)
+            if approach is not None:
+                self.advance_towards_revisitable_target(controller, approach)
+            else:
+                self.advance_towards_unvisited_target(controller, ore)
+            return
+        probes = [self.tile_cache.offset(self.destination, dx, dy)
+                  for dx, dy in ((0, -5), (5, -3), (5, 3), (0, 5), (-5, 3), (-5, -3))]
+        probes = [p for p in probes if p is not None and p not in self.visited_tiles
+                  and self.known_env.get(p) not in (Environment.WALL, Environment.ORE_TITANIUM, Environment.ORE_AXIONITE)]
+        if probes:
+            probe = min(probes, key=lambda p: current.distance_squared(p))
+            self.advance_towards_revisitable_target(controller, probe)
+            return
+        # The original bridge-aware supply planner remains available once
+        # local direct-feed positions have genuinely been exhausted.
         self.build_forward_gunner(controller, current)
 
     def draw_goal_indicator(self, controller: Controller, current: Position) -> None:

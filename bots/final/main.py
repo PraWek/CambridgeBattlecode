@@ -1,13 +1,13 @@
-from cambc import Controller, Direction, EntityType
+from cambc import Controller, EntityType
 
 from base import BaseBot
 from builder_bot import BuilderBot
 from core_bot import CoreBot
+from defender_bot import DefenderBot
 from gunner_bot import GunnerBot
 from intruder_bot import IntruderBot
 from launcher_bot import LauncherBot
 from sentinel_bot import SentinelBot
-from defender_bot import DefenderBot
 from spawn_orders import read_spawn_assignment
 
 class Player:
@@ -36,9 +36,7 @@ class Player:
             # cache. A CPU interruption must not lose the selected role.
             if self.builder_role is None:
                 intruder, self.builder_direction = read_spawn_assignment(c)
-                self.builder_role = IntruderBot if intruder else BuilderBot
-                if self.builder_direction == Direction.CENTRE:
-                    self.builder_role = DefenderBot
+                self.builder_role = DefenderBot if intruder == "defender" else IntruderBot if intruder else BuilderBot
             self.bot = self.builder_role(c.get_map_width(), c.get_map_height())
             if self.builder_role is BuilderBot and self.builder_direction is not None:
                 self.bot.work_direction = self.builder_direction

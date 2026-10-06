@@ -26,14 +26,11 @@ _CORE_FOOTPRINT_OFFSETS = tuple(
 _BASE_SYMMETRIES = ("rotational", "vertical", "horizontal")
 _DIAGONAL_SYMMETRIES = ("main_diagonal", "anti_diagonal")
 _DIRECTION_DELTAS = {direction: direction.delta() for direction in Direction}
-# Controller calls have a material CPU cost on crowded maps.  Seven calls leave
-# room for navigation after a partial entity scan; terrain and the own unit
-# are always completed before a role is allowed to act.
-# Nexus keeps four economic scouts and a multi-marker order board around the
-# Core.  Seven calls (the RC combat-role budget) can finish the entity queue
-# but repeatedly starves marker reads.  Fourteen remains a hard 2 ms guard
-# while allowing one stable crowded scan plus its local orders to complete.
-_SCAN_API_CALL_LIMIT = 96
+# A fixed 14-call slice made every few walking steps cost several idle turns.
+# Use the measured CPU budget, with a separate hard call bound for engines
+# that do not report CPU time (including the local Windows runner).
+_SCAN_API_CALL_LIMIT = 128
+_SCAN_CPU_LIMIT_US = 750
 # Confirming a symmetry may happen after a scout has seen hundreds of tiles.
 # Mirroring all of them in one bot turn exceeds the 2 ms limit, so drain the
 # historical cache over several later turns instead.  This work shares a
@@ -41,7 +38,7 @@ _SCAN_API_CALL_LIMIT = 96
 # at a time.  The historical source uses direct-observation order and a
 # cursor, avoiding one large scheduling pass at the exact turn symmetry
 # becomes known.
-_SYMMETRY_BACKFILL_TILES_PER_TURN = 8
+_SYMMETRY_BACKFILL_TILES_PER_TURN = 1
 
 
 class TileCache:
@@ -113,6 +110,7 @@ class TileCache:
         self.scan_incomplete_this_turn = False
         self.role_cache_ready_this_turn = False
         self.scan_api_calls_this_turn = 0
+        self._scan_clock = None
 
         # Entity metadata is immutable except for a builder's position and a
         # gunner's rotation.  Keeping it lets later scans reuse type/team and
@@ -149,6 +147,7 @@ class TileCache:
         self.scan_incomplete_this_turn = False
         self.role_cache_ready_this_turn = self.current_position is not None
         self.scan_api_calls_this_turn = 0
+        self._scan_clock = getattr(controller, 'get_cpu_time_elapsed', None)
         if not self._take_scan_api_call():
             return
         visible_tiles = {
@@ -663,7 +662,12 @@ class TileCache:
 
     def _take_scan_api_call(self) -> bool:
         """Reserve one Controller call, or stop this cache turn at its budget."""
-        if self.scan_api_calls_this_turn >= _SCAN_API_CALL_LIMIT:
+        out_of_time = (
+            self._scan_clock is not None
+            and self.scan_api_calls_this_turn % 8 == 0
+            and self._scan_clock() >= _SCAN_CPU_LIMIT_US
+        )
+        if self.scan_api_calls_this_turn >= _SCAN_API_CALL_LIMIT or out_of_time:
             self.scan_incomplete_this_turn = True
             return False
         self.scan_api_calls_this_turn += 1

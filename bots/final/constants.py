@@ -3,7 +3,7 @@ from cambc import Direction, EntityType, Environment
 
 DIRECTIONS = [direction for direction in Direction if direction != Direction.CENTRE]
 ORTHOGONAL_DIRECTIONS = [Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST]
-BUILDER_WORK_DIRECTIONS = (Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST)
+BUILDER_WORK_DIRECTIONS = tuple(ORTHOGONAL_DIRECTIONS)
 
 PASSABLE_BUILDINGS = {
     EntityType.CORE,
@@ -37,7 +37,7 @@ MARKER_KIND_INTRUDER_LAUNCH = 11
 MARKER_KIND_SPAWN_DEFENDER = 12
 
 # Replacements are bounded so a blocked attack cannot consume the economy.
-MAX_INTRUDER_SPAWNS = 3
+MAX_INTRUDER_SPAWNS = 6
 INTRUDER_REPLACEMENT_INTERVAL = 128
 LAUNCH_WAIT_ROUNDS = 32
 
