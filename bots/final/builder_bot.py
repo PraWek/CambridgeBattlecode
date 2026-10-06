@@ -5,6 +5,7 @@ from cambc import Controller, Direction, EntityType, Environment, GameConstants,
 from base import BaseBot
 from construction_access import ConstructionAccess
 from defense import defend_economy
+from refinery import try_refinery
 from planning_budget import PlanningBudget, SearchMemory
 from constants import (
     AXIONITE_PIPELINE_ENABLED,
@@ -334,6 +335,8 @@ class BuilderBot(BaseBot):
         )
         self.cleanup_abandoned_network(controller, current)
         if defend_economy(self, controller, current):
+            return
+        if try_refinery(self, controller, current):
             return
         if self.try_repair_nearby_network(controller, current):
             return
@@ -831,7 +834,6 @@ class BuilderBot(BaseBot):
                     if (p := self.tile_cache.neighbor(ore, d)) is not None)
         for guard in ordered:
             if current.distance_squared(guard) > GameConstants.ACTION_RADIUS_SQ:
-                self.harvester_guard_tiles.discard(guard)
                 continue
             if guard != current and not armed and controller.get_global_resources()[0] >= controller.get_gunner_cost()[0] + 4 * controller.get_conveyor_cost()[0]:
                 old = self.known_buildings.get(guard)
@@ -1058,6 +1060,21 @@ class BuilderBot(BaseBot):
 
     def ore_network_needs_work(self, ore: Position) -> bool:
         """Return whether a harvester lacks either continuity or transport capacity."""
+        # A refinery's titanium input deliberately terminates at the foundry.
+        # Reconnecting that mine directly to the core would starve refinement.
+        for direction in ORTHOGONAL_DIRECTIONS:
+            feed = self.tile_cache.neighbor(ore, direction)
+            building = self.known_buildings.get(feed)
+            if building is None or building[1] != self.team:
+                continue
+            sink = feed
+            if building[0] == EntityType.BRIDGE:
+                sink = self.known_bridge_targets.get(feed)
+            elif building[0] == EntityType.CONVEYOR:
+                facing = self.known_conveyor_directions.get(feed)
+                sink = self.tile_cache.neighbor(feed, facing) if facing is not None else None
+            if self.known_buildings.get(sink) == (EntityType.FOUNDRY, self.team):
+                return False
         return (
             not self.harvester_is_connected(ore)
             or self.ore_needs_capacity_relief(ore)

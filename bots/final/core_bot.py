@@ -278,8 +278,12 @@ class CoreBot(BaseBot):
         living_builders = len(self.economy_builder_ids)
         # Two profitable sectors finance expansion. Four simultaneous scouts
         # otherwise spend the opening bank before either conveyor is complete.
-        if living_builders >= 2 and controller.get_global_resources()[0] < 500:
-            return False
+        if living_builders >= 2:
+            money = controller.get_global_resources()[0]
+            reserve = controller.get_builder_bot_cost()[0] + controller.get_harvester_cost()[0] + 4 * controller.get_conveyor_cost()[0]
+            expansion_round = 30 + 30 * (living_builders - 2)
+            if money < 500 and (controller.get_current_round() < expansion_round or money < reserve):
+                return False
         desired_builders = desired_builder_count(
             controller.get_current_round(),
             len(BUILDER_WORK_DIRECTIONS),
@@ -479,6 +483,20 @@ class CoreBot(BaseBot):
         """Reserve repairs before a short-range battery can burn through 500 HP."""
         hp = controller.get_hp(self.entity_id)
         desired = 6 if hp < 350 else 4 if hp < 490 else 0
+        if desired:
+            damage = 0
+            for entity_id in self.tile_cache.visible_entity_ids:
+                if self.tile_cache.entity_team(entity_id) == self.team:
+                    continue
+                kind = self.tile_cache.entity_type(entity_id)
+                if kind not in (EntityType.GUNNER, EntityType.SENTINEL, EntityType.BREACH):
+                    continue
+                pos = self.tile_cache.entity_position(entity_id)
+                facing = self.tile_cache.entity_direction(entity_id)
+                if pos is not None and facing is not None and any(controller.can_fire_from(pos, facing, kind, tile)
+                                        for tile in self.core_receiver_positions()):
+                    damage += 10 if kind == EntityType.GUNNER else 6 if kind == EntityType.SENTINEL else 40
+            desired = max(desired, min(9, (damage + 3) // 4 + 1))
         if len(self.defender_ids) >= desired or self.defender_order_pad is not None:
             return False
         if controller.get_global_resources()[0] < controller.get_builder_bot_cost()[0] + 60 and hp > 160:
@@ -506,6 +524,11 @@ class CoreBot(BaseBot):
                 return True
         return False
 
+    def core_receiver_positions(self):
+        return [self.tile_cache.offset(self.core_pos, dx, dy)
+                for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                if self.tile_cache.offset(self.core_pos, dx, dy) is not None]
+
     def try_spawn_intruder(self, controller: Controller) -> bool:
         """Spawn the first non-Core unit as an infiltrator with an identifying marker."""
         if (
@@ -519,7 +542,7 @@ class CoreBot(BaseBot):
 
         if self.intruders_spawned:
             opening_partner = self.intruders_spawned == 1 and bool(self.intruder_ids)
-            interval = 3 if opening_partner else INTRUDER_REPLACEMENT_INTERVAL
+            interval = (3 if controller.get_global_resources()[0] >= 750 else 64) if opening_partner else INTRUDER_REPLACEMENT_INTERVAL
             if controller.get_current_round() - self.intruder_spawn_round < interval:
                 return False
             titanium, _ = controller.get_global_resources()

@@ -38,6 +38,17 @@ class GunnerBot(BaseBot):
                       EntityType.BUILDER_BOT: 110, EntityType.HARVESTER: 20,
                       EntityType.LAUNCHER: 70}
         ammo = controller.get_ammo_amount()
+        facing = self.tile_cache.entity_direction(self.entity_id)
+        if ammo == 0 and facing is not None:
+            source = self.tile_cache.neighbor(self.current_position, facing)
+            building = self.tile_cache.building_at(source) if source is not None else None
+            if building is not None and building[0] == EntityType.HARVESTER:
+                # Firing toward a captured mine closes that ammo port. Reopen
+                # it after the magazine empties instead of remaining stuck.
+                reload_direction = facing.opposite()
+                if controller.can_rotate(reload_direction):
+                    controller.rotate(reload_direction)
+                    return
         targets = []
         for entity_id in self.tile_cache.visible_entity_ids:
             if self.tile_cache.entity_team(entity_id) == team:

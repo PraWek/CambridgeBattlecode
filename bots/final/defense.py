@@ -8,6 +8,15 @@ TURRETS = {EntityType.GUNNER, EntityType.SENTINEL, EntityType.BREACH}
 
 def defend_economy(bot, controller, current):
     cache = bot.tile_cache
+    for entity_id in cache.visible_entity_ids:
+        if cache.entity_team(entity_id) != bot.team:
+            continue
+        if cache.entity_type(entity_id) in (EntityType.HARVESTER, EntityType.GUNNER, EntityType.SENTINEL):
+            pos = cache.entity_position(entity_id)
+            if current.distance_squared(pos) <= 2 and controller.can_heal(pos):
+                controller.heal(pos)
+                bot.last_progress_round = bot.rounds_alive
+                return True
     # Repairing the core wins time without discarding the active conveyor job.
     core = bot.core_pos
     if core is not None and current.distance_squared(core) <= 8:
@@ -60,6 +69,8 @@ def defend_economy(bot, controller, current):
     launchers = [cache.entity_position(entity_id) for entity_id in cache.visible_entity_ids
                  if cache.entity_team(entity_id) == bot.team
                  and cache.entity_type(entity_id) == EntityType.LAUNCHER]
+    if any(current.distance_squared(pos) <= 16 for pos in launchers):
+        return False
     enemies = [pos for pos in enemies if not any(pos.distance_squared(p) <= 2 for p in launchers)]
     for enemy in enemies:
         for direction in DIRECTIONS:
