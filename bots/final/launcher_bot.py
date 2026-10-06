@@ -12,13 +12,18 @@ class LauncherBot(BaseBot):
 
     def run(self, controller: Controller) -> None:
         """Read one launch order, throw its adjacent friendly builder, then clear it."""
-        # Combat launchers must react immediately, including their first turn.
-        # No terrain/symmetry scan is necessary for a legal throw.
-        if self.throw_enemy(controller):
-            return
         if self._scan_turn(controller, read_markers=True):
             return
-
+        current = self.get_cached_position()
+        for source, entity_id in self.tile_cache.visible_builder_ids.items():
+            if self.tile_cache.entity_team(entity_id) == self.team or current.distance_squared(source) > 2:
+                continue
+            landings = sorted(self.tile_cache.visible_tiles,
+                              key=lambda p: source.distance_squared(p), reverse=True)
+            for target in landings:
+                if controller.can_launch(source, target):
+                    controller.launch(source, target)
+                    return
         landing, marker_pos, source = self.read_launch_order()
         if landing is None or marker_pos is None or source is None:
             return
@@ -34,27 +39,6 @@ class LauncherBot(BaseBot):
             controller.launch(bot_pos, landing)
             self.clear_launch_order(controller, marker_pos)
             return
-
-    def throw_enemy(self, controller: Controller) -> bool:
-        origin = controller.get_position()
-        team = controller.get_team()
-        for direction in DIRECTIONS:
-            source = origin.add(direction)
-            if not self.in_bounds(source):
-                continue
-            entity_id = controller.get_tile_builder_bot_id(source)
-            if entity_id is None or controller.get_team(entity_id) == team:
-                continue
-            targets = [self.tile_cache.offset(origin, dx, dy)
-                       for dx in range(-5, 6) for dy in range(-5, 6)
-                       if dx * dx + dy * dy <= 26]
-            targets = [pos for pos in targets if pos is not None]
-            targets.sort(key=lambda pos: source.distance_squared(pos), reverse=True)
-            for target in targets:
-                if controller.can_launch(source, target):
-                    controller.launch(source, target)
-                    return True
-        return False
 
     def read_launch_order(self) -> tuple[Position | None, Position | None, Position | None]:
         """Return the landing tile and marker tile from a visible intruder order."""

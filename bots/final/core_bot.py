@@ -56,14 +56,16 @@ class CoreBot(BaseBot):
         self.economy_builder_ids: list[int] = []
         self.fleet_check_cursor = 0
         self.intruder_id: int | None = None
-        self.extra_intruder_ids = []
+        self.intruder_ids = []
         self.intruders_spawned = 0
         self.intruder_spawn_round: int | None = None
         self.intruder_order_pad: Position | None = None
         self.intruder_order_active = False
         self.intruder_spawn_pos: Position | None = None
         self.defender_ids = []
-        self.defender_handoff = None
+        self.defender_order_pad = None
+        self.defender_order_round = -10
+        self.opening_directions = None
 
     def run(self, controller: Controller) -> None:
         """Observe the map, update sector orders, and maintain the economy fleet."""
@@ -76,11 +78,17 @@ class CoreBot(BaseBot):
         self.refresh_fleet(controller)
         self.clear_intruder_spawn_order(controller)
         self.clear_completed_spawn_order(controller)
-        if self.try_spawn_defender(controller):
-            return
+        if self.defender_order_pad is not None and controller.get_current_round() > self.defender_order_round + 1:
+            if controller.can_destroy(self.defender_order_pad):
+                controller.destroy(self.defender_order_pad)
+                self.tile_cache.forget_building(self.defender_order_pad)
+            self.defender_order_pad = None
         # RC's early intruder leaves before the four Nexus sector workers.
         if not self.intruders_spawned and self.try_spawn_intruder(controller):
             return
+        if len(self.economy_builder_ids) >= 2 and self.intruders_spawned == 1:
+            if self.try_spawn_intruder(controller):
+                return
         # The first four cardinal spawn tiles encode their sectors directly.
         # They do not need the full vision cache or a marker handoff, so start
         # the economy while the comparatively expensive initial scan proceeds
@@ -95,6 +103,8 @@ class CoreBot(BaseBot):
                 self.current_position = self.core_pos
             if self.try_spawn_missing_builder(controller):
                 return
+        if self.try_spawn_defender(controller):
+            return
         if self._scan_turn(controller):
             return
         self.observe_tiles()
@@ -119,8 +129,8 @@ class CoreBot(BaseBot):
         """Check one spawned unit per turn, keeping API work bounded."""
         roster = list(self.economy_builder_ids)
         roster.extend(self.defender_ids)
-        roster.extend(self.extra_intruder_ids)
-        if self.intruder_id is not None:
+        roster.extend(self.intruder_ids)
+        if self.intruder_id is not None and self.intruder_id not in roster:
             roster.append(self.intruder_id)
         if not roster:
             return
@@ -128,44 +138,15 @@ class CoreBot(BaseBot):
         self.fleet_check_cursor += 1
         if unit_is_alive(controller, entity_id):
             return
-        if entity_id == self.intruder_id:
-            self.intruder_id = None
+        if entity_id in self.intruder_ids or entity_id == self.intruder_id:
+            if entity_id in self.intruder_ids:
+                self.intruder_ids.remove(entity_id)
+            if entity_id == self.intruder_id:
+                self.intruder_id = None
         elif entity_id in self.defender_ids:
             self.defender_ids.remove(entity_id)
-        elif entity_id in self.extra_intruder_ids:
-            self.extra_intruder_ids.remove(entity_id)
         else:
             self.economy_builder_ids.remove(entity_id)
-
-    def try_spawn_defender(self, controller):
-        if self.defender_handoff is not None:
-            pad, born = self.defender_handoff
-            if controller.get_current_round() <= born + 1:
-                return True
-            if controller.can_destroy(pad):
-                controller.destroy(pad)
-                self.tile_cache.forget_building(pad)
-            self.defender_handoff = None
-            for direction, sector_pad in self.sector_marker_pads.items():
-                if sector_pad == pad:
-                    self.sector_marker_values[direction] = None
-        hp = controller.get_hp(self.entity_id)
-        desired = 0 if hp >= 480 else (2 if hp >= 350 else 4)
-        if len(self.defender_ids) >= desired or self.intruder_order_active:
-            return False
-        pad = self.find_first_intruder_order_pad(controller)
-        if pad is None:
-            pad = next((p for p in self.sector_marker_pads.values() if controller.can_place_marker(p)), None)
-        if pad is None:
-            return False
-        for dx, dy in ((0, 0), (-1, -1), (1, 1), (1, -1), (-1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)):
-            pos = self.tile_cache.offset(self.core_pos, dx, dy)
-            if pos is not None and controller.can_spawn(pos):
-                controller.place_marker(pad, encode_marker(MARKER_KIND_SPAWN_DEFENDER, pos))
-                self.defender_ids.append(controller.spawn_builder(pos))
-                self.defender_handoff = pad, controller.get_current_round()
-                return True
-        return False
 
     def clear_intruder_spawn_order(self, controller: Controller) -> None:
         """Retire the role handoff before another newborn can use its tile."""
@@ -212,7 +193,7 @@ class CoreBot(BaseBot):
         pads: list[Position] = []
         for dx, dy in offsets:
             pos = self.tile_cache.offset(self.core_pos, dx, dy)
-            if pos is None or pos == self.intruder_order_pad or not controller.can_place_marker(pos):
+            if pos is None or pos in (self.intruder_order_pad, self.defender_order_pad) or not controller.can_place_marker(pos):
                 continue
             pads.append(pos)
             if len(pads) == len(BUILDER_WORK_DIRECTIONS) + 1:
@@ -295,9 +276,9 @@ class CoreBot(BaseBot):
         # Turrets and intruders must never occupy the economy's worker quota.
         # The roster is checked incrementally even after workers leave vision.
         living_builders = len(self.economy_builder_ids)
-        # Fund the forward battery and the first mines before expanding the
-        # workforce; idle unfunded builders only slow down this opening.
-        if living_builders >= 2 and controller.get_global_resources()[0] < 200:
+        # Two profitable sectors finance expansion. Four simultaneous scouts
+        # otherwise spend the opening bank before either conveyor is complete.
+        if living_builders >= 2 and controller.get_global_resources()[0] < 500:
             return False
         desired_builders = desired_builder_count(
             controller.get_current_round(),
@@ -310,9 +291,16 @@ class CoreBot(BaseBot):
             return False
 
         if len(self.initial_spawned_directions) < len(BUILDER_WORK_DIRECTIONS):
+            if self.opening_directions is None:
+                distances = {d: self.map_width + self.map_height for d in BUILDER_WORK_DIRECTIONS}
+                for pos in controller.get_nearby_tiles():
+                    if controller.get_tile_env(pos) == Environment.ORE_TITANIUM:
+                        d = self.sector_for(pos)
+                        distances[d] = min(distances[d], self.core_distance(pos))
+                self.opening_directions = sorted(BUILDER_WORK_DIRECTIONS, key=lambda d: distances[d])
             directions = [
                 direction
-                for direction in BUILDER_WORK_DIRECTIONS
+                for direction in self.opening_directions
                 if direction not in self.initial_spawned_directions
             ]
         else:
@@ -481,17 +469,48 @@ class CoreBot(BaseBot):
             (-2, 0), (0, -2), (2, 0), (0, 2),
         ):
             pad = self.tile_cache.offset(self.core_pos, dx, dy)
-            if pad == self.spawn_order_pad or pad in self.sector_marker_pads.values():
+            if pad in (self.spawn_order_pad, self.defender_order_pad) or pad in self.sector_marker_pads.values():
                 continue
             if pad is not None and controller.can_place_marker(pad):
                 return pad
         return None
 
+    def try_spawn_defender(self, controller):
+        """Reserve repairs before a short-range battery can burn through 500 HP."""
+        hp = controller.get_hp(self.entity_id)
+        desired = 6 if hp < 350 else 4 if hp < 490 else 0
+        if len(self.defender_ids) >= desired or self.defender_order_pad is not None:
+            return False
+        if controller.get_global_resources()[0] < controller.get_builder_bot_cost()[0] + 60 and hp > 160:
+            return False
+        if controller.get_unit_count() >= GameConstants.MAX_TEAM_UNITS:
+            return False
+        pad = self.find_first_intruder_order_pad(controller)
+        if pad is None or pad == self.intruder_order_pad:
+            # The first free pad may be the attacker's reserved handoff.
+            pad = next((self.tile_cache.offset(self.core_pos, dx, dy)
+                        for dx, dy in ((2, 2), (-2, 2), (2, -2), (-2, -2), (0, 2), (2, 0), (0, -2), (-2, 0))
+                        if self.tile_cache.offset(self.core_pos, dx, dy) not in
+                        (*self.sector_marker_pads.values(), self.spawn_order_pad, self.intruder_order_pad)
+                        and self.tile_cache.offset(self.core_pos, dx, dy) is not None
+                        and controller.can_place_marker(self.tile_cache.offset(self.core_pos, dx, dy))), None)
+        if pad is None:
+            return False
+        for dx, dy in ((0, 0), (-1, -1), (1, 1), (-1, 1), (1, -1), (0, -1), (0, 1), (-1, 0), (1, 0)):
+            pos = self.tile_cache.offset(self.core_pos, dx, dy)
+            if pos is not None and controller.can_spawn(pos):
+                controller.place_marker(pad, encode_marker(MARKER_KIND_SPAWN_DEFENDER, pos))
+                self.defender_ids.append(controller.spawn_builder(pos))
+                self.defender_order_pad = pad
+                self.defender_order_round = controller.get_current_round()
+                return True
+        return False
+
     def try_spawn_intruder(self, controller: Controller) -> bool:
         """Spawn the first non-Core unit as an infiltrator with an identifying marker."""
         if (
             self.core_pos is None
-            or self.intruder_id is not None
+            or len(self.intruder_ids) >= 2
             or self.intruder_order_active
             or self.intruders_spawned >= MAX_INTRUDER_SPAWNS
             or controller.get_unit_count() >= GameConstants.MAX_TEAM_UNITS
@@ -499,7 +518,9 @@ class CoreBot(BaseBot):
             return False
 
         if self.intruders_spawned:
-            if controller.get_current_round() - self.intruder_spawn_round < INTRUDER_REPLACEMENT_INTERVAL:
+            opening_partner = self.intruders_spawned == 1 and bool(self.intruder_ids)
+            interval = 3 if opening_partner else INTRUDER_REPLACEMENT_INTERVAL
+            if controller.get_current_round() - self.intruder_spawn_round < interval:
                 return False
             titanium, _ = controller.get_global_resources()
             reserve = controller.get_harvester_cost()[0] + 8 * controller.get_conveyor_cost()[0]
@@ -533,11 +554,8 @@ class CoreBot(BaseBot):
                 continue
             if not self.write_intruder_spawn_order(controller, spawn_pos):
                 return False
-            spawned_id = controller.spawn_builder(spawn_pos)
-            if self.intruder_id is None:
-                self.intruder_id = spawned_id
-            else:
-                self.extra_intruder_ids.append(spawned_id)
+            self.intruder_id = controller.spawn_builder(spawn_pos)
+            self.intruder_ids.append(self.intruder_id)
             self.intruders_spawned += 1
             self.intruder_order_active = True
             self.intruder_spawn_pos = spawn_pos

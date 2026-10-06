@@ -1,4 +1,4 @@
-"""Contracts between Nexus's economy and RC's combat roles."""
+"""Contracts between final's economy, combat roles and spawn handoffs."""
 
 import importlib
 from pathlib import Path
@@ -52,6 +52,7 @@ class CoreController:
     def get_harvester_cost(self): return (100, 0)
     def get_conveyor_cost(self): return (3, 0)
     def get_builder_bot_cost(self): return (50, 0)
+    def get_nearby_tiles(self): return []
 
     def spawn_builder(self, pos):
         self.next_id += 1
@@ -69,6 +70,8 @@ class CoreController:
         del self.markers[pos]
 
     def get_hp(self, entity_id):
+        if entity_id == 1:
+            return 500
         if entity_id in self.dead:
             raise ValueError("Unknown id")
         raise ValueError("Position out of vision range")
@@ -281,6 +284,8 @@ class CombatIntegrationTests(unittest.TestCase):
         bot._scan_turn = lambda *a, **k: False
         bot.read_launch_order = lambda: (landing, marker, source)
         c = Mock()
+        c.get_position.return_value = bot.current_position
+        c.get_tile_builder_bot_id.return_value = None
         c.can_launch.return_value = True
         c.can_destroy.return_value = True
         bot.run(c)
@@ -314,12 +319,28 @@ class CombatIntegrationTests(unittest.TestCase):
 
     def test_gunner_fires_at_engine_validated_target(self):
         bot = player.GunnerBot(12, 12)
-        bot._scan_turn = lambda *a, **k: False
+        bot._scan_turn = lambda *a, **k: True
         c = Mock()
-        c.get_gunner_target.return_value = Position(5, 5)
+        c.get_team.side_effect = lambda entity_id=None: Team.A if entity_id is None else Team.B
+        c.get_attackable_tiles.return_value = [Position(5, 5)]
+        c.get_tile_builder_bot_id.return_value = None
+        c.get_tile_building_id.return_value = 99
+        c.get_entity_type.return_value = EntityType.CORE
         c.can_fire.return_value = True
         bot.run(c)
         c.fire.assert_called_once_with(Position(5, 5))
+
+    def test_gunner_does_not_shoot_friendly_builder_covering_enemy_road(self):
+        bot = player.GunnerBot(12, 12)
+        bot._scan_turn = lambda *a, **k: True
+        c = Mock()
+        c.get_team.return_value = Team.A
+        c.get_attackable_tiles.return_value = [Position(5, 5)]
+        c.get_tile_builder_bot_id.return_value = 20
+        c.get_tile_building_id.return_value = 99
+        c.can_fire.return_value = True
+        bot.run(c)
+        c.fire.assert_not_called()
 
 
 if __name__ == "__main__":

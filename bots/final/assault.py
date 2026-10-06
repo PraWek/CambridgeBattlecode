@@ -1,55 +1,79 @@
-"""Exploit local ammunition sources before committing to a long supply route."""
+"""Ammo-first batteries using RC movement and the shared map cache.
 
-from cambc import EntityType, Environment, GameConstants
+Adapt sota/qualifier's use of enemy mine outputs without taking economy lanes.
+"""
+from cambc import Direction, EntityType, Environment
 from constants import DIRECTIONS, ORTHOGONAL_DIRECTIONS
+
+TURRETS = (EntityType.GUNNER, EntityType.SENTINEL)
+
+
+def buildable(bot, site):
+    if site is None or bot.tile_cache.environment_at(site) != Environment.EMPTY:
+        return False
+    building = bot.tile_cache.building_at(site)
+    return building is None or building == (EntityType.ROAD, bot.team) or (
+        building[1] != bot.team and building[0] in
+        (EntityType.ROAD, EntityType.CONVEYOR, EntityType.BRIDGE, EntityType.SPLITTER))
+
+
+def approach(bot, controller, current, site):
+    if current == site:
+        bot.vacate_gunner_site(controller, site)
+        return False
+    if current.distance_squared(site) > 2:
+        target = bot.construction_approach(site)
+        if target is not None:
+            bot.advance_towards_revisitable_target(controller, target)
+        return False
+    return True
 
 
 def execute_plan(bot, controller, current, plan):
-    site, ore, kind, facing, feed = plan
+    site, ore, kind, facing = plan
     cache = bot.tile_cache
     mine = cache.building_at(ore)
-    if feed != site and cache.building_at(feed) != (EntityType.BRIDGE, bot.team):
-        if current == feed or current.distance_squared(feed) > 2:
-            bot.advance_towards_revisitable_target(controller, bot.construction_approach(feed))
-            return True
-        old = cache.building_at(feed)
-        if old is not None:
-            if old != (EntityType.ROAD, bot.team):
-                bot.siege_plan = None
-                return False
-            if controller.can_destroy(feed):
-                controller.destroy(feed)
-                cache.forget_building(feed)
-        if controller.can_build_bridge(feed, site):
-            entity_id = controller.build_bridge(feed, site)
-            cache.remember_building(feed, entity_id, EntityType.BRIDGE, bot.team)
+    old = cache.building_at(site)
+    if old is not None and old[1] != bot.team and buildable(bot, site):
+        if current != site:
+            bot.advance_towards_revisitable_target(controller, site)
+        elif controller.can_fire(site):
+            entity_id = cache.building_id_at(site)
+            hp = controller.get_hp(entity_id)
+            controller.fire(site)
+            if hp <= 2:
+                cache.forget_building(site)
         return True
-    building = cache.building_at(site)
-    if building is not None and building[0] != EntityType.ROAD:
+    if old is not None and old != (EntityType.ROAD, bot.team):
+        if old == (kind, bot.team):
+            bot.siege_site, bot.siege_ore = site, ore
         bot.siege_plan = None
         return False
-    if current == site or current.distance_squared(site) > 2:
-        approaches = [cache.neighbor(site, d) for d in DIRECTIONS]
-        approaches = [p for p in approaches if p is not None and bot.is_roadable_position(p)
-                      ]
-        if approaches:
-            approach = min(approaches, key=lambda p: current.distance_squared(p))
-            bot.advance_towards_revisitable_target(controller, approach)
+    if mine is not None and mine[0] != EntityType.HARVESTER:
+        bot.siege_plan = None
+        return False
+    if mine == (EntityType.HARVESTER, bot.team) and ore not in bot.owned_supply_ores:
+        bot.siege_plan = None
+        return False
+    if mine is None:
+        if not approach(bot, controller, current, ore):
             return True
-        bot.siege_plan = None
-        return False
-    if building is not None:
-        if building[1] != bot.team:
-            bot.siege_plan = None
-            return False
-        if controller.can_destroy(site):
-            controller.destroy(site)
-            cache.forget_building(site)
+        if controller.can_build_harvester(ore):
+            entity_id = controller.build_harvester(ore)
+            cache.remember_building(ore, entity_id, EntityType.HARVESTER, bot.team)
+            bot.owned_supply_ores.add(ore)
+        return True
+    if not approach(bot, controller, current, site):
+        return True
+    if old is not None:
+        if not controller.can_destroy(site):
+            return True
+        controller.destroy(site)
+        cache.forget_building(site)
     if controller.can_build(kind, site, facing):
         entity_id = controller.build(kind, site, facing)
         cache.remember_building(site, entity_id, kind, bot.team, direction=facing)
         bot.siege_site, bot.siege_ore = site, ore
-        bot.siege_feed = feed
         bot.siege_plan = None
     return True
 
@@ -59,163 +83,107 @@ def try_siege(bot, controller, current):
     target = bot.destination
     if target is None or not bot.destination_is_confirmed_core:
         return False
-    site = getattr(bot, 'siege_site', None)
+    now = controller.get_current_round()
+    for entity_id in cache.visible_entity_ids:
+        if cache.entity_type(entity_id) in TURRETS and cache.entity_team(entity_id) == bot.team:
+            pos = cache.entity_position(entity_id)
+            if controller.can_heal(pos):
+                controller.heal(pos)
+                return True
+    if not hasattr(bot, 'siege_rejected'):
+        bot.siege_rejected = {}
+        bot.siege_plan = None
+        bot.siege_site = None
+        bot.siege_progress = (current, now)
+    site = bot.siege_site
     if site is not None:
         building = cache.building_at(site)
-        if building is None or building[1] != bot.team or building[0] not in (EntityType.GUNNER, EntityType.SENTINEL):
-            bot.siege_site = None
-        else:
+        if building is not None and building[1] == bot.team and building[0] in TURRETS:
             if building[0] == EntityType.GUNNER and clear_firing_lane(bot, controller, current, site):
                 return True
             if controller.can_heal(site):
                 controller.heal(site)
                 return True
             ore = bot.siege_ore
-            feed = bot.siege_feed
-            if feed != site and cache.building_at(feed) != (EntityType.BRIDGE, bot.team):
-                if current == feed or current.distance_squared(feed) > 2:
-                    bot.advance_towards_revisitable_target(controller, bot.construction_approach(feed))
-                    return True
-                old = cache.building_at(feed)
-                if old is not None:
-                    if old != (EntityType.ROAD, bot.team):
-                        bot.siege_site = None
-                        return False
-                    if controller.can_destroy(feed):
-                        controller.destroy(feed)
-                        cache.forget_building(feed)
-                if controller.can_build_bridge(feed, site):
-                    entity_id = controller.build_bridge(feed, site)
-                    cache.remember_building(feed, entity_id, EntityType.BRIDGE, bot.team)
-                return True
             if cache.building_at(ore) is None:
-                if current.distance_squared(ore) > 2:
-                    bot.advance_towards_revisitable_target(controller, bot.construction_approach(ore))
-                elif controller.can_build_harvester(ore):
+                if approach(bot, controller, current, ore) and controller.can_build_harvester(ore):
                     entity_id = controller.build_harvester(ore)
                     cache.remember_building(ore, entity_id, EntityType.HARVESTER, bot.team)
                     bot.owned_supply_ores.add(ore)
                 return True
-            # A single gunner can be outhealed by core defenders. Keep the
-            # first battery firing while constructing a second independent one.
-            bot.siege_site = None
+        bot.siege_site = None
 
-    plan = getattr(bot, 'siege_plan', None)
+    plan = bot.siege_plan
     if plan is not None:
-        return execute_plan(bot, controller, current, plan)
+        previous, since = bot.siege_progress
+        if current != previous:
+            bot.siege_progress = (current, now)
+        elif now - since > 12:
+            # Lost collisions or a changed obstacle must not freeze the attack.
+            bot.siege_rejected[plan[0]] = now + 32
+            bot.siege_plan = None
+        if bot.siege_plan is not None:
+            return execute_plan(bot, controller, current, plan)
 
     core_tiles = [cache.offset(target, dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
     core_tiles = [p for p in core_tiles if p is not None]
-    core_tiles.sort(key=lambda pos: current.distance_squared(pos))
-    # One short bridge makes a gunner as cheap as a sentinel, but a single Ti
-    # mine supplies its 2-Ti shots every turn instead of one 10-Ti shot per four.
-    sources = []
-    for ore in cache.visible_tiles:
+    core_tiles.sort(key=lambda p: current.distance_squared(p))
+    candidates = []
+    for ore in sorted(cache.visible_tiles, key=lambda p: (p.x, p.y)):
         if cache.environment_at(ore) != Environment.ORE_TITANIUM:
             continue
         mine = cache.building_at(ore)
-        if mine is not None and (mine[0] != EntityType.HARVESTER or (mine[1] == bot.team and ore not in bot.owned_supply_ores)):
+        if mine is not None and (mine[0] != EntityType.HARVESTER or
+                                (mine[1] == bot.team and ore not in bot.owned_supply_ores)):
             continue
-        for d in ORTHOGONAL_DIRECTIONS:
-            feed = cache.neighbor(ore, d)
-            if buildable(bot, feed):
-                sources.append((ore, feed))
-    shots = {}
-    for tile in core_tiles:
-        for facing in DIRECTIONS:
-            dx, dy = facing.delta()
-            for distance in range(1, 4 if facing in ORTHOGONAL_DIRECTIONS else 3):
-                site = cache.offset(tile, -dx * distance, -dy * distance)
-                if not buildable(bot, site):
-                    continue
-                for ore, feed in sources:
-                    if site.distance_squared(feed) <= 9 and site.add(facing) != feed:
-                        key = (site, facing, feed)
-                        shots[key] = (current.distance_squared(site) + current.distance_squared(feed),
-                                      site, ore, facing, feed, tile)
-    ordered = sorted(shots.values(), key=lambda item: (item[0], item[1].x, item[1].y))
-    for _, site, ore, facing, feed, tile in ordered[:12]:
-        if controller.can_fire_from(site, facing, EntityType.GUNNER, tile):
-            bot.siege_plan = site, ore, EntityType.GUNNER, facing, feed
+        if ore.distance_squared(target) > 85:
+            continue
+        for direction in ORTHOGONAL_DIRECTIONS:
+            site = cache.neighbor(ore, direction)
+            if not buildable(bot, site) or bot.siege_rejected.get(site, 0) > now:
+                continue
+            obstruction = cache.building_at(site)
+            penalty = 18 if obstruction is not None and obstruction[1] != bot.team else 0
+            # Capture a hostile source even when it cannot yet reach the core.
+            # The gunner loads facing away, then chooses its own nearby target.
+            if mine is not None and mine[1] != bot.team:
+                candidates.append((35 + current.distance_squared(site) + penalty,
+                                   site, ore, EntityType.GUNNER, direction, None))
+            for kind, radius in ((EntityType.GUNNER, 13), (EntityType.SENTINEL, 32)):
+                for goal in core_tiles:
+                    if site.distance_squared(goal) > radius:
+                        continue
+                    facing = site.direction_to(goal)
+                    if facing == Direction.CENTRE or site.add(facing) == ore:
+                        continue
+                    dx, dy = abs(goal.x-site.x), abs(goal.y-site.y)
+                    if kind == EntityType.GUNNER and dx and dy and dx != dy:
+                        continue
+                    score = current.distance_squared(site) + penalty + (12 if mine is None else 0) + (8 if kind == EntityType.SENTINEL else 0)
+                    candidates.append((score, site, ore, kind, facing, goal))
+    candidates.sort(key=lambda v: v[0])
+    for _, site, ore, kind, facing, goal in candidates[:20]:
+        if goal is None or controller.can_fire_from(site, facing, kind, goal):
+            bot.siege_plan = site, ore, kind, facing
+            bot.siege_progress = (current, now)
             return execute_plan(bot, controller, current, bot.siege_plan)
-    candidates = []
-    for site in tuple(cache.visible_tiles):
-        if site is None or cache.environment_at(site) != Environment.EMPTY:
-            continue
-        building = cache.building_at(site)
-        if building is not None and not (building[0] == EntityType.ROAD and building[1] == bot.team):
-            continue
-        for facing in ORTHOGONAL_DIRECTIONS:
-            ore = cache.neighbor(site, facing)
-            if ore is None or cache.environment_at(ore) != Environment.ORE_TITANIUM:
-                continue
-            mine = cache.building_at(ore)
-            # The economy's mines retain all their outputs.
-            if mine is not None and (mine[0] != EntityType.HARVESTER or (mine[1] == bot.team and ore not in bot.owned_supply_ores)):
-                continue
-            if min(site.distance_squared(p) for p in core_tiles) > 32:
-                continue
-            candidates.append((mine is None, site, ore))
-    candidates.sort(key=lambda item: (item[0], current.distance_squared(item[1]), item[1].x, item[1].y))
-    for unmined, site, ore in candidates[:6]:
-        for kind in (EntityType.GUNNER, EntityType.SENTINEL):
-            for target_tile in core_tiles[:3]:
-                facing = site.direction_to(target_tile)
-                # A turret cannot receive ammunition through its output side.
-                if site.add(facing) == ore:
-                    continue
-                if not controller.can_fire_from(site, facing, kind, target_tile):
-                    continue
-                bot.siege_plan = site, ore, kind, facing, site
-                return execute_plan(bot, controller, current, bot.siege_plan)
-    # Explore the ammunition source before choosing a disconnected gunner.
-    if bot.gunner_id is None:
-        ores = [p for p, env in cache.environments.items()
-                if env == Environment.ORE_TITANIUM and p.distance_squared(target) <= 64
-                and p not in cache.visible_tiles
-                and (cache.building_at(p) is None or cache.building_at(p)[1] != bot.team)]
-        if ores:
-            ore = min(ores, key=lambda p: current.distance_squared(p))
-            approach = bot.construction_approach(ore)
-            if approach is not None:
-                bot.advance_towards_revisitable_target(controller, approach)
-                return True
-        if controller.get_current_round() < 100:
-            probes = [cache.offset(target, dx, dy) for dx, dy in
-                      ((-5, -4), (0, -6), (5, -4), (6, 0), (5, 4), (0, 6), (-5, 4), (-6, 0))]
-            probes = [p for p in probes if p is not None and p not in cache.observed_tiles
-                      and cache.environment_at(p) != Environment.WALL]
-            if probes:
-                probe = min(probes, key=lambda p: current.distance_squared(p))
-                bot.advance_towards_unvisited_target(controller, probe)
-                return True
+    # Survey the source before falling back to RC's longer bridge supply plan.
+    hidden = [p for p, env in cache.environments.items()
+              if env == Environment.ORE_TITANIUM and p.distance_squared(target) <= 85
+              and p not in cache.observed_tiles and bot.is_available_supply_ore(p)]
+    if hidden:
+        ore = min(hidden, key=lambda p: current.distance_squared(p))
+        pos = bot.construction_approach(ore)
+        if pos is not None:
+            bot.advance_towards_revisitable_target(controller, pos)
+            return True
     return False
-
-
-def buildable(bot, site):
-    if site is None or bot.tile_cache.environment_at(site) != Environment.EMPTY:
-        return False
-    building = bot.tile_cache.building_at(site)
-    if building is not None and building != (EntityType.ROAD, bot.team):
-        return False
-    for entity_id in bot.tile_cache.visible_entity_ids:
-        if bot.tile_cache.entity_type(entity_id) != EntityType.GUNNER or bot.tile_cache.entity_team(entity_id) != bot.team:
-            continue
-        origin = bot.tile_cache.entity_position(entity_id)
-        facing = bot.tile_cache.entity_direction(entity_id)
-        if facing is not None and origin.direction_to(site) == facing:
-            dx, dy = abs(site.x - origin.x), abs(site.y - origin.y)
-            if (dx == 0 or dy == 0 or dx == dy) and site.distance_squared(origin) <= 13:
-                return False
-    return True
 
 
 def clear_firing_lane(bot, controller, current, site):
     cache = bot.tile_cache
-    direction = cache.conveyor_directions.get(site)
     entity_id = cache.building_id_at(site)
-    if entity_id is not None:
-        direction = cache.entity_direction(entity_id)
+    direction = cache.entity_direction(entity_id) if entity_id is not None else None
     if direction is None:
         return False
     lane = []
@@ -226,17 +194,9 @@ def clear_firing_lane(bot, controller, current, site):
             break
         lane.append(pos)
     for pos in lane:
-        if cache.building_at(pos) == (EntityType.ROAD, bot.team):
-            if controller.can_destroy(pos):
-                controller.destroy(pos)
-                cache.forget_building(pos)
-                continue
-            approaches = [cache.neighbor(pos, d) for d in DIRECTIONS]
-            approaches = [p for p in approaches if p is not None and p not in lane
-                          and bot.is_roadable_position(p)]
-            if approaches:
-                bot.advance_towards_revisitable_target(controller, min(approaches, key=lambda p: current.distance_squared(p)))
-                return True
+        if cache.building_at(pos) == (EntityType.ROAD, bot.team) and controller.can_destroy(pos):
+            controller.destroy(pos)
+            cache.forget_building(pos)
     if current in lane:
         for direction in DIRECTIONS:
             step = cache.neighbor(current, direction)
